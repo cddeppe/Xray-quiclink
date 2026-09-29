@@ -185,7 +185,8 @@ type udpConn struct {
 	downlink         stats.Counter
 	inactive         bool
 	cancel           context.CancelFunc
-	src              *net.Destination // pointer for migration	dcid             []byte           // QUIC DCID, nil for non-QUIC
+	src              *net.Destination // pointer for migration
+	dcid             []byte           // QUIC DCID, nil for non-QUIC
 }
 
 func (c *udpConn) setInactive() {
