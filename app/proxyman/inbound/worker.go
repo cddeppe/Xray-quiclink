@@ -279,6 +279,7 @@ type udpWorker struct {
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
 	dcidIndex  map[string]connID
+	srcIndex   map[string]connID  // src.String() -> connID, for CID rotation fallback
 
 	ctx  context.Context
 	cone bool
@@ -339,9 +340,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
 	conn, existing := w.getConnection(id)
 
-	// Record DCID for new QUIC connections
+	// Record DCID and src for new QUIC connections
 	if !existing {
 		w.recordDCID(b.Bytes(), id, conn)
+		w.recordSrc(id, conn)
 	}
 
 	// payload will be discarded in pipe is full.
@@ -398,6 +400,7 @@ func (w *udpWorker) removeConn(id connID) {
 		if conn.dcid != nil {
 			delete(w.dcidIndex, hex.EncodeToString(conn.dcid))
 		}
+		delete(w.srcIndex, id.src.String())
 		delete(w.activeConn, id)
 	} else {
 		delete(w.activeConn, id)
@@ -406,8 +409,14 @@ func (w *udpWorker) removeConn(id connID) {
 }
 
 // tryQUICMigration checks if a packet belongs to an existing QUIC connection
-// that has migrated to a new source address. Returns the existing conn if
-// migration is detected, nil otherwise.
+// that has migrated. Returns the existing conn if migration is detected, nil otherwise.
+//
+// Handles two migration patterns:
+// 1. Source port change with same DCID (Chrome desktop path probing, NAT rebind).
+//    DCID lookup finds existing conn, source is updated.
+// 2. CID rotation with source port change (Android YouTube aggressive CID rotation
+//    via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
+//    finds existing conn. New DCID is added to dcidIndex for future packets.
 func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 	dcid, _, err := quic.ParseDCID(packet)
 	if err != nil {
@@ -418,36 +427,65 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 	w.Lock()
 	defer w.Unlock()
 
-	oldID, found := w.dcidIndex[dcidHex]
-	if !found {
-		return nil
+	// Case 1: DCID lookup (handles source port change with same DCID)
+	if oldID, found := w.dcidIndex[dcidHex]; found {
+		oldConn, ok := w.activeConn[oldID]
+		if !ok || oldConn.done.Done() {
+			delete(w.dcidIndex, dcidHex)
+		} else if oldID != id {
+			oldSrcKey := oldID.src.String()
+			*oldConn.src = id.src
+			oldConn.updateActivity()
+
+			delete(w.activeConn, oldID)
+			w.activeConn[id] = oldConn
+			w.dcidIndex[dcidHex] = id
+			delete(w.srcIndex, oldSrcKey)
+			w.srcIndex[id.src.String()] = id
+
+			errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex[:8], " from ", oldID.src, " to ", id.src)
+			return oldConn
+		}
 	}
 
-	oldConn, ok := w.activeConn[oldID]
-	if !ok || oldConn.done.Done() {
-		delete(w.dcidIndex, dcidHex)
-		return nil
+	// Case 2: src IP:port lookup (handles CID rotation with source port change)
+	srcKey := id.src.String()
+	if oldID, found := w.srcIndex[srcKey]; found {
+		oldConn, ok := w.activeConn[oldID]
+		if !ok || oldConn.done.Done() {
+			delete(w.srcIndex, srcKey)
+			return nil
+		}
+
+		if oldID == id {
+			return nil // same conn, normal packet
+		}
+
+		// CID rotation: same source IP:port, new DCID
+		*oldConn.src = id.src
+		oldConn.updateActivity()
+		oldConn.dcid = dcid
+
+		delete(w.activeConn, oldID)
+		w.activeConn[id] = oldConn
+		w.srcIndex[srcKey] = id
+		w.dcidIndex[dcidHex] = id // Add new DCID for future lookups
+
+		errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex[:8], " from ", id.src)
+		return oldConn
 	}
 
-	// Same connID — not a migration, just a normal packet
-	if oldID == id {
-		return nil
+	return nil
+}
+
+// recordSrc associates a source IP:port with a connID for future CID rotation lookup.
+func (w *udpWorker) recordSrc(id connID, conn *udpConn) {
+	srcKey := id.src.String()
+	w.Lock()
+	defer w.Unlock()
+	if _, exists := w.srcIndex[srcKey]; !exists {
+		w.srcIndex[srcKey] = id
 	}
-
-	// Migration detected — update the existing conn to use new source
-	*oldConn.src = id.src
-	oldConn.updateActivity()
-	oldConn.dcid = dcid
-
-	// Re-key in activeConn map
-	delete(w.activeConn, oldID)
-	w.activeConn[id] = oldConn
-
-	// Update dcidIndex to new connID
-	w.dcidIndex[dcidHex] = id
-
-	errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex[:8], " from ", oldID.src, " to ", id.src)
-	return oldConn
 }
 
 // recordDCID associates a QUIC DCID with a connID for future migration lookup.
@@ -491,6 +529,7 @@ func (w *udpWorker) clean() error {
 				if conn.dcid != nil {
 					delete(w.dcidIndex, hex.EncodeToString(conn.dcid))
 				}
+				delete(w.srcIndex, addr.src.String())
 				delete(w.activeConn, addr)
 			}
 			conn.Close()
@@ -500,6 +539,7 @@ func (w *udpWorker) clean() error {
 	if len(w.activeConn) == 0 {
 		w.activeConn = make(map[connID]*udpConn, 16)
 		w.dcidIndex = make(map[string]connID)
+		w.srcIndex = make(map[string]connID)
 	}
 
 	return nil
@@ -508,6 +548,7 @@ func (w *udpWorker) clean() error {
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
 	w.dcidIndex = make(map[string]connID)
+	w.srcIndex = make(map[string]connID)
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
