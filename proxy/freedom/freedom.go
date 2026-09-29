@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -98,6 +99,7 @@ type Handler struct {
 	finalRules      []*FinalRule
 	resolveStrategy internet.DomainStrategy
 	usesDialerProxy bool
+	socketPool      *UDPSocketPool
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -204,6 +206,13 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 		}
 		h.finalRules = append(h.finalRules, rule)
 	}
+
+	// Initialize UDP socket pool if XRAY_UDP_POOL=1 env var is set.
+	if os.Getenv("XRAY_UDP_POOL") == "1" {
+		h.socketPool = NewUDPSocketPool()
+		errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (XRAY_UDP_POOL=1)")
+	}
+
 	return nil
 }
 
@@ -372,6 +381,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
+	// For UDP pool: acquire a pooled conn if pool is enabled.
+	// This is declared here so both requestDone and responseDone can use it.
+	var pooledConn *pooledConn
+	if destination.Network != net.Network_TCP && h.socketPool != nil {
+		pooledConn, err = h.socketPool.Acquire(&net.UDPAddr{
+			IP:   destination.Address.IP(),
+			Port: int(destination.Port),
+		})
+		if err != nil {
+			return errors.New("failed to acquire pooled UDP conn").Base(err)
+		}
+		defer pooledConn.Close()
+	}
+
 	var newCtx context.Context
 	var newCancel context.CancelFunc
 	if session.TimeoutOnlyFromContext(ctx) {
@@ -402,6 +425,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			} else {
 				writer = buf.NewWriter(conn)
 			}
+		} else if pooledConn != nil {
+			var statWrite stats.Counter
+			if statConn, ok := conn.(*stat.CounterConnection); ok {
+				statWrite = statConn.WriteCounter
+			}
+			writer = NewPooledPacketWriter(pooledConn, statWrite)
 		} else {
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
 			if h.config.Noises != nil {
@@ -437,6 +466,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		var reader buf.Reader
 		if destination.Network == net.Network_TCP {
 			reader = buf.NewReader(conn)
+		} else if pooledConn != nil {
+			reader = NewPooledPacketReader(pooledConn)
 		} else {
 			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
 		}
