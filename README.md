@@ -1,5 +1,53 @@
 # Project X
 
+## Fork features
+
+This fork adds two features for transparent proxy setups that forward QUIC traffic end-to-end. Both are opt-in (or always-on with no config change) and do not affect existing behavior unless enabled.
+
+### 1. QUIC connection migration support (always on, no config needed)
+
+When a QUIC client migrates (NAT rebinding, CID rotation, path probing), xray's UDP session map — keyed on src+dst 4-tuple — saw a "new" flow, created a new outbound socket, and the destination server dropped the unexpected packets. This caused 30s stalls before TCP fallback.
+
+**Patch:** `app/proxyman/inbound/worker.go` adds a parallel `dcidIndex map[string]connID` and `srcIndex map[string]connID` alongside the existing `activeConn map[connID]*udpConn`. On packet arrival, `tryQUICMigration()` parses the QUIC DCID and looks up the existing session by CID. If found, the outbound socket is preserved and the conn's source is updated. The `srcIndex` provides a fallback for CID rotation with source port change.
+
+**New package:** `common/protocol/quic/dcid.go` exports `ParseDCID()` to extract the Destination Connection ID from any QUIC packet (long or short header).
+
+### 2. UDP socket pool (opt-in via XRAY_UDP_POOL=1)
+
+When applications (e.g. mobile streaming apps) create many short-lived QUIC connections to the same destination, freedom's outbound created a new UDP socket per connection. Each new socket added kernel overhead and forced a new QUIC handshake, causing stalls on mobile clients.
+
+**Patch:** `proxy/freedom/udp_pool.go` adds a destination-keyed UDP socket pool. Many inbound sessions going to the same destination share one outbound UDP socket. Reply packets are demuxed by parsing the QUIC DCID (server-to-client replies carry the client's own CID, matching the SCID on outgoing packets). Non-QUIC UDP falls back to the existing per-session dial path.
+
+**Enable (run as root):** create the systemd drop-in file `/etc/systemd/system/xray.service.d/udp-pool.conf` with the content:
+
+    [Service]
+    Environment=XRAY_UDP_POOL=1
+
+Then run `systemctl daemon-reload` and `systemctl restart xray`.
+
+**Verify active** — look for this line in `/var/log/xray/error.log`:
+
+    [Warning] proxy/freedom: freedom: UDP socket pool enabled (XRAY_UDP_POOL=1)
+
+### Build and install
+
+    # AMD64
+    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o xray-pool-amd64 ./main
+
+    # ARM64
+    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o xray-pool-arm64 ./main
+
+    # Install on each server
+    sudo cp xray-pool-<arch> /usr/local/bin/xray
+    sudo systemctl restart xray
+
+### Roll back
+
+Remove the env var drop-in file, daemon-reload, and restart. Or install the stock xray binary.
+
+### See HANDOFF.md for full architecture, design notes, and deployment details.
+
+
 [Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).
 
 [README](https://github.com/XTLS/Xray-core#readme) is open, so feel free to submit your project [here](https://github.com/XTLS/Xray-core/pulls).
