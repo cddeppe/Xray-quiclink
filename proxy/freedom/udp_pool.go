@@ -401,3 +401,16 @@ func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
     }
     return nil
 }
+
+
+// isQUICLongHeader checks if a packet looks like a QUIC long header.
+// QUIC long header: byte 0 has bit 7 = 1 (long header), bit 6 = 1 (fixed bit).
+// Used to decide whether to use the UDP socket pool: only QUIC traffic
+// can be demuxed by DCID in the pool's readLoop, so non-QUIC UDP (e.g.
+// WireGuard, DNS, games) falls back to the existing per-session socket path.
+func isQUICLongHeader(b []byte) bool {
+    if len(b) < 1 {
+        return false
+    }
+    return b[0]&0x80 != 0 && b[0]&0x40 != 0
+}

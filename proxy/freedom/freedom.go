@@ -384,26 +384,36 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	defer conn.Close()
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
-	// For UDP pool: acquire a pooled conn if pool is enabled.
-	// This is declared here so both requestDone and responseDone can use it.
-	// Note: we use conn.RemoteAddr() (already-resolved IP) instead of
-	// destination.Address.IP() because the latter panics on domain addresses.
+	// For UDP pool: peek at the first packet to determine if it's QUIC.
+	// Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
+	// non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
+	// per-session socket path. This prevents the pool from breaking non-QUIC UDP.
 	var pooledConn *pooledConn
+	var peekedPackets buf.MultiBuffer
 	if destination.Network != net.Network_TCP && h.socketPool != nil {
-		remoteAddr := conn.RemoteAddr()
-		var udpRemote *net.UDPAddr
-		if u, ok := remoteAddr.(*net.UDPAddr); ok {
-			udpRemote = u
-		} else {
-			udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
-		}
-		if udpRemote != nil {
-			pooledConn, err = h.socketPool.Acquire(udpRemote)
-			if err != nil {
-				return errors.New("failed to acquire pooled UDP conn").Base(err)
+		// Peek at the first packet(s) to check if this is QUIC traffic.
+		mb, peekErr := input.ReadMultiBuffer()
+		if peekErr == nil && len(mb) > 0 {
+			peekedPackets = mb
+			if isQUICLongHeader(mb[0].Bytes()) {
+				remoteAddr := conn.RemoteAddr()
+				var udpRemote *net.UDPAddr
+				if u, ok := remoteAddr.(*net.UDPAddr); ok {
+					udpRemote = u
+				} else {
+					udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
+				}
+				if udpRemote != nil {
+					pooledConn, err = h.socketPool.Acquire(udpRemote)
+					if err != nil {
+						return errors.New("failed to acquire pooled UDP conn").Base(err)
+					}
+					defer pooledConn.Close()
+				}
 			}
-			defer pooledConn.Close()
+			// If not QUIC, pooledConn stays nil — existing per-session path is used.
 		}
+		// If peek failed, proceed with existing path (pooledConn stays nil).
 	}
 
 	var newCtx context.Context
@@ -453,6 +463,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					UDPOverride: UDPOverride,
 					remoteAddr:  net.DestinationFromAddr(conn.RemoteAddr()).Address,
 				}
+			}
+		}
+
+		// Write any packets we peeked during the pool decision (before buf.Copy).
+		if len(peekedPackets) > 0 {
+			if err := writer.WriteMultiBuffer(peekedPackets); err != nil {
+				return errors.New("failed to write peeked UDP packets").Base(err)
 			}
 		}
 
