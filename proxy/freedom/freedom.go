@@ -100,6 +100,7 @@ type Handler struct {
 	resolveStrategy internet.DomainStrategy
 	usesDialerProxy bool
 	socketPool      *UDPSocketPool
+	stickyResolver  *StickyResolver
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -201,6 +202,15 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 		errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (XRAY_UDP_POOL=1)")
 	}
 
+	// Initialize sticky UDP resolver if XRAY_UDP_STICKY=1 env var is set.
+	// This caches the first resolved IP per hostname for UDP flows, preventing
+	// IPv4/IPv6 flipping that causes 400 errors on servers that validate source
+	// IPs (e.g., YouTube CDN).
+	if os.Getenv("XRAY_UDP_STICKY") == "1" {
+		h.stickyResolver = NewStickyResolver(5 * time.Minute)
+		errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (XRAY_UDP_STICKY=1)")
+	}
+
 	if h.usesDialerProxy { // freedom is not the final outbound, final rules do not apply
 		if len(config.FinalRules) > 0 {
 			errors.LogWarning(context.Background(), `The "finalRules" setting is ignored when "sockopt.dialerProxy" is set, since freedom is not the final outbound.`)
@@ -298,6 +308,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	input := link.Reader
 	output := link.Writer
+
+	// Sticky UDP DNS: if enabled and destination is a domain, pre-resolve to
+	// a consistent IP for this hostname. This prevents IPv4/IPv6 flipping
+	// across flows to the same hostname, which can cause destination servers
+	// (e.g., YouTube CDN) to reject requests due to source IP mismatch in
+	// their validated URLs.
+	if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() && h.stickyResolver != nil {
+		if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil {
+			destination.Address = stickyIP
+			if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
+				UDPOverride.Address = stickyIP
+			}
+		} else {
+			errors.LogInfoInner(ctx, err, "sticky: pre-resolve failed, falling back to normal resolution")
+		}
+	}
 
 	var conn stat.Connection
 	var blockedDest *net.Destination
