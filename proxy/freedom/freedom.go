@@ -383,16 +383,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	// For UDP pool: acquire a pooled conn if pool is enabled.
 	// This is declared here so both requestDone and responseDone can use it.
+	// Note: we use conn.RemoteAddr() (already-resolved IP) instead of
+	// destination.Address.IP() because the latter panics on domain addresses.
 	var pooledConn *pooledConn
 	if destination.Network != net.Network_TCP && h.socketPool != nil {
-		pooledConn, err = h.socketPool.Acquire(&net.UDPAddr{
-			IP:   destination.Address.IP(),
-			Port: int(destination.Port),
-		})
-		if err != nil {
-			return errors.New("failed to acquire pooled UDP conn").Base(err)
+		remoteAddr := conn.RemoteAddr()
+		var udpRemote *net.UDPAddr
+		if u, ok := remoteAddr.(*net.UDPAddr); ok {
+			udpRemote = u
+		} else {
+			udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
 		}
-		defer pooledConn.Close()
+		if udpRemote != nil {
+			pooledConn, err = h.socketPool.Acquire(udpRemote)
+			if err != nil {
+				return errors.New("failed to acquire pooled UDP conn").Base(err)
+			}
+			defer pooledConn.Close()
+		}
 	}
 
 	var newCtx context.Context
