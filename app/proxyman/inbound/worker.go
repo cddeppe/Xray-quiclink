@@ -3,6 +3,10 @@ package inbound
 import (
 	"context"
 	"sync"
+
+	"encoding/hex"
+
+	"github.com/xtls/xray-core/common/protocol/quic"
 	"sync/atomic"
 	"time"
 
@@ -181,6 +185,7 @@ type udpConn struct {
 	downlink         stats.Counter
 	inactive         bool
 	cancel           context.CancelFunc
+	src              *net.Destination // pointer for migration	dcid             []byte           // QUIC DCID, nil for non-QUIC
 }
 
 func (c *udpConn) setInactive() {
@@ -272,6 +277,7 @@ type udpWorker struct {
 
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
+	dcidIndex  map[string]connID
 
 	ctx  context.Context
 	cone bool
@@ -287,12 +293,10 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	}
 
 	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(16*1024))
+	srcCopy := id.src
 	conn := &udpConn{
 		reader: pReader,
 		writer: pWriter,
-		output: func(b []byte) (int, error) {
-			return w.hub.WriteTo(b, id.src)
-		},
 		remote: &net.UDPAddr{
 			IP:   id.src.Address.IP(),
 			Port: int(id.src.Port),
@@ -304,6 +308,10 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		done:     done.New(),
 		uplink:   w.uplinkCounter,
 		downlink: w.downlinkCounter,
+		src:      &srcCopy,
+	}
+	conn.output = func(b []byte) (int, error) {
+		return w.hub.WriteTo(b, *conn.src)
 	}
 	w.activeConn[id] = conn
 
@@ -321,7 +329,19 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		}
 		b.UDP = &originalDest
 	}
+	// Try QUIC DCID-based migration lookup before creating a new conn
+	if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
+		migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+		migratedConn.updateActivity()
+		return
+	}
+
 	conn, existing := w.getConnection(id)
+
+	// Record DCID for new QUIC connections
+	if !existing {
+		w.recordDCID(b.Bytes(), id, conn)
+	}
 
 	// payload will be discarded in pipe is full.
 	conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
@@ -373,8 +393,78 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
 func (w *udpWorker) removeConn(id connID) {
 	w.Lock()
-	delete(w.activeConn, id)
+	if conn, ok := w.activeConn[id]; ok {
+		if conn.dcid != nil {
+			delete(w.dcidIndex, hex.EncodeToString(conn.dcid))
+		}
+		delete(w.activeConn, id)
+	} else {
+		delete(w.activeConn, id)
+	}
 	w.Unlock()
+}
+
+// tryQUICMigration checks if a packet belongs to an existing QUIC connection
+// that has migrated to a new source address. Returns the existing conn if
+// migration is detected, nil otherwise.
+func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
+	dcid, _, err := quic.ParseDCID(packet)
+	if err != nil {
+		return nil
+	}
+	dcidHex := hex.EncodeToString(dcid)
+
+	w.Lock()
+	defer w.Unlock()
+
+	oldID, found := w.dcidIndex[dcidHex]
+	if !found {
+		return nil
+	}
+
+	oldConn, ok := w.activeConn[oldID]
+	if !ok || oldConn.done.Done() {
+		delete(w.dcidIndex, dcidHex)
+		return nil
+	}
+
+	// Same connID — not a migration, just a normal packet
+	if oldID == id {
+		return nil
+	}
+
+	// Migration detected — update the existing conn to use new source
+	*oldConn.src = id.src
+	oldConn.updateActivity()
+	oldConn.dcid = dcid
+
+	// Re-key in activeConn map
+	delete(w.activeConn, oldID)
+	w.activeConn[id] = oldConn
+
+	// Update dcidIndex to new connID
+	w.dcidIndex[dcidHex] = id
+
+	errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex[:8], " from ", oldID.src, " to ", id.src)
+	return oldConn
+}
+
+// recordDCID associates a QUIC DCID with a connID for future migration lookup.
+// Only records on first sighting of a DCID.
+func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
+	dcid, _, err := quic.ParseDCID(packet)
+	if err != nil {
+		return
+	}
+	dcidHex := hex.EncodeToString(dcid)
+
+	w.Lock()
+	defer w.Unlock()
+
+	if _, exists := w.dcidIndex[dcidHex]; !exists {
+		w.dcidIndex[dcidHex] = id
+		conn.dcid = dcid
+	}
 }
 
 func (w *udpWorker) handlePackets() {
@@ -397,6 +487,9 @@ func (w *udpWorker) clean() error {
 		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
 			if !conn.inactive {
 				conn.setInactive()
+				if conn.dcid != nil {
+					delete(w.dcidIndex, hex.EncodeToString(conn.dcid))
+				}
 				delete(w.activeConn, addr)
 			}
 			conn.Close()
@@ -405,6 +498,7 @@ func (w *udpWorker) clean() error {
 
 	if len(w.activeConn) == 0 {
 		w.activeConn = make(map[connID]*udpConn, 16)
+		w.dcidIndex = make(map[string]connID)
 	}
 
 	return nil
@@ -412,6 +506,7 @@ func (w *udpWorker) clean() error {
 
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
+	w.dcidIndex = make(map[string]connID)
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {
