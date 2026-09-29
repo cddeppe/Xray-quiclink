@@ -192,6 +192,15 @@ func (h *Handler) matchFinalRule(network net.Network, address net.Address, port 
 func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.config = config
 	h.policyManager = pm
+
+	// Initialize UDP socket pool if XRAY_UDP_POOL=1 env var is set.
+	// This runs unconditionally (before the usesDialerProxy check) so the
+	// pool is available for any outbound that handles UDP traffic.
+	if os.Getenv("XRAY_UDP_POOL") == "1" {
+		h.socketPool = NewUDPSocketPool()
+		errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (XRAY_UDP_POOL=1)")
+	}
+
 	if h.usesDialerProxy { // freedom is not the final outbound, final rules do not apply
 		if len(config.FinalRules) > 0 {
 			errors.LogWarning(context.Background(), `The "finalRules" setting is ignored when "sockopt.dialerProxy" is set, since freedom is not the final outbound.`)
@@ -205,12 +214,6 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 			return errors.New("failed to build final rule").Base(err)
 		}
 		h.finalRules = append(h.finalRules, rule)
-	}
-
-	// Initialize UDP socket pool if XRAY_UDP_POOL=1 env var is set.
-	if os.Getenv("XRAY_UDP_POOL") == "1" {
-		h.socketPool = NewUDPSocketPool()
-		errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (XRAY_UDP_POOL=1)")
 	}
 
 	return nil
