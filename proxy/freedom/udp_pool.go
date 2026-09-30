@@ -17,28 +17,24 @@ import (
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
-// UDP socket. This eliminates per-connection socket creation overhead
-// for applications (e.g. Android YouTube) that open many short-lived
-// QUIC connections to the same destination.
-//
-// Reply packets are demultiplexed by parsing the QUIC DCID, which (for
-// packets sent by the server back to the client) carries the client's
-// own connection ID. Outgoing packets carry the client's CID as the
-// SCID, so the pool can match each reply to the originating session.
+// UDP socket. Reply packets are demuxed by parsing the QUIC DCID.
 type UDPSocketPool struct {
     mu      sync.Mutex
     sockets map[string]*pooledSocket
+    reaper  *time.Ticker
 }
 
 type pooledSocket struct {
-    mu        sync.Mutex
-    conn      stdnet.PacketConn
-    dest      *stdnet.UDPAddr
-    refCount  int
-    lastUsed  time.Time
-    demux     map[string]chan<- readResult
-    closed    chan struct{}
-    closeOnce sync.Once
+    mu            sync.Mutex
+    conn          stdnet.PacketConn
+    dest          *stdnet.UDPAddr
+    refCount      int
+    lastUsed      time.Time
+    lastReplyTime time.Time
+    demux         map[string]chan<- readResult
+    closed        chan struct{}
+    closeOnce     sync.Once
+    dead          bool
 }
 
 type readResult struct {
@@ -50,16 +46,43 @@ type pooledConn struct {
     socket *pooledSocket
     inbox  chan readResult
     done   chan struct{}
-
     mu     sync.Mutex
     closed bool
     scids  map[string]bool
 }
 
-// NewUDPSocketPool creates a new pool.
 func NewUDPSocketPool() *UDPSocketPool {
-    return &UDPSocketPool{
+    p := &UDPSocketPool{
         sockets: make(map[string]*pooledSocket),
+    }
+    p.startReaper()
+    return p
+}
+
+func (p *UDPSocketPool) startReaper() {
+    p.reaper = time.NewTicker(2 * time.Minute)
+    go func() {
+        for range p.reaper.C {
+            p.evictStale()
+        }
+    }()
+}
+
+func (p *UDPSocketPool) evictStale() {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    for key, sock := range p.sockets {
+        sock.mu.Lock()
+        isDead := sock.dead
+        isIdle := time.Since(sock.lastReplyTime) > 10*time.Minute && sock.refCount > 0
+        isUnused := time.Since(sock.lastUsed) > 5*time.Minute && sock.refCount == 0
+        sock.mu.Unlock()
+
+        if isDead || isIdle || isUnused {
+            sock.MarkDead()
+            delete(p.sockets, key)
+            errors.LogInfo(context.Background(), "udp_pool: evicted stale socket for ", key)
+        }
     }
 }
 
@@ -67,14 +90,12 @@ func destKey(dest *stdnet.UDPAddr) string {
     return dest.String()
 }
 
-// Acquire returns a *pooledConn for the given destination. The caller
-// must call Close() on it when done.
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
     key := destKey(dest)
 
     p.mu.Lock()
     sock, ok := p.sockets[key]
-    if ok && sock.IsClosed() {
+    if ok && (sock.IsClosed() || sock.IsDead()) {
         delete(p.sockets, key)
         ok = false
     }
@@ -101,7 +122,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
         }
 
         p.mu.Lock()
-        if existing, ok := p.sockets[key]; ok && !existing.IsClosed() {
+        if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
             pc.Close()
             sock = existing
             sock.mu.Lock()
@@ -141,8 +162,9 @@ func (s *pooledSocket) readLoop() {
             if s.IsClosed() {
                 return
             }
-            errors.LogInfo(context.Background(), "udp_pool: read error: ", err)
-            continue
+            errors.LogInfo(context.Background(), "udp_pool: read error, marking socket dead: ", err)
+            s.MarkDead()
+            return
         }
 
         packet := make([]byte, n)
@@ -157,6 +179,7 @@ func (s *pooledSocket) readLoop() {
         s.mu.Lock()
         ch, ok := s.demux[dcidHex]
         s.lastUsed = time.Now()
+        s.lastReplyTime = time.Now()
         s.mu.Unlock()
 
         if !ok {
@@ -179,6 +202,26 @@ func (s *pooledSocket) IsClosed() bool {
     }
 }
 
+func (s *pooledSocket) IsDead() bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    return s.dead
+}
+
+// MarkDead marks the socket as dead and closes it.
+func (s *pooledSocket) MarkDead() {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.dead {
+        return
+    }
+    s.dead = true
+    s.closeOnce.Do(func() {
+        close(s.closed)
+        _ = s.conn.Close()
+    })
+}
+
 func (s *pooledSocket) release() {
     s.mu.Lock()
     if s.refCount > 0 {
@@ -188,15 +231,6 @@ func (s *pooledSocket) release() {
     s.mu.Unlock()
 }
 
-func (s *pooledSocket) Close() error {
-    s.closeOnce.Do(func() {
-        close(s.closed)
-        _ = s.conn.Close()
-    })
-    return nil
-}
-
-// RegisterCID tells the pool that replies with this DCID belong to this session.
 func (c *pooledConn) RegisterCID(cid []byte) {
     if len(cid) == 0 {
         return
@@ -221,7 +255,6 @@ func (c *pooledConn) RegisterCID(cid []byte) {
     }
 }
 
-// WriteTo sends a packet via the shared socket.
 func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
     if c.IsClosed() {
         return 0, io.EOF
@@ -231,10 +264,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         c.RegisterCID(scid)
     }
 
-    return c.socket.conn.WriteTo(b, c.socket.dest)
+    n, err := c.socket.conn.WriteTo(b, c.socket.dest)
+    if err != nil {
+        c.socket.MarkDead()
+    }
+    return n, err
 }
 
-// ReadFrom returns the next reply packet for this session.
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
     select {
     case rr, ok := <-c.inbox:
@@ -254,7 +290,6 @@ func (c *pooledConn) IsClosed() bool {
     return c.closed
 }
 
-// Close releases this session's hold on the pooled socket.
 func (c *pooledConn) Close() error {
     c.mu.Lock()
     if c.closed {
@@ -289,7 +324,6 @@ func (c *pooledConn) SetDeadline(time.Time) error      { return nil }
 func (c *pooledConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *pooledConn) SetWriteDeadline(time.Time) error { return nil }
 
-// parseQUICSCID extracts the Source Connection ID from a QUIC long header.
 func parseQUICSCID(b []byte) ([]byte, bool, error) {
     if len(b) < 1 {
         return nil, false, quic.ErrTooShort
@@ -331,7 +365,6 @@ func parseQUICSCID(b []byte) ([]byte, bool, error) {
 // Integration with freedom.go: pooled buf.Reader/Writer
 // ============================================================
 
-// PooledPacketReader is a buf.Reader that reads packets from a pooled UDP socket.
 type PooledPacketReader struct {
     conn *pooledConn
 }
@@ -361,7 +394,6 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
     return buf.MultiBuffer{b}, nil
 }
 
-// PooledPacketWriter is a buf.Writer that sends packets to a pooled UDP socket.
 type PooledPacketWriter struct {
     conn      *pooledConn
     statWrite stats.Counter
@@ -402,12 +434,6 @@ func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
     return nil
 }
 
-
-// isQUICLongHeader checks if a packet looks like a QUIC long header.
-// QUIC long header: byte 0 has bit 7 = 1 (long header), bit 6 = 1 (fixed bit).
-// Used to decide whether to use the UDP socket pool: only QUIC traffic
-// can be demuxed by DCID in the pool's readLoop, so non-QUIC UDP (e.g.
-// WireGuard, DNS, games) falls back to the existing per-session socket path.
 func isQUICLongHeader(b []byte) bool {
     if len(b) < 1 {
         return false
