@@ -170,7 +170,7 @@ func (s *pooledSocket) readLoop() {
                 return
             }
             // Check if the error is a timeout (net.Error)
-            if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+            if netErr, ok := err.(stdnet.Error); ok && netErr.Timeout() {
                 errors.LogInfo(context.Background(), "udp_pool: read timeout (30s), marking socket dead: ", s.dest)
                 s.MarkDead()
                 return
