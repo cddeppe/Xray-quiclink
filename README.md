@@ -1,56 +1,138 @@
 # Project X
 
-## Fork features
+## Fork Features: Transparent QUIC Proxying (cddeppe/Xray-core)
 
-This fork adds two features for transparent proxy setups that forward QUIC traffic end-to-end. Both are opt-in (or always-on with no config change) and do not affect existing behavior unless enabled.
+This fork solves a long-standing problem in the xray community: **how to transparently proxy QUIC/HTTP3 traffic (like YouTube) through a multi-hop chain without client-side certificates, TUN adapters, or DNS-to-VPS forwarding.**
 
-### 1. QUIC connection migration support (always on, no config needed)
+Standard xray fails in this scenario because it is a Layer-4 proxy, but QUIC is a Layer-7 protocol with strict connection validation. This fork bridges that gap.
 
-When a QUIC client migrates (NAT rebinding, CID rotation, path probing), xray's UDP session map — keyed on src+dst 4-tuple — saw a "new" flow, created a new outbound socket, and the destination server dropped the unexpected packets. This caused 30s stalls before TCP fallback.
+### The Problem
 
-**Patch:** `app/proxyman/inbound/worker.go` adds a parallel `dcidIndex map[string]connID` and `srcIndex map[string]connID` alongside the existing `activeConn map[connID]*udpConn`. On packet arrival, `tryQUICMigration()` parses the QUIC DCID and looks up the existing session by CID. If found, the outbound socket is preserved and the conn's source is updated. The `srcIndex` provides a fallback for CID rotation with source port change.
+When you use DNS hijacking (e.g., Control D) to point `youtube.com` to your VPS, the browser sends QUIC packets to the VPS. xray sniffs the SNI and tries to forward the packet. However, it fails due to four architectural limitations:
 
-**New package:** `common/protocol/quic/dcid.go` exports `ParseDCID()` to extract the Destination Connection ID from any QUIC packet (long or short header).
+1. **2-Minute Session Timeout:** xray kills UDP sessions after 2 minutes of inactivity. Video buffering pauses kill the session.
+2. **IPv4/IPv6 Flipping:** xray re-resolves DNS per flow, randomly picking IPv4 or IPv6. YouTube validates the source IP and rejects mismatches (400 errors).
+3. **NXDOMAIN Edge Rotation:** YouTube rotates CDN hostnames faster than public DNS caches them. xray tries to resolve a new hostname, gets NXDOMAIN, and drops the flow.
+4. **Per-Connection Overhead:** Each new flow creates a new outbound socket. If a CDN edge dies, the socket stays open and continues to fail.
 
-### 2. UDP socket pool (opt-in via XRAY_UDP_POOL=1)
+### The Solution
 
-When applications (e.g. mobile streaming apps) create many short-lived QUIC connections to the same destination, freedom's outbound created a new UDP socket per connection. Each new socket added kernel overhead and forced a new QUIC handshake, causing stalls on mobile clients.
+This fork introduces four new features to solve these problems:
 
-**Patch:** `proxy/freedom/udp_pool.go` adds a destination-keyed UDP socket pool. Many inbound sessions going to the same destination share one outbound UDP socket. Reply packets are demuxed by parsing the QUIC DCID (server-to-client replies carry the client's own CID, matching the SCID on outgoing packets). Non-QUIC UDP falls back to the existing per-session dial path.
+1. **Extended UDP Timeout:** The hardcoded 2-minute timeout in `worker.go` is increased to 30 minutes.
+2. **Sticky Resolver (`udp_sticky.go`):** Caches the first DNS resolution per hostname. If DNS fails (NXDOMAIN), it falls back to the last known-good IP for the domain suffix (stale-serve).
+3. **UDP Socket Pool (`udp_pool.go`):** Pools outbound sockets by destination IP. Includes **Dead Socket Detection** (marks sockets dead on read/write errors) and an **Idle Reaper** (evicts sockets idle >10min or unused >5min).
+4. **QUIC CID Migration (`worker.go`):** Tracks QUIC Connection IDs. If a client migrates (NAT rebinding, CID rotation), the existing outbound socket is preserved.
 
-**Enable (run as root):** create the systemd drop-in file `/etc/systemd/system/xray.service.d/udp-pool.conf` with the content:
+All features are opt-in via environment variables:
+- `XRAY_UDP_POOL=1` — Enable the UDP socket pool.
+- `XRAY_UDP_STICKY=1` — Enable the sticky DNS resolver.
 
-    [Service]
-    Environment=XRAY_UDP_POOL=1
+### Architecture Diagrams
 
-Then run `systemctl daemon-reload` and `systemctl restart xray`.
+#### 1. The Problem: Standard Xray (Failing)
 
-**Verify active** — look for this line in `/var/log/xray/error.log`:
+```mermaid
+graph TD
+    A[Home Browser] -->|UDP/QUIC| B(VPS xray)
+    B -->|Sniff SNI| C{Resolve DNS}
+    C -->|NXDOMAIN| D[❌ Flow Dropped]
+    C -->|IPv4| E[YouTube IPv4 Edge]
+    C -->|IPv6| F[YouTube IPv6 Edge]
+    E -.->|400 Error| G[Browser Stalls]
+    F -.->|400 Error| G
+    B -->|2 min idle| H[❌ Session Killed]
+    H --> G
+```
 
-    [Warning] proxy/freedom: freedom: UDP socket pool enabled (XRAY_UDP_POOL=1)
+#### 2. The Solution: This Fork (Working)
 
-### Build and install
+```mermaid
+graph TD
+    A[Home Browser] -->|UDP/QUIC| B(VPS xray)
+    B -->|Sniff SNI| C{Sticky Resolver}
+    C -->|Cache Hit| D[Use Cached IP]
+    C -->|NXDOMAIN| E[Stale-Serve Fallback]
+    C -->|Cache Miss| F[Resolve & Cache]
+    D --> G{UDP Socket Pool}
+    E --> G
+    F --> G
+    G -->|Dead Socket?| H[Evict & Reconnect]
+    G -->|Healthy Socket| I[YouTube CDN]
+    I --> J[✅ Video Plays Smoothly]
+    B -->|30 min timeout| K[Session Stays Alive]
+    K --> J
+```
 
-    # AMD64
-    GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o xray-pool-amd64 ./main
+### How It Works
 
-    # ARM64
-    GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o xray-pool-arm64 ./main
+#### Sticky Resolver (`udp_sticky.go`)
 
-    # Install on each server
-    sudo cp xray-pool-<arch> /usr/local/bin/xray
-    sudo systemctl restart xray
+When a new UDP flow arrives, the sticky resolver checks if the hostname is cached.
+- If yes, it returns the cached IP (no DNS lookup needed).
+- If no, it resolves the hostname, caches the IP (IPv4 or IPv6, whichever is first), and returns it.
+- If DNS returns NXDOMAIN, it falls back to the last known-good IP for the domain suffix (e.g., `*.googlevideo.com`).
 
-### Roll back
+This prevents the IPv4/IPv6 flipping and NXDOMAIN errors.
 
-Remove the env var drop-in file, daemon-reload, and restart. Or install the stock xray binary.
+#### UDP Socket Pool (`udp_pool.go`)
+
+When a new UDP flow arrives, the pool checks if a socket to the destination IP already exists.
+- If yes, it reuses the socket (no new socket creation).
+- If no, it creates a new socket and caches it.
+- If a socket read or write fails, it marks the socket as dead, removes it from the pool, and the next flow creates a fresh socket.
+- A background reaper goroutine evicts sockets that have been idle (no replies in 10 min) or unused (refCount=0 for 5 min).
+
+This prevents the per-connection overhead and handles CDN edge rotation.
+
+#### 30-Minute UDP Timeout (`worker.go`)
+
+The standard 2-minute timeout in `worker.go` kills UDP sessions during video buffering. This fork increases it to 30 minutes.
+
+#### QUIC CID Migration (`worker.go`)
+
+If a QUIC client migrates (NAT rebinding, CID rotation), xray tracks the new Connection ID and preserves the existing outbound socket. The destination server sees a consistent source IP.
+
+### Build and Install
+
+```bash
+# AMD64
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o xray-fork-amd64 ./main
+
+# ARM64
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o xray-fork-arm64 ./main
+
+# Install
+sudo cp xray-fork-<arch> /usr/local/bin/xray
+sudo systemctl restart xray
+```
+
+### Enable the Features
+
+```bash
+# Create systemd drop-in
+sudo mkdir -p /etc/systemd/system/xray.service.d
+sudo tee /etc/systemd/system/xray.service.d/udp-features.conf > /dev/null << 'EOF'
+[Service]
+Environment=XRAY_UDP_POOL=1
+Environment=XRAY_UDP_STICKY=1
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart xray
+```
+
+### Configuration Requirements
+
+Your xray config must have:
+1. **UDP enabled on port 443 inbounds:** `"network": "tcp,udp"`
+2. **QUIC allowed in routing:** (Do NOT block `protocol: "quic"`)
+3. **Policy with long idle timeout:** `"policy": {"levels": {"0": {"connIdle": 1800}}}`
 
 ### See HANDOFF.md for full architecture, design notes, and deployment details.
 
+### License
 
-[Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).
-
-[README](https://github.com/XTLS/Xray-core#readme) is open, so feel free to submit your project [here](https://github.com/XTLS/Xray-core/pulls).
+Mozilla Public License Version 2.0 (inherits from xray-core).
 
 ## Sponsors
 
@@ -96,202 +178,3 @@ Remove the env var drop-in file, daemon-reload, and restart. Or install the stoc
 [Project VLESS](https://t.me/projectVless) (Русский)
 
 [Project XHTTP](https://t.me/projectXhttp) (Persian)
-
-## Installation
-
-- Linux Script
-  - [XTLS/Xray-install](https://github.com/XTLS/Xray-install) (**Official**)
-  - [tempest](https://github.com/team-cloudchaser/tempest) (supports [`systemd`](https://systemd.io) and [OpenRC](https://github.com/OpenRC/openrc); Linux-only)
-- Docker
-  - [ghcr.io/xtls/xray-core](https://ghcr.io/xtls/xray-core) (**Official**)
-  - [teddysun/xray](https://hub.docker.com/r/teddysun/xray)
-  - [wulabing/xray_docker](https://github.com/wulabing/xray_docker)
-- Web Panel
-  - [Remnawave](https://github.com/remnawave/panel)
-  - [3X-UI](https://github.com/MHSanaei/3x-ui)
-  - [PasarGuard](https://github.com/PasarGuard/panel)
-  - [Xray-UI](https://github.com/qist/xray-ui)
-  - [X-Panel](https://github.com/xeefei/X-Panel)
-  - [Marzban](https://github.com/Gozargah/Marzban)
-  - [Hiddify](https://github.com/hiddify/Hiddify-Manager)
-  - [TX-UI](https://github.com/AghayeCoder/tx-ui)
-  - [CELERITY](https://github.com/ClickDevTech/CELERITY-panel)
-- One Click
-  - [Xray-REALITY](https://github.com/zxcvos/Xray-script), [xray-reality](https://github.com/sajjaddg/xray-reality), [reality-ezpz](https://github.com/aleskxyz/reality-ezpz)
-  - [Xray_bash_onekey](https://github.com/hello-yunshu/Xray_bash_onekey), [XTool](https://github.com/LordPenguin666/XTool), [VPainLess](https://github.com/vpainless/vpainless)
-  - [v2ray-agent](https://github.com/mack-a/v2ray-agent), [Xray_onekey](https://github.com/wulabing/Xray_onekey), [ProxySU](https://github.com/proxysu/ProxySU)
-- Magisk
-  - [Magic_V2Ray](https://github.com/vincentng295/Magic_V2Ray)
-  - [Xray_For_Magisk](https://github.com/E7KMbb/Xray_For_Magisk)
-- Homebrew
-  - `brew install xray`
-
-## Usage
-
-- Example
-  - [VLESS-XTLS-uTLS-REALITY](https://github.com/XTLS/REALITY#readme)
-  - [VLESS-TCP-XTLS-Vision](https://github.com/XTLS/Xray-examples/tree/main/VLESS-TCP-XTLS-Vision)
-  - [All-in-One-fallbacks-Nginx](https://github.com/XTLS/Xray-examples/tree/main/All-in-One-fallbacks-Nginx)
-- Xray-examples
-  - [XTLS/Xray-examples](https://github.com/XTLS/Xray-examples)
-  - [chika0801/Xray-examples](https://github.com/chika0801/Xray-examples)
-  - [lxhao61/integrated-examples](https://github.com/lxhao61/integrated-examples)
-- Tutorial
-  - [XTLS Vision](https://github.com/chika0801/Xray-install)
-  - [REALITY (English)](https://cscot.pages.dev/2023/03/02/Xray-REALITY-tutorial/)
-  - [XTLS-Iran-Reality (English)](https://github.com/SasukeFreestyle/XTLS-Iran-Reality)
-  - [Xray REALITY with 'steal oneself' (English)](https://computerscot.github.io/vless-xtls-utls-reality-steal-oneself.html)
-  - [Xray with WireGuard inbound (English)](https://g800.pages.dev/wireguard)
-
-## GUI Clients
-
-- OpenWrt
-  - [PassWall](https://github.com/Openwrt-Passwall/openwrt-passwall), [PassWall 2](https://github.com/Openwrt-Passwall/openwrt-passwall2)
-  - [ShadowSocksR Plus+](https://github.com/fw876/helloworld)
-  - [luci-app-xray](https://github.com/yichya/luci-app-xray) ([openwrt-xray](https://github.com/yichya/openwrt-xray))
-- Asuswrt-Merlin
-  - [XRAYUI](https://github.com/DanielLavrushin/asuswrt-merlin-xrayui)
-  - [fancyss](https://github.com/hq450/fancyss)
-- Windows
-  - [v2rayN](https://github.com/2dust/v2rayN)
-  - [Furious](https://github.com/LorenEteval/Furious)
-  - [Invisible Man - Xray](https://github.com/InvisibleManVPN/InvisibleMan-XRayClient)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [GenyConnect](https://github.com/genyleap/GenyConnect)
-  - [OneXray](https://github.com/OneXray/OneXray)
-  - [XrayUI-dev](https://github.com/PhoenixNil/XrayUI-dev)
-- Android
-  - [v2rayNG](https://github.com/2dust/v2rayNG)
-  - [X-flutter](https://github.com/XTLS/X-flutter)
-  - [SaeedDev94/Xray](https://github.com/SaeedDev94/Xray)
-  - [SimpleXray](https://github.com/lhear/SimpleXray)
-  - [XrayFA](https://github.com/Q7DF1/XrayFA)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [OneXray](https://github.com/OneXray/OneXray)
-  - [AsteriskNG](https://github.com/Asterisk4Magisk/AsteriskNG)
-- iOS & macOS arm64 & tvOS
-  - [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215) | [Happ RU](https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973) | [Happ tvOS](https://apps.apple.com/us/app/happ-proxy-utility-for-tv/id6748297274)
-  - [Streisand](https://apps.apple.com/app/streisand/id6450534064)
-  - [OneXray](https://github.com/OneXray/OneXray)
-  - [INCY](https://apps.apple.com/en/app/incy/id6756943388)
-- macOS arm64 & x64
-  - [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215) | [Happ RU](https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973)
-  - [V2rayU](https://github.com/yanue/V2rayU)
-  - [V2RayXS](https://github.com/tzmax/V2RayXS)
-  - [Furious](https://github.com/LorenEteval/Furious)
-  - [OneXray](https://github.com/OneXray/OneXray)
-  - [GoXRay](https://github.com/goxray/desktop)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [v2rayN](https://github.com/2dust/v2rayN)
-  - [GenyConnect](https://github.com/genyleap/GenyConnect)
-  - [INCY](https://apps.apple.com/en/app/incy/id6756943388)
-- Linux
-  - [v2rayA](https://github.com/v2rayA/v2rayA)
-  - [Furious](https://github.com/LorenEteval/Furious)
-  - [GorzRay](https://github.com/ketetefid/GorzRay)
-  - [GoXRay](https://github.com/goxray/desktop)
-  - [AnyPortal](https://github.com/AnyPortal/AnyPortal)
-  - [v2rayN](https://github.com/2dust/v2rayN)
-  - [GenyConnect](https://github.com/genyleap/GenyConnect)
-  - [OneXray](https://github.com/OneXray/OneXray)
-- HarmonyOS
-  - [Hey](https://github.com/popsiclelmlm/Hey)
-
-## Others that support VLESS, XTLS, REALITY, XUDP, PLUX...
-
-- iOS & macOS arm64 & tvOS
-  - [Anywhere](https://github.com/NodePassProject/Anywhere)
-  - [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118)
-  - [Loon](https://apps.apple.com/us/app/loon/id1373567447)
-  - [Egern](https://apps.apple.com/us/app/egern/id1616105820)
-  - [Quantumult X](https://apps.apple.com/us/app/quantumult-x/id1443988620)
-- Xray Tools
-  - [xray-knife](https://github.com/lilendian0x00/xray-knife)
-  - [xray-checker](https://github.com/kutovoys/xray-checker)
-- Xray Wrapper
-  - [XTLS/libXray](https://github.com/XTLS/libXray)
-  - [xtls-sdk](https://github.com/remnawave/xtls-sdk)
-  - [xtlsapi](https://github.com/hiddify/xtlsapi)
-  - [AndroidLibXrayLite](https://github.com/2dust/AndroidLibXrayLite)
-  - [flutter_vless](https://github.com/XIIIFOX/flutter_vless)
-  - [Xray-core-python](https://github.com/LorenEteval/Xray-core-python)
-  - [xray-api](https://github.com/XVGuardian/xray-api)
-- [XrayR](https://github.com/XrayR-project/XrayR)
-  - [XrayR-release](https://github.com/XrayR-project/XrayR-release)
-  - [XrayR-V2Board](https://github.com/missuo/XrayR-V2Board)
-- Cores
-  - [Amnezia VPN](https://github.com/amnezia-vpn)
-  - [mihomo](https://github.com/MetaCubeX/mihomo)
-  - [sing-box](https://github.com/SagerNet/sing-box)
-
-## Contributing
-
-[Code of Conduct](https://github.com/XTLS/Xray-core/blob/main/CODE_OF_CONDUCT.md)
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/XTLS/Xray-core)
-
-## Credits
-
-- [Xray-core v1.0.0](https://github.com/XTLS/Xray-core/releases/tag/v1.0.0) was forked from [v2fly-core 9a03cc5](https://github.com/v2fly/v2ray-core/commit/9a03cc5c98d04cc28320fcee26dbc236b3291256), and we have made & accumulated a huge number of enhancements over time, check [the release notes for each version](https://github.com/XTLS/Xray-core/releases).
-- For third-party projects used in [Xray-core](https://github.com/XTLS/Xray-core), check your local or [the latest go.mod](https://github.com/XTLS/Xray-core/blob/main/go.mod).
-
-### Bundled Third-Party Components Redistribution
-
-**Certain optional features dynamically load third-party components. These optional components are separate works distributed under their own licenses, and are bundled into the ZIP package for ease of use. Users may replace these components under the licenses from these components.**
-
-These components include:
-
-#### Wintun
-
-This distribution contains unmodified official precompiled and pre-signed Wintun binaries.
-
-- Project: Wintun
-- Copyright: Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved.
-- Redistribution License: Prebuilt Binaries License (PBL) bundled with official precompiled and pre-signed binaries from wintun.net
-- Component(s): wintun.dll
-- Source: https://www.wintun.net/
-- Included in:
-  - Windows x86 (windows-32, win7-32)
-  - Windows x86-64 (windows-64, win7-64)
-  - Windows AArch64 (windows-arm64)
-- Notes: Wintun is an optional runtime-loaded component only used for TUN inbound functionality on supported Windows platforms.
-
-## One-line Compilation
-
-### Windows (PowerShell)
-
-```powershell
-$env:CGO_ENABLED=0
-go build -o xray.exe -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -v ./main
-```
-
-### Linux / macOS
-
-```bash
-CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -v ./main
-```
-
-### Reproducible Releases
-
-Make sure that you are using the same Go version, and remember to set the git commit id (7 bytes):
-
-```bash
-CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=REPLACE -s -w -buildid=" -v ./main
-```
-
-For Android:
-
-```bash
-GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=/path/to/aarch64-linux-android24-clang go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=REPLACE -s -w -buildid= -checklinkname=0" -v ./main
-GOOS=android GOARCH=amd64 CGO_ENABLED=1 CC=/path/to/x86_64-linux-android24-clang go build -o xray -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=REPLACE -s -w -buildid= -checklinkname=0" -v ./main
-```
-
-If you are compiling a 32-bit MIPS/MIPSLE target, use this command instead:
-
-```bash
-CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -gcflags="-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=REPLACE -s -w -buildid=" -v ./main
-```
-
-## Stargazers over time
-
-[![Stargazers over time](https://starchart.cc/XTLS/Xray-core.svg)](https://starchart.cc/XTLS/Xray-core)
