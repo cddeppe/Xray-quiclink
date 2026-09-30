@@ -2,7 +2,8 @@ package freedom
 
 import (
     "context"
-    "sync"
+    "strings"
+	"sync"
     "time"
 
     "github.com/xtls/xray-core/common/errors"
@@ -49,38 +50,37 @@ func NewStickyResolver(ttl time.Duration) *StickyResolver {
     }
 }
 
-// Resolve returns a sticky IP for the given hostname. If a cached entry
-// exists and is fresh (within TTL), returns it. Otherwise, resolves fresh
-// via xray's default resolver, caches, and returns.
-//
-// The first resolution picks the first IP from the resolver's result
-// (which may be IPv4 or IPv6 — whatever the resolver returns first).
-// Subsequent resolutions of the same hostname return the same IP,
-// regardless of what the resolver returns later.
+// Resolve returns a sticky IP for the given hostname. 
+// If a cached entry exists, it returns it. If DNS fails (NXDOMAIN), 
+// it falls back to the last known good IP (stale-serve).
 func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Address, error) {
-    // Check cache (read lock)
+    // Check cache first
     s.mu.RLock()
     if entry, ok := s.entries[hostname]; ok {
-        if time.Since(entry.lastUsed) < s.ttl {
-            s.mu.RUnlock()
-            // Update lastUsed (needs write lock, but it's just a timestamp
-            // so we accept the race for simplicity)
-            entry.lastUsed = time.Now()
-            return entry.ip, nil
-        }
+        s.mu.RUnlock()
+        entry.lastUsed = time.Now()
+        return entry.ip, nil
     }
     s.mu.RUnlock()
 
     // Resolve fresh
     addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
-    if err != nil {
-        return nil, errors.New("sticky: failed to resolve ", hostname).Base(err)
-    }
-    if len(addrs) == 0 {
-        return nil, errors.New("sticky: no IPs returned for ", hostname)
+    if err != nil || len(addrs) == 0 {
+        // STALE-SERVE FALLBACK: If DNS fails, look for ANY cached entry 
+        // with the same domain suffix (e.g., *.googlevideo.com).
+        s.mu.RLock()
+        for host, entry := range s.entries {
+            if strings.HasSuffix(hostname, strings.SplitN(host, ".", 2)[1]) {
+                s.mu.RUnlock()
+                errors.LogInfo(ctx, "sticky: stale-serve fallback for ", hostname, " using ", entry.ip)
+                return entry.ip, nil
+            }
+        }
+        s.mu.RUnlock()
+        return nil, errors.New("sticky: failed to resolve and no stale cache for ", hostname)
     }
 
-    // Pick the first IP (could prefer IPv4 here if needed — see comment below)
+    // Pick the first IP
     ip := net.IPAddress(addrs[0].IP)
     if ip == nil {
         return nil, errors.New("sticky: resolved IP is nil for ", hostname)
