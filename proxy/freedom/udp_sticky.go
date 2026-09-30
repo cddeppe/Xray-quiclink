@@ -58,6 +58,15 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
     s.mu.RLock()
     if entry, ok := s.entries[hostname]; ok {
         s.mu.RUnlock()
+	// Wildcard match: check for *.domain.com entry
+	parts := strings.SplitN(hostname, ".", 2)
+	if len(parts) == 2 {
+		wildcardKey := "*." + parts[1]
+		if entry, ok := s.entries[wildcardKey]; ok {
+			entry.lastUsed = time.Now()
+			return entry.ip, nil
+		}
+	}
         entry.lastUsed = time.Now()
         return entry.ip, nil
     }
@@ -93,6 +102,17 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
         lastUsed: time.Now(),
     }
     s.mu.Unlock()
+	// Also cache a wildcard entry (e.g., *.googlevideo.com)
+	parts := strings.SplitN(hostname, ".", 2)
+	if len(parts) == 2 {
+		wildcardKey := "*." + parts[1]
+		if _, exists := s.entries[wildcardKey]; !exists {
+			s.entries[wildcardKey] = &stickyEntry{
+				ip:       ip,
+				lastUsed: time.Now(),
+			}
+		}
+	}
 
     errors.LogInfo(ctx, "sticky: resolved ", hostname, " -> ", ip)
     return ip, nil
