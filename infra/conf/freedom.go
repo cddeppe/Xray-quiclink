@@ -27,6 +27,7 @@ type FreedomConfig struct {
 	ProxyProtocol  uint32                    `json:"proxyProtocol"`
 	IPsBlocked     *StringList               `json:"ipsBlocked"`
 	FinalRules     []*FreedomFinalRuleConfig `json:"finalRules"`
+	UDPConfig      *UDPConfig     `json:"udpConfig"`
 }
 
 type Fragment struct {
@@ -190,7 +191,16 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 		config.FinalRules = append(config.FinalRules, rule)
 	}
 
-	return config, nil
+	
+	if c.UDPConfig != nil {
+		config.UdpConfig = &freedom.UDPConfig{
+			EnableSocketPool:     c.UDPConfig.EnableSocketPool,
+			EnableStickyResolver: c.UDPConfig.EnableStickyResolver,
+			PreferIpv4:           c.UDPConfig.PreferIPv4,
+			PreferIpv6:           c.UDPConfig.PreferIPv6,
+		}
+	}
+return config, nil
 }
 
 func ParseNoise(noise *Noise) (*freedom.Noise, error) {
@@ -285,4 +295,11 @@ func (c *FreedomFinalRuleConfig) Build() (*freedom.FinalRuleConfig, error) {
 	}
 
 	return rule, nil
+}
+
+type UDPConfig struct {
+	EnableSocketPool     bool `json:"enableSocketPool"`
+	EnableStickyResolver bool `json:"enableStickyResolver"`
+	PreferIPv4           bool `json:"preferIpv4"`
+	PreferIPv6           bool `json:"preferIpv6"`
 }

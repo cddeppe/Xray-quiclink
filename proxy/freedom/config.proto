@@ -54,6 +54,14 @@ message FinalRuleConfig {
   Range block_delay = 5;
 }
 
+
+message UDPConfig {
+  bool enable_socket_pool = 1;
+  bool enable_sticky_resolver = 2;
+  bool prefer_ipv4 = 3;
+  bool prefer_ipv6 = 4;
+}
+
 message Config {
   xray.transport.internet.DomainStrategy domain_strategy = 1;
   DestinationOverride destination_override = 3;
@@ -62,4 +70,5 @@ message Config {
   uint32 proxy_protocol = 6;
   repeated Noise noises = 7;
   repeated FinalRuleConfig final_rules = 8;
+  UDPConfig udp_config = 9;
 }

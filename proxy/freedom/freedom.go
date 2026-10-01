@@ -2,7 +2,6 @@ package freedom
 
 import (
 	"context"
-	"os"
 	"crypto/rand"
 	"io"
 	"strings"
@@ -33,14 +32,6 @@ import (
 )
 
 
-// UDPConfig holds settings for the UDP socket pool and sticky resolver.
-// These are parsed from the "udpConfig" field in the freedom outbound settings.
-type UDPConfig struct {
-	EnableSocketPool     bool
-	EnableStickyResolver bool
-	PreferIPv4           bool
-	PreferIPv6           bool
-}
 
 var (
 	useSplice               atomic.Bool
@@ -111,7 +102,6 @@ type Handler struct {
 	usesDialerProxy bool
 	socketPool      *UDPSocketPool
 	stickyResolver  *StickyResolver
-	udpConfig       *UDPConfig
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -206,17 +196,16 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.policyManager = pm
 
 	// Initialize UDP features from config
-    h.udpConfig = parseUDPConfig(config)
-    if h.udpConfig != nil {
-        if h.udpConfig.EnableSocketPool {
+    if config.UdpConfig != nil {
+        if config.UdpConfig.EnableSocketPool {
             h.socketPool = NewUDPSocketPool()
             errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled")
         }
-        if h.udpConfig.EnableStickyResolver {
+        if config.UdpConfig.EnableStickyResolver {
             h.stickyResolver = NewStickyResolver(5 * time.Minute)
-            h.stickyResolver.PreferIPv4 = h.udpConfig.PreferIPv4
-            h.stickyResolver.PreferIPv6 = h.udpConfig.PreferIPv6
-            errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (PreferIPv4:", h.udpConfig.PreferIPv4, "PreferIPv6:", h.udpConfig.PreferIPv6, ")")
+            h.stickyResolver.PreferIPv4 = config.UdpConfig.PreferIpv4
+            h.stickyResolver.PreferIPv6 = config.UdpConfig.PreferIpv6
+            errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (PreferIPv4:", config.UdpConfig.PreferIpv4, "PreferIPv6:", config.UdpConfig.PreferIpv6, ")")
         }
     }
 
@@ -902,39 +891,3 @@ func GenerateRandomBytes(n int64) ([]byte, error) {
 	return b, nil
 }
 
-// parseUDPConfig extracts the UDPConfig from the freedom config settings.
-// xray passes the raw JSON settings in the config object, but since we
-// didn't modify the protobuf, we need to parse it manually.
-func parseUDPConfig(config *Config) *UDPConfig {
-	if config == nil {
-		return nil
-	}
-	// The UDPConfig is not in the protobuf, so we rely on the fact that
-	// xray's JSON parser ignores unknown fields. We need to access the
-	// raw JSON. In xray, the config is built from JSON, so we can't
-	// easily get the raw JSON here.
-	
-	// However, we can use the environment variables as a fallback for now.
-	// This is a temporary measure until we can properly integrate with the
-	// xray config system. The env vars still work perfectly fine.
-	udpCfg := &UDPConfig{}
-	enabled := false
-	if os.Getenv("XRAY_UDP_POOL") == "1" {
-		udpCfg.EnableSocketPool = true
-		enabled = true
-	}
-	if os.Getenv("XRAY_UDP_STICKY") == "1" {
-		udpCfg.EnableStickyResolver = true
-		enabled = true
-	}
-	if os.Getenv("XRAY_UDP_PREFER_IPV4") == "1" {
-		udpCfg.PreferIPv4 = true
-	}
-	if os.Getenv("XRAY_UDP_PREFER_IPV6") == "1" {
-		udpCfg.PreferIPv6 = true
-	}
-	if !enabled {
-		return nil
-	}
-	return udpCfg
-}
