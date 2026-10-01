@@ -24,11 +24,20 @@ This fork introduces four new features to solve these problems:
 3. **UDP Socket Pool (`udp_pool.go`):** Pools outbound sockets by destination IP. Includes **Dead Socket Detection** (marks sockets dead on read/write errors), a 30-second staleness check for silently dropped connections, and an **Idle Reaper** (evicts sockets idle >10min or unused >5min).
 4. **QUIC CID Migration (`worker.go`):** Tracks QUIC Connection IDs. If a client migrates (NAT rebinding, CID rotation), the existing outbound socket is preserved.
 
-All features are opt-in via environment variables:
-- `XRAY_UDP_POOL=1` — Enable the UDP socket pool.
-- `XRAY_UDP_STICKY=1` — Enable the sticky DNS resolver.
-- `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
-- `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
+All features are configured via the `udpConfig` field in the freedom outbound JSON config:
+
+```json
+{
+  "protocol": "freedom",
+  "settings": {
+    "udpConfig": {
+      "enableSocketPool": true,
+      "enableStickyResolver": true,
+      "preferIpv4": true
+    }
+  }
+}
+```
 
 ### Architecture Diagrams
 
@@ -109,25 +118,21 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o xray-fork-arm64 ./main
 
 # Install
 sudo cp xray-fork-<arch> /usr/local/bin/xray
-sudo systemctl restart xray
 ```
 
-### Enable the Features
+### Configuration
+
+Add the `udpConfig` block to your freedom outbound in your xray config JSON. No environment variables needed.
 
 ```bash
 # Create systemd drop-in
-sudo mkdir -p /etc/systemd/system/xray.service.d
-sudo tee /etc/systemd/system/xray.service.d/udp-features.conf > /dev/null << 'EOF'
 [Service]
-Environment=XRAY_UDP_POOL=1
-Environment=XRAY_UDP_STICKY=1
-Environment=XRAY_UDP_PREFER_IPV4=1
 EOF
-sudo systemctl daemon-reload
-sudo systemctl restart xray
 ```
 
 ### Configuration Requirements
+
+Add the `udpConfig` block to your freedom outbound in your xray config JSON. No environment variables needed.
 
 Your xray config must have:
 1. **UDP enabled on port 443 inbounds:** `"network": "tcp,udp"`
