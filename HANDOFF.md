@@ -279,3 +279,32 @@ This combination ensures that:
 - The background refresh updates the cache immediately.
 - The next request (e.g., the browser's retry) gets the fresh, live IP.
 - The video plays smoothly without getting stuck at 0:00.
+
+## Production-Ready Refactor
+
+The fork was refactored to be production-ready for potential upstream inclusion:
+
+### 1. Proper UDPConfig struct
+- Replaced environment-variable-only configuration with a proper `UDPConfig` struct in `freedom.go`
+- The `parseUDPConfig` function reads the config and falls back to env vars for backward compatibility
+- Supports `EnableSocketPool`, `EnableStickyResolver`, `PreferIPv4`, and `PreferIPv6` flags
+
+### 2. IPv4/IPv6 Preference
+- Added `PreferIPv4` and `PreferIPv6` fields to the `StickyResolver` struct
+- When `PreferIPv4` is true, the resolver only picks IPv4 addresses from DNS results
+- When `PreferIPv6` is true, the resolver only picks IPv6 addresses
+- If neither is set, it uses the first address returned (dual-stack auto)
+- Enabled via `XRAY_UDP_PREFER_IPV4=1` or `XRAY_UDP_PREFER_IPV6=1` env vars
+
+### 3. Environment Variables (Current)
+All features are controlled via environment variables for easy deployment:
+- `XRAY_UDP_POOL=1` — Enable the UDP socket pool
+- `XRAY_UDP_STICKY=1` — Enable the sticky DNS resolver
+- `XRAY_UDP_PREFER_IPV4=1` — Force IPv4 preference (optional)
+- `XRAY_UDP_PREFER_IPV6=1` — Force IPv6 preference (optional)
+
+### 4. Final Tuning Parameters
+- Wildcard TTL: 60 seconds (matches YouTube's CDN edge rotation)
+- Pool staleness check: 30 seconds (silently dropped connections)
+- Idle reaper: 10 minutes (no replies) / 5 minutes (refCount=0)
+- UDP worker timeout: 30 minutes (was 2 minutes in stock xray)
