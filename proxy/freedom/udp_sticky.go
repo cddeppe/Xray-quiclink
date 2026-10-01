@@ -16,6 +16,8 @@ type StickyResolver struct {
     mu         sync.RWMutex
     ttl        time.Duration
     wildcardTTL time.Duration
+    PreferIPv4 bool
+    PreferIPv6 bool
 }
 
 type stickyEntry struct {
