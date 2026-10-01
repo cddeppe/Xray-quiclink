@@ -29,6 +29,10 @@ All features are opt-in via environment variables:
 - `XRAY_UDP_STICKY=1` — Enable the sticky DNS resolver.
 - `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
 - `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
+- `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
+- `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
+- `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
+- `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
 
 ### Architecture Diagrams
 
