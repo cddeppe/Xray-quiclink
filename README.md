@@ -29,10 +29,6 @@ All features are opt-in via environment variables:
 - `XRAY_UDP_STICKY=1` — Enable the sticky DNS resolver.
 - `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
 - `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
-- `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
-- `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
-- `XRAY_UDP_PREFER_IPV4=1` — (Optional) Force the sticky resolver to only use IPv4 addresses.
-- `XRAY_UDP_PREFER_IPV6=1` — (Optional) Force the sticky resolver to only use IPv6 addresses.
 
 ### Architecture Diagrams
 
@@ -72,25 +68,25 @@ graph TD
 
 ### How It Works
 
-#### Sticky Resolver (`udp_sticky.go`)
+#### Sticky Resolver with Stale-While-Revalidate (`udp_sticky.go`)
 
 When a new UDP flow arrives, the sticky resolver checks if the hostname is cached.
 - If yes, it returns the cached IP (no DNS lookup needed).
 - If no, it resolves the hostname, caches the IP, and returns it.
+- If DNS returns NXDOMAIN, it falls back to the last known-good IP for the domain suffix (e.g., `*.googlevideo.com`).
 - **Wildcard Caching:** Caches `*.googlevideo.com` with a 60-second TTL. When it expires, it returns the stale IP immediately AND triggers a background DNS refresh (stale-while-revalidate) to get a live edge IP.
 - **IPv4/IPv6 Preference:** Supports `XRAY_UDP_PREFER_IPV4=1` or `XRAY_UDP_PREFER_IPV6=1` to force the resolver to only pick addresses from the preferred family, eliminating "Happy Eyeballs" flipping entirely.
-- If DNS returns NXDOMAIN, it falls back to the last known-good IP for the domain suffix (e.g., `*.googlevideo.com`).
 
 This prevents the IPv4/IPv6 flipping and NXDOMAIN errors.
 
-#### UDP Socket Pool (`udp_pool.go`)
+#### UDP Socket Pool with Dead Socket Detection (`udp_pool.go`)
 
 When a new UDP flow arrives, the pool checks if a socket to the destination IP already exists.
 - If yes, it reuses the socket (no new socket creation).
 - If no, it creates a new socket and caches it.
 - **Dead Socket Detection:** If a socket read or write fails, it marks the socket as dead. The next flow creates a fresh socket.
 - **Staleness Check:** If a socket hasn't received a reply in 30 seconds, it is marked dead and evicted.
-- A background reaper goroutine evicts sockets that have been idle (no replies in 10 min) or unused (refCount=0 for 5 min).
+- **Idle Reaper:** A background goroutine evicts sockets that have been idle (no replies in 10 min) or unused (refCount=0 for 5 min).
 
 This prevents the per-connection overhead and handles CDN edge rotation.
 
@@ -125,6 +121,7 @@ sudo tee /etc/systemd/system/xray.service.d/udp-features.conf > /dev/null << 'EO
 [Service]
 Environment=XRAY_UDP_POOL=1
 Environment=XRAY_UDP_STICKY=1
+Environment=XRAY_UDP_PREFER_IPV4=1
 EOF
 sudo systemctl daemon-reload
 sudo systemctl restart xray
