@@ -100,6 +100,17 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
         ok = false
     }
     if ok {
+		// STALENESS CHECK: If the socket hasn't received a reply in 60 seconds,
+		// assume the CDN edge rotated and is silently dropping packets.
+		// Mark it dead and force the creation of a fresh socket for this request.
+		sock.mu.Lock()
+		isStale := time.Since(sock.lastReplyTime) > 60*time.Second
+		sock.mu.Unlock()
+		if isStale {
+			sock.MarkDead()
+			delete(p.sockets, key)
+			ok = false
+		}
         sock.mu.Lock()
         sock.refCount++
         sock.lastUsed = time.Now()
