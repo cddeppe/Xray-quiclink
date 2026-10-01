@@ -157,22 +157,9 @@ func (s *pooledSocket) readLoop() {
         default:
         }
 
-        // Set a 30-second read deadline.
-        // If no packets arrive within 30 seconds, the socket is likely dead
-        // (e.g., the CDN edge rotated and is silently dropping packets).
-        // This forces instant detection and eviction, rather than waiting
-        // for the browser to time out or the 10-minute idle reaper to run.
-        _ = s.conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
         n, addr, err := s.conn.ReadFrom(b)
         if err != nil {
             if s.IsClosed() {
-                return
-            }
-            // Check if the error is a timeout (net.Error)
-            if netErr, ok := err.(stdnet.Error); ok && netErr.Timeout() {
-                errors.LogInfo(context.Background(), "udp_pool: read timeout (30s), marking socket dead: ", s.dest)
-                s.MarkDead()
                 return
             }
             errors.LogInfo(context.Background(), "udp_pool: read error, marking socket dead: ", err)
