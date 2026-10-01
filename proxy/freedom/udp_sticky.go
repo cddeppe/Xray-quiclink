@@ -3,7 +3,7 @@ package freedom
 import (
     "context"
     "strings"
-	"sync"
+    "sync"
     "time"
 
     "github.com/xtls/xray-core/common/errors"
@@ -11,27 +11,11 @@ import (
 )
 
 // StickyResolver provides per-hostname DNS result stickiness for UDP outbound.
-//
-// Problem it solves: when xray's freedom outbound handles many UDP flows to
-// the same destination hostname (e.g., rr1---sn-xxx.googlevideo.com), it
-// re-resolves the hostname per flow and picks a random IP from the result.
-// If the destination has both IPv4 and IPv6 records, different flows in the
-// same conversation may go out from different source IPs. Some destination
-// servers (notably YouTube's CDN) embed the source IP they see in videoplayback
-// URLs and reject subsequent requests if the source IP doesn't match —
-// returning 400 Bad Request.
-//
-// The fix: cache the first resolved IP for each hostname and reuse it for
-// subsequent flows within a TTL. This makes all flows to the same hostname
-// use the same destination IP and (implicitly) the same source IP, so the
-// destination server sees consistency.
-//
-// This is opt-in via the XRAY_UDP_STICKY=1 environment variable. When
-// disabled, freedom uses the existing per-flow resolution path unchanged.
 type StickyResolver struct {
-    entries map[string]*stickyEntry
-    mu      sync.RWMutex
-    ttl     time.Duration
+    entries    map[string]*stickyEntry
+    mu         sync.RWMutex
+    ttl        time.Duration
+    wildcardTTL time.Duration
 }
 
 type stickyEntry struct {
@@ -39,44 +23,86 @@ type stickyEntry struct {
     lastUsed time.Time
 }
 
-// NewStickyResolver creates a new StickyResolver with the given TTL.
-// Recommended TTL: 5 minutes — long enough to cover a typical video
-// streaming session's related flows, short enough to handle CDN edge
-// rotation eventually.
 func NewStickyResolver(ttl time.Duration) *StickyResolver {
     return &StickyResolver{
-        entries: make(map[string]*stickyEntry),
-        ttl:     ttl,
+        entries:    make(map[string]*stickyEntry),
+        ttl:        ttl,
+        wildcardTTL: 60 * time.Second,
     }
 }
 
-// Resolve returns a sticky IP for the given hostname. 
-// If a cached entry exists, it returns it. If DNS fails (NXDOMAIN), 
-// it falls back to the last known good IP (stale-serve).
+// Resolve returns a sticky IP for the given hostname.
+// Exact matches are permanent. Wildcard matches expire after 5 minutes.
+// When a wildcard expires, we return the stale IP immediately AND
+// trigger a background refresh (stale-while-revalidate).
 func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Address, error) {
-    // Check cache first
+    // Check exact match first (permanent, no TTL)
     s.mu.RLock()
     if entry, ok := s.entries[hostname]; ok {
         s.mu.RUnlock()
-	// Wildcard match: check for *.domain.com entry
-	parts := strings.SplitN(hostname, ".", 2)
-	if len(parts) == 2 {
-		wildcardKey := "*." + parts[1]
-		if entry, ok := s.entries[wildcardKey]; ok {
-			entry.lastUsed = time.Now()
-			return entry.ip, nil
-		}
-	}
         entry.lastUsed = time.Now()
         return entry.ip, nil
     }
+
+    // Check wildcard match (e.g., *.googlevideo.com)
+    parts := strings.SplitN(hostname, ".", 2)
+    if len(parts) == 2 {
+        wildcardKey := "*." + parts[1]
+        if entry, ok := s.entries[wildcardKey]; ok {
+            if time.Since(entry.lastUsed) < s.wildcardTTL {
+                // Wildcard is fresh — return it instantly
+                s.mu.RUnlock()
+                entry.lastUsed = time.Now()
+                return entry.ip, nil
+            }
+            // Wildcard is expired — return stale IP immediately,
+            // AND trigger background refresh (stale-while-revalidate)
+            staleIP := entry.ip
+            s.mu.RUnlock()
+
+            // Background refresh: resolve in a goroutine
+            go s.refreshWildcard(hostname, wildcardKey)
+
+            errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
+            return staleIP, nil
+        }
+    }
     s.mu.RUnlock()
 
-    // Resolve fresh
+    // No cache hit — resolve fresh
+    return s.resolveAndCache(ctx, hostname)
+}
+
+// refreshWildcard does a background DNS resolution and updates the cache.
+// This runs in a goroutine so the current request isn't blocked.
+func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
+    ctx := context.Background()
     addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
     if err != nil || len(addrs) == 0 {
-        // STALE-SERVE FALLBACK: If DNS fails, look for ANY cached entry 
-        // with the same domain suffix (e.g., *.googlevideo.com).
+        errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname, ": ", err)
+        return
+    }
+
+    ip := net.IPAddress(addrs[0].IP)
+    if ip == nil {
+        return
+    }
+
+    // Update the wildcard cache with the fresh IP
+    s.mu.Lock()
+    s.entries[wildcardKey] = &stickyEntry{ip: ip, lastUsed: time.Now()}
+    // Also update the exact match
+    s.entries[hostname] = &stickyEntry{ip: ip, lastUsed: time.Now()}
+    s.mu.Unlock()
+
+    errors.LogInfo(ctx, "sticky: background refresh completed for ", hostname, " -> ", ip)
+}
+
+// resolveAndCache does a fresh DNS resolution and caches the result.
+func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (net.Address, error) {
+    addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+    if err != nil || len(addrs) == 0 {
+        // Stale-serve fallback: look for any cached entry with same domain suffix
         s.mu.RLock()
         for host, entry := range s.entries {
             if strings.HasSuffix(hostname, strings.SplitN(host, ".", 2)[1]) {
@@ -89,38 +115,23 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
         return nil, errors.New("sticky: failed to resolve and no stale cache for ", hostname)
     }
 
-    // Pick the first IP
     ip := net.IPAddress(addrs[0].IP)
     if ip == nil {
         return nil, errors.New("sticky: resolved IP is nil for ", hostname)
     }
 
-    // Cache (write lock)
+    // Cache exact match and wildcard
     s.mu.Lock()
-    s.entries[hostname] = &stickyEntry{
-        ip:       ip,
-        lastUsed: time.Now(),
+    s.entries[hostname] = &stickyEntry{ip: ip, lastUsed: time.Now()}
+    parts := strings.SplitN(hostname, ".", 2)
+    if len(parts) == 2 {
+        wildcardKey := "*." + parts[1]
+        if _, exists := s.entries[wildcardKey]; !exists {
+            s.entries[wildcardKey] = &stickyEntry{ip: ip, lastUsed: time.Now()}
+        }
     }
     s.mu.Unlock()
-	// Also cache a wildcard entry (e.g., *.googlevideo.com)
-	parts := strings.SplitN(hostname, ".", 2)
-	if len(parts) == 2 {
-		wildcardKey := "*." + parts[1]
-		if _, exists := s.entries[wildcardKey]; !exists {
-			s.entries[wildcardKey] = &stickyEntry{
-				ip:       ip,
-				lastUsed: time.Now(),
-			}
-		}
-	}
 
     errors.LogInfo(ctx, "sticky: resolved ", hostname, " -> ", ip)
     return ip, nil
 }
-
-// Note on IP family preference:
-// Currently, this picks the first IP from the resolver's result. If you want
-// to prefer IPv4 (or IPv6), modify the Resolve function to filter addrs by
-// family before picking. For dual-stack destinations where either family
-// works, "first result" is fine. For destinations where one family is more
-// reliable, prefer that family explicitly.

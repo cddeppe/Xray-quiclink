@@ -104,7 +104,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 		// assume the CDN edge rotated and is silently dropping packets.
 		// Mark it dead and force the creation of a fresh socket for this request.
 		sock.mu.Lock()
-		isStale := time.Since(sock.lastReplyTime) > 60*time.Second
+		isStale := time.Since(sock.lastReplyTime) > 30*time.Second
 		sock.mu.Unlock()
 		if isStale {
 			sock.MarkDead()
