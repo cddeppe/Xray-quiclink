@@ -258,3 +258,24 @@ These were considered during the project but not implemented:
 3. **Multiple-CID support via NEW_CONNECTION_ID frames** — current `srcIndex` fallback handles the common case, but proper NEW_CONNECTION_ID tracking would be more correct. Could be future improvement.
 
 4. **GSO/GRO for outbound** — would batch syscalls for higher throughput. Not needed for this use case (single user, mobile video).
+
+## Final Tuning (Post-Initial Release)
+
+After extensive testing with the YouTube Android app, we discovered that YouTube rotates its CDN edge hostnames every 60-90 seconds. This caused videos to occasionally get "stuck at 0:00" when swiping to a new video after watching one for a minute or two.
+
+### The Root Cause
+1. The Sticky Resolver's wildcard cache (`*.googlevideo.com`) was permanent (no TTL).
+2. When YouTube rotated the edge, the wildcard cache still held the old (now dead) IP.
+3. The pool created new sockets to this dead IP.
+4. The QUIC handshake went into a black hole, and the video sat at 0:00.
+
+### The Fix: Stale-While-Revalidate
+1. **Wildcard TTL:** Set to 60 seconds to match YouTube's rotation window.
+2. **Stale-While-Revalidate:** When the wildcard expires, the stale IP is returned immediately (so the current request isn't blocked), AND a background goroutine does a fresh DNS resolution to update the cache for the next request.
+3. **Pool Staleness Check:** Reduced from 60 seconds to 30 seconds. If a socket hasn't received a reply in 30 seconds, it is marked dead and evicted, ensuring the next request creates a fresh socket to a live edge.
+
+This combination ensures that:
+- The first request after a rotation gets the stale IP (fast, but might fail).
+- The background refresh updates the cache immediately.
+- The next request (e.g., the browser's retry) gets the fresh, live IP.
+- The video plays smoothly without getting stuck at 0:00.
