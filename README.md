@@ -141,9 +141,23 @@ Your xray config must have:
 
 ### See HANDOFF.md for full architecture, design notes, and deployment details.
 
+## Support
+
+If this fork saves you time and you want to support its maintenance, feel free to buy me a coffee:
+
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/cdeppe)
+
+
 ### License
 
 Mozilla Public License Version 2.0 (inherits from xray-core).
+
+## Support
+
+If this fork saves you time and you want to support its maintenance, feel free to buy me a coffee:
+
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/cdeppe)
+
 
 ## License
 
