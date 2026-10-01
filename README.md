@@ -20,8 +20,8 @@ When you use DNS hijacking (e.g., Control D) to point `youtube.com` to your VPS,
 This fork introduces four new features to solve these problems:
 
 1. **Extended UDP Timeout:** The hardcoded 2-minute timeout in `worker.go` is increased to 30 minutes.
-2. **Sticky Resolver (`udp_sticky.go`):** Caches the first DNS resolution per hostname. If DNS fails (NXDOMAIN), it falls back to the last known-good IP for the domain suffix (stale-serve).
-3. **UDP Socket Pool (`udp_pool.go`):** Pools outbound sockets by destination IP. Includes **Dead Socket Detection** (marks sockets dead on read/write errors) and an **Idle Reaper** (evicts sockets idle >10min or unused >5min).
+2. **Sticky Resolver (`udp_sticky.go`):** Caches the first DNS resolution per hostname. If DNS fails (NXDOMAIN), it falls back to the last known-good IP for the domain suffix (stale-serve). Includes Wildcard Caching (`*.googlevideo.com`) with a 60-second TTL and background refresh (stale-while-revalidate). Supports IPv4/IPv6 preference flags.
+3. **UDP Socket Pool (`udp_pool.go`):** Pools outbound sockets by destination IP. Includes **Dead Socket Detection** (marks sockets dead on read/write errors), a 30-second staleness check for silently dropped connections, and an **Idle Reaper** (evicts sockets idle >10min or unused >5min).
 4. **QUIC CID Migration (`worker.go`):** Tracks QUIC Connection IDs. If a client migrates (NAT rebinding, CID rotation), the existing outbound socket is preserved.
 
 All features are opt-in via environment variables:
@@ -76,7 +76,9 @@ graph TD
 
 When a new UDP flow arrives, the sticky resolver checks if the hostname is cached.
 - If yes, it returns the cached IP (no DNS lookup needed).
-- If no, it resolves the hostname, caches the IP (IPv4 or IPv6, whichever is first), and returns it.
+- If no, it resolves the hostname, caches the IP, and returns it.
+- **Wildcard Caching:** Caches `*.googlevideo.com` with a 60-second TTL. When it expires, it returns the stale IP immediately AND triggers a background DNS refresh (stale-while-revalidate) to get a live edge IP.
+- **IPv4/IPv6 Preference:** Supports `XRAY_UDP_PREFER_IPV4=1` or `XRAY_UDP_PREFER_IPV6=1` to force the resolver to only pick addresses from the preferred family, eliminating "Happy Eyeballs" flipping entirely.
 - If DNS returns NXDOMAIN, it falls back to the last known-good IP for the domain suffix (e.g., `*.googlevideo.com`).
 
 This prevents the IPv4/IPv6 flipping and NXDOMAIN errors.
@@ -86,7 +88,8 @@ This prevents the IPv4/IPv6 flipping and NXDOMAIN errors.
 When a new UDP flow arrives, the pool checks if a socket to the destination IP already exists.
 - If yes, it reuses the socket (no new socket creation).
 - If no, it creates a new socket and caches it.
-- If a socket read or write fails, it marks the socket as dead, removes it from the pool, and the next flow creates a fresh socket.
+- **Dead Socket Detection:** If a socket read or write fails, it marks the socket as dead. The next flow creates a fresh socket.
+- **Staleness Check:** If a socket hasn't received a reply in 30 seconds, it is marked dead and evicted.
 - A background reaper goroutine evicts sockets that have been idle (no replies in 10 min) or unused (refCount=0 for 5 min).
 
 This prevents the per-connection overhead and handles CDN edge rotation.
