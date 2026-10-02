@@ -212,7 +212,7 @@ sudo cp xray /usr/local/bin/xray
 
 ### Configuration
 
-See `example-configs/vps-3959-consolidated.json` for a complete working example (uses documentation IP ranges 192.0.2.0/24 and 2001:db8::/32, not real IPs). Key points:
+See `example-configs/vps-consolidated.json` for a complete working example (uses documentation IP ranges 192.0.2.0/24 and 2001:db8::/32, not real IPs). Key points:
 
 1. Multi-IP inbound listen: `listen: [v4-ip, v6-ip]` consolidates per-IP inbounds into one block.
 2. `portMap` for multi-port: a single inbound can listen on multiple ports and forward each to a different destination.
