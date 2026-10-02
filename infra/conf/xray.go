@@ -130,7 +130,7 @@ func (m *MuxConfig) Build() (*proxyman.MultiplexingConfig, error) {
 type InboundDetourConfig struct {
 	Protocol       string           `json:"protocol"`
 	PortList       *PortList        `json:"port"`
-	ListenOn       *Address         `json:"listen"`
+	ListenOn       *AddressList     `json:"listen"`
 	Settings       *json.RawMessage `json:"settings"`
 	Tag            string           `json:"tag"`
 	StreamSetting  *StreamConfig    `json:"streamSettings"`
@@ -138,13 +138,40 @@ type InboundDetourConfig struct {
 }
 
 // Build implements Buildable.
-func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
+// BuildAll builds one *core.InboundHandlerConfig per listen IP.
+// For a single (or no) listen address, exactly one config is returned.
+// For multiple listen addresses, one config is produced per IP, with a
+// synthesized tag of the form `<originalTag>#<ip>` so routing can target
+// each listener individually.
+func (c *InboundDetourConfig) BuildAll() ([]*core.InboundHandlerConfig, error) {
+	var addrs []*Address
+	if c.ListenOn != nil {
+		addrs = []*Address(*c.ListenOn)
+	}
+	if len(addrs) == 0 {
+		// Listen on anyip — single config with no Listen set
+		addrs = []*Address{nil}
+	}
+	configs := make([]*core.InboundHandlerConfig, 0, len(addrs))
+	for idx, addr := range addrs {
+		cfg, err := c.buildOne(addr, idx)
+		if err != nil {
+			return nil, err
+		}
+		configs = append(configs, cfg)
+	}
+	return configs, nil
+}
+
+// buildOne constructs a single InboundHandlerConfig bound to the given listen
+// address. If addr is nil, the handler listens on anyip.
+func (c *InboundDetourConfig) buildOne(listenAddr *Address, idx int) (*core.InboundHandlerConfig, error) {
 	receiverSettings := &proxyman.ReceiverConfig{}
 
 	// TUN inbound doesn't need port configuration as it uses network interface instead
 	if strings.ToLower(c.Protocol) == "tun" {
 		// Skip port validation for TUN
-	} else if c.ListenOn == nil || len(c.ListenOn.String()) == 0 {
+	} else if listenAddr == nil || len(listenAddr.String()) == 0 {
 		// Listen on anyip, must set PortList
 		if c.PortList == nil {
 			return nil, errors.New("Listen on AnyIP but no Port(s) set in InboundDetour.")
@@ -152,9 +179,9 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 		receiverSettings.PortList = c.PortList.Build()
 	} else {
 		// Listen on specific IP or Unix Domain Socket
-		receiverSettings.Listen = c.ListenOn.Build()
-		listenDS := c.ListenOn.Family().IsDomain() && (filepath.IsAbs(c.ListenOn.Domain()) || c.ListenOn.Domain()[0] == '@')
-		listenIP := c.ListenOn.Family().IsIP() || (c.ListenOn.Family().IsDomain() && c.ListenOn.Domain() == "localhost")
+		receiverSettings.Listen = listenAddr.Build()
+		listenDS := listenAddr.Family().IsDomain() && (filepath.IsAbs(listenAddr.Domain()) || listenAddr.Domain()[0] == '@')
+		listenIP := listenAddr.Family().IsIP() || (listenAddr.Family().IsDomain() && listenAddr.Domain() == "localhost")
 		if listenIP {
 			// Listen on specific IP, must set PortList
 			if c.PortList == nil {
@@ -168,7 +195,7 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 				receiverSettings.PortList = nil
 			}
 		} else {
-			return nil, errors.New("unable to listen on domain address: ", c.ListenOn.Domain())
+			return nil, errors.New("unable to listen on domain address: ", listenAddr.Domain())
 		}
 	}
 
@@ -210,13 +237,29 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 		return nil, errors.New("the masque transport can only be used by the masque inbound")
 	}
 
+	// Synthesize a per-IP tag when multiple listen addresses are given.
+	tag := c.Tag
+	if c.ListenOn != nil && len(*c.ListenOn) > 1 && listenAddr != nil {
+		tag = c.Tag + "#" + listenAddr.String()
+	}
+
 	return &core.InboundHandlerConfig{
-		Tag:              c.Tag,
+		Tag:              tag,
 		ReceiverSettings: serial.ToTypedMessage(receiverSettings),
 		ProxySettings:    serial.ToTypedMessage(ts),
 	}, nil
 }
 
+// Build implements Buildable. For backward compatibility it returns the
+// first config produced by BuildAll(). Use BuildAll() to obtain one config
+// per listen IP when `"listen"` is an array.
+func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
+	all, err := c.BuildAll()
+	if err != nil {
+		return nil, err
+	}
+	return all[0], nil
+}
 type OutboundDetourConfig struct {
 	Protocol       string           `json:"protocol"`
 	SendThrough    *string          `json:"sendThrough"`
@@ -675,11 +718,11 @@ func (c *Config) Build() (*core.Config, error) {
 	}
 
 	for _, rawInboundConfig := range inbounds {
-		ic, err := rawInboundConfig.Build()
+		ics, err := rawInboundConfig.BuildAll()
 		if err != nil {
 			return nil, errors.New("failed to build inbound config with tag ", rawInboundConfig.Tag).Base(err)
 		}
-		config.Inbound = append(config.Inbound, ic)
+		config.Inbound = append(config.Inbound, ics...)
 	}
 
 	var outbounds []OutboundDetourConfig
