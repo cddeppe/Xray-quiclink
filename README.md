@@ -1,4 +1,4 @@
-# xray-quiclink
+# Xray-quiclink
 
 A fork of [Xray-core](https://github.com/XTLS/Xray-core) focused on **multi-hop transparent proxying with deterministic source-IP handling**. Originally built to solve QUIC/HTTP3 proxying through a multi-hop chain (Home -> vps-de -> vps-al -> YouTube), now also supports multi-IP inbound listen and outbound source-IP binding.
 
