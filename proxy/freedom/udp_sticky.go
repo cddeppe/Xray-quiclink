@@ -117,7 +117,26 @@ func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (
         return nil, errors.New("sticky: failed to resolve and no stale cache for ", hostname)
     }
 
-    ip := net.IPAddress(addrs[0].IP)
+    // Apply IPv4/IPv6 preference if set. If PreferIPv4 is true, scan for
+    // the first IPv4 address. If PreferIPv6 is true, scan for the first
+    // IPv6 address. If neither is set, fall back to addrs[0].
+    var selectedAddr net.IP
+    if s.PreferIPv4 || s.PreferIPv6 {
+        for _, addr := range addrs {
+            if s.PreferIPv4 && len(addr.IP) == net.IPv4len {
+                selectedAddr = addr.IP
+                break
+            }
+            if s.PreferIPv6 && len(addr.IP) == net.IPv6len {
+                selectedAddr = addr.IP
+                break
+            }
+        }
+    }
+    if selectedAddr == nil {
+        selectedAddr = addrs[0].IP
+    }
+    ip := net.IPAddress(selectedAddr)
     if ip == nil {
         return nil, errors.New("sticky: resolved IP is nil for ", hostname)
     }
