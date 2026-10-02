@@ -1,4 +1,4 @@
-# xray-link
+# xray-quiclink
 
 A fork of [Xray-core](https://github.com/XTLS/Xray-core) focused on **multi-hop transparent proxying with deterministic source-IP handling**. Originally built to solve QUIC/HTTP3 proxying through a multi-hop chain (Home -> vps-de -> vps-al -> YouTube), now also supports multi-IP inbound listen and outbound source-IP binding.
 
@@ -233,11 +233,11 @@ With `useip`, xray resolves the domain via its internal DNS (querying both A and
 
 ### Build and Install
 
-Pre-built binaries are available on the [releases page](https://github.com/cddeppe/Xray-link/releases).
+Pre-built binaries are available on the [releases page](https://github.com/cddeppe/xray-quiclink/releases).
 
 ```bash
 # Download from latest release (AMD64)
-wget https://github.com/cddeppe/Xray-link/releases/latest/download/xray-linux-amd64 -O xray
+wget https://github.com/cddeppe/xray-quiclink/releases/latest/download/xray-linux-amd64 -O xray
 chmod +x xray
 sudo cp xray /usr/local/bin/xray
 
