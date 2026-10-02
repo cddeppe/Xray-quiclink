@@ -10,6 +10,13 @@ Solves how to transparently proxy QUIC/HTTP3 traffic (like YouTube) through a mu
 
 Standard xray fails in this scenario because it is a Layer-4 proxy, but QUIC is a Layer-7 protocol with strict connection validation. This fork bridges that gap.
 
+**Four architectural limitations solved:**
+
+1. **2-Minute Session Timeout:** xray kills UDP sessions after 2 minutes of inactivity. Video buffering pauses kill the session. **Fix:** Extended to 30 minutes.
+2. **IPv4/IPv6 Flipping:** xray re-resolves DNS per flow, randomly picking IPv4 or IPv6. YouTube validates the source IP and rejects mismatches (400 errors). **Fix:** Sticky resolver with IPv4/IPv6 preference.
+3. **NXDOMAIN Edge Rotation:** YouTube rotates CDN hostnames faster than public DNS caches them. xray tries to resolve a new hostname, gets NXDOMAIN, and drops the flow. **Fix:** Sticky resolver with wildcard cache + stale-while-revalidate.
+4. **Per-Connection Overhead:** Each new flow creates a new outbound socket. If a CDN edge dies, the socket stays open and continues to fail. **Fix:** UDP socket pool with dead-socket detection.
+
 ### 2. Multi-IP Inbound Listen (v26.10.0)
 
 The `listen` field on inbounds now accepts an **array** of IPs, producing one inbound handler per IP. Backward compatible with the single-string form.
@@ -20,17 +27,37 @@ The `listen` field on inbounds now accepts an **array** of IPs, producing one in
 
 Produces two underlying handlers with synthesized tags `<tag>#<ip>` so routing can target each individually. Consolidates configs from N*2 inbounds (one per IP per port) down to N inbounds (one per port, multi-IP).
 
-### 3. Deterministic Outbound Source IP (v26.10.1)
+**Why:** Servers with multiple public IPs (up to 10+) previously needed one inbound config per IP per port. A 6-IP server with 8 ports needed 96 inbound entries. With multi-IP listen, it needs 8 inbound entries — one per port, each listing all 6 IPs.
 
-For servers with multiple public IPs, `sendThrough: origin` on the freedom outbound binds the outbound dial's source IP to the inbound listen IP. Combined with three small patches:
+### 3. Deterministic Outbound Source IP (v26.10.1 + v26.10.2)
 
-- `resolveSrcAddr` (system_dialer.go): skips source binding when destination is loopback or source/dest IP families mismatch (avoids EADDRNOTAVAIL)
-- `LookupForIP` (dialer.go): queries both A and AAAA DNS records regardless of source IP family (so IPv4-only domains resolve even with IPv6 source)
-- UDP pool bypass (freedom.go): bypasses the socket pool when sendThrough is configured, so QUIC honors the source IP
+For servers with multiple public IPs, the kernel might pick a different source IP than the one the client connected to. `sendThrough: "origin"` forces the outbound dial's source IP to match the inbound listen IP.
 
-This makes `sendThrough: origin` safe to use universally -- it kicks in when families match, and lets the kernel pick when they don't.
+**Four patches make this safe:**
 
-### The Problem
+1. **`transport/internet/system_dialer.go`** -- `resolveSrcAddr` now takes `dest` as a second argument and returns nil (let kernel pick source) when:
+   - `src` is nil or wildcard (AnyIP/AnyIPv6)
+   - `dest` is loopback and `src` is non-loopback (would EADDRNOTAVAIL)
+   - `src` and `dest` are IPs of different families (would EADDRNOTAVAIL)
+
+2. **`transport/internet/dialer.go`** -- `LookupForIP` now queries both A and AAAA records regardless of `localAddr` family. Previously, when a source IP was set, only the matching family was queried -- so IPv6 source + IPv4-only destination returned empty DNS response and the dial failed. Now the DNS query returns whatever the domain has, and the family-mismatch guard in `resolveSrcAddr` handles the source-binding decision.
+
+3. **`app/proxyman/outbound/handler.go`** -- `isLoopbackDestination` guard prevents `SetOutboundGateway` from being called when the destination is loopback (127.0.0.0/8, ::1, localhost). This prevents EADDRNOTAVAIL when the dokodemo default destination is 127.0.0.1:443 (when SNI sniffing fails and no explicit `address` is set in the inbound).
+
+4. **`proxy/freedom/freedom.go`** -- **TCP/UDP separation** (v26.10.2). `SetOutboundGateway` is only called for TCP, or for UDP when the socket pool is NOT enabled. When the UDP pool is enabled, `outGateway` stays nil so the pool's wildcard-bound sockets are used for DCID demuxing. This is critical because:
+
+   - **TCP**: Each connection is a dedicated stream. Source IP can be bound per-connection via `dialer.LocalAddr`. `sendThrough: origin` works cleanly.
+   - **UDP/QUIC**: Multiple QUIC sessions share the same outbound socket in the pool, demuxed by DCID. The pool socket is wildcard-bound -- it can't bind a specific source IP. If `sendThrough` were applied to UDP, the pool would be bypassed, and QUIC packets would fall back to per-session sockets without DCID demuxing. When SNI sniffing fails (200ms timeout), the destination stays at 127.0.0.1:443 (dokodemo default), creating a dial-self loop that freezes YouTube.
+
+   **The fix**: `sendThrough: origin` is applied to TCP only. UDP uses the pool (when `enableSocketPool: true`), which handles DCID demuxing and doesn't depend on SNI sniffing.
+
+**Why `domainStrategy: useip` is required in the outbound's sockopt:**
+
+`sendThrough: origin` needs the destination resolved to an IP *before* the system dialer runs, so the family-mismatch guard in `resolveSrcAddr` can compare the source and destination families. Without `useip`, the destination stays a domain and the guard can't run -- leading to "no suitable address found" errors for cross-family dials (e.g., IPv6 listen IP + IPv4-only destination).
+
+**None of these patches touch the dispatcher, sniffer, inbound worker, routing, or config parser** -- so SNI sniffing is unaffected by construction.
+
+### The Problem (Detailed)
 
 When you use DNS hijacking (e.g., Control D) to point `youtube.com` to your VPS, the browser sends QUIC packets to the VPS. xray sniffs the SNI and tries to forward the packet. However, it fails due to four architectural limitations:
 
@@ -45,7 +72,7 @@ This fork introduces four new features to solve these problems:
 
 1. **Extended UDP Timeout:** The hardcoded 2-minute timeout in `worker.go` is increased to 30 minutes.
 2. **Sticky Resolver (`udp_sticky.go`):** Caches the first DNS resolution per hostname. If DNS fails (NXDOMAIN), it falls back to the last known-good IP for the domain suffix (stale-serve). Includes Wildcard Caching (`*.googlevideo.com`) with a 60-second TTL and background refresh (stale-while-revalidate). Supports IPv4/IPv6 preference flags.
-3. **UDP Socket Pool (`udp_pool.go`):** Pools outbound sockets by destination IP. Includes **Dead Socket Detection** (marks sockets dead on read/write errors), a 30-second staleness check for silently dropped connections, and an **Idle Reaper** (evicts sockets idle >10min or unused >5min).
+3. **UDP Socket Pool (`udp_pool.go`):** Pools outbound sockets by destination IP. Includes **Dead Socket Detection** (marks sockets dead on read/write errors), a 30-second staleness check for silently dropped connections, and an **Idle Reaper** (evicts sockets idle >10min or unused >5min). Demuxes QUIC by DCID (Connection ID), so reply packets are routed to the correct session even when SNI sniffing fails.
 4. **QUIC CID Migration (`worker.go`):** Tracks QUIC Connection IDs. If a client migrates (NAT rebinding, CID rotation), the existing outbound socket is preserved.
 
 All features are configured via the `udpConfig` field in the freedom outbound JSON config:
@@ -71,12 +98,12 @@ All features are configured via the `udpConfig` field in the freedom outbound JS
 graph TD
     A[Home Browser] -->|UDP/QUIC| B(VPS xray)
     B -->|Sniff SNI| C{Resolve DNS}
-    C -->|NXDOMAIN| D[❌ Flow Dropped]
+    C -->|NXDOMAIN| D[Flow Dropped]
     C -->|IPv4| E[YouTube IPv4 Edge]
     C -->|IPv6| F[YouTube IPv6 Edge]
     E -.->|400 Error| G[Browser Stalls]
     F -.->|400 Error| G
-    B -->|2 min idle| H[❌ Session Killed]
+    B -->|2 min idle| H[Session Killed]
     H --> G
 ```
 
@@ -94,7 +121,7 @@ graph TD
     F --> G
     G -->|Dead Socket?| H[Evict & Reconnect]
     G -->|Healthy Socket| I[YouTube CDN]
-    I --> J[✅ Video Plays Smoothly]
+    I --> J[Video Plays Smoothly]
     B -->|30 min timeout| K[Session Stays Alive]
     K --> J
 ```
@@ -108,7 +135,7 @@ When a new UDP flow arrives, the sticky resolver checks if the hostname is cache
 - If no, it resolves the hostname, caches the IP, and returns it.
 - If DNS returns NXDOMAIN, it falls back to the last known-good IP for the domain suffix (e.g., `*.googlevideo.com`).
 - **Wildcard Caching:** Caches `*.googlevideo.com` with a 60-second TTL. When it expires, it returns the stale IP immediately AND triggers a background DNS refresh (stale-while-revalidate) to get a live edge IP.
-- **IPv4/IPv6 Preference:** Supports `XRAY_UDP_PREFER_IPV4=1` or `XRAY_UDP_PREFER_IPV6=1` to force the resolver to only pick addresses from the preferred family, eliminating "Happy Eyeballs" flipping entirely.
+- **IPv4/IPv6 Preference:** Supports `preferIpv4: true` or `preferIpv6: true` to force the resolver to only pick addresses from the preferred family, eliminating "Happy Eyeballs" flipping entirely.
 
 This prevents the IPv4/IPv6 flipping and NXDOMAIN errors.
 
@@ -120,6 +147,7 @@ When a new UDP flow arrives, the pool checks if a socket to the destination IP a
 - **Dead Socket Detection:** If a socket read or write fails, it marks the socket as dead. The next flow creates a fresh socket.
 - **Staleness Check:** If a socket hasn't received a reply in 30 seconds, it is marked dead and evicted.
 - **Idle Reaper:** A background goroutine evicts sockets that have been idle (no replies in 10 min) or unused (refCount=0 for 5 min).
+- **DCID Demuxing:** The pool reads QUIC Connection IDs from packets and routes reply packets to the correct session. This means the pool works even when SNI sniffing fails -- the packet is forwarded to the destination based on the DCID, not the SNI.
 
 This prevents the per-connection overhead and handles CDN edge rotation.
 
@@ -131,7 +159,7 @@ The standard 2-minute timeout in `worker.go` kills UDP sessions during video buf
 
 If a QUIC client migrates (NAT rebinding, CID rotation), xray tracks the new Connection ID and preserves the existing outbound socket. The destination server sees a consistent source IP.
 
-### Multi-IP Inbound + Deterministic Source IP (v26.10.0 + v26.10.1)
+### Multi-IP Inbound + Deterministic Source IP (v26.10.0 + v26.10.1 + v26.10.2)
 
 #### Multi-IP Inbound Listen
 
@@ -178,15 +206,30 @@ For servers with multiple public IPs, the kernel might pick a different source I
 }
 ```
 
-Three patches make this safe:
+**How it works (TCP vs UDP):**
 
-1. `transport/internet/system_dialer.go` -- `resolveSrcAddr` now takes `dest` as a second argument and returns nil (let kernel pick source) when dest is loopback or source/dest families mismatch.
-2. `transport/internet/dialer.go` -- `LookupForIP` now queries both A and AAAA records regardless of `localAddr` family. Previously, IPv6 source + IPv4-only destination returned empty DNS response.
-3. `proxy/freedom/freedom.go` -- bypass the UDP socket pool when `outGateway` is non-nil (sendThrough configured), so QUIC honors the source IP.
+| Network | sendThrough applied? | Source IP | Pool used? | Why |
+|---------|---------------------|-----------|------------|-----|
+| TCP | Yes | Listen IP (via `dialer.LocalAddr`) | N/A (TCP has no pool) | Each TCP connection gets its own socket; source IP can be bound per-connection |
+| UDP + pool enabled | No | Kernel-chosen (wildcard) | Yes (DCID demux) | Pool uses wildcard-bound sockets for DCID demuxing; can't bind specific source IP |
+| UDP + pool disabled | Yes | Listen IP (per-session socket) | No | Per-session socket can bind source IP, but no DCID demuxing |
 
-`domainStrategy: useip` in the outbound's sockopt is required: it resolves the destination to an IP before the system dialer runs, so the family-mismatch guard can compare source and destination families.
+**Why UDP skips sendThrough when the pool is enabled:**
 
-None of these patches touch the dispatcher, sniffer, inbound worker, routing, or config parser -- so SNI sniffing is unaffected by construction.
+The UDP pool uses a single wildcard-bound socket per destination IP. Multiple QUIC sessions to the same destination share this socket, demuxed by QUIC Connection ID (DCID). This is essential for YouTube because:
+
+1. YouTube creates many simultaneous QUIC flows (video, audio, chat, ads)
+2. When SNI sniffing fails (200ms timeout), the destination stays at the dokodemo default (127.0.0.1:443)
+3. Without the pool's DCID demuxing, each flow gets its own per-session socket that dials 127.0.0.1:443 -- creating a dial-self loop that freezes YouTube
+4. The pool's DCID demuxing routes packets correctly even when sniffing fails, because it uses the DCID (not the SNI) to identify the session
+
+If `sendThrough: origin` were applied to UDP, `outGateway` would be non-nil, the pool would be bypassed, and QUIC would fall back to per-session sockets -- breaking YouTube.
+
+**Why `domainStrategy: useip` is required:**
+
+`sendThrough: origin` needs the destination resolved to an IP before the system dialer runs, so the family-mismatch guard can compare source and destination families. Without `useip`, the destination stays a domain and the guard can't run. For example: IPv6 listen IP + IPv4-only destination (like zattoo.com) would fail with "no suitable address found" because the system dialer tries to bind an IPv6 source to an IPv4 destination.
+
+With `useip`, xray resolves the domain via its internal DNS (querying both A and AAAA records), then passes the resolved IP to `resolveSrcAddr`. The family-mismatch guard sees the mismatch and returns nil (let the kernel pick an IPv4 source), so the dial succeeds.
 
 ### Build and Install
 
@@ -208,20 +251,21 @@ sudo cp xray /usr/local/bin/xray
 
 - `v26.9.9-udp-fork` -- original UDP/QUIC fork (sticky resolver, socket pool, CID migration, 30-min timeout)
 - `v26.10.0-link` -- adds multi-IP inbound listen (`listen: [ip1, ip2]`)
-- `v26.10.1-link` -- adds safe `sendThrough: origin` (family-mismatch + loopback guards, UDP pool bypass)
+- `v26.10.1-link` -- adds safe `sendThrough: origin` (family-mismatch + loopback guards, both-family DNS lookup)
+- `v26.10.2-link` -- separates TCP/UDP sendThrough (TCP honors source-IP binding, UDP uses pool for DCID demuxing)
 
 ### Configuration
 
-See `example-configs/vps-consolidated.json` for a complete working example (uses documentation IP ranges 192.0.2.0/24 and 2001:db8::/32, not real IPs). Key points:
+See the sanitized example config for a complete working example (uses documentation IP ranges 192.0.2.0/24 and 2001:db8::/32, not real IPs). Key points:
 
-1. Multi-IP inbound listen: `listen: [v4-ip, v6-ip]` consolidates per-IP inbounds into one block.
-2. `portMap` for multi-port: a single inbound can listen on multiple ports and forward each to a different destination.
-3. `sendThrough: origin` on freedom outbound: binds outbound source IP to inbound listen IP.
-4. `domainStrategy: useip` in freedom's sockopt: resolves destination to IP before dialing (required for family-mismatch guard).
-5. `udpConfig` for QUIC: `enableSocketPool`, `enableStickyResolver`, `preferIpv4` for the YouTube/QUIC chain.
-6. UDP enabled on port 443 inbounds: `network: tcp,udp`
-7. QUIC allowed in routing: (Do NOT block `protocol: quic`)
-8. Policy with long idle timeout: `policy: {levels: {0: {connIdle: 1800}}}`
+1. **Multi-IP inbound listen:** `listen: [v4-ip, v6-ip]` consolidates per-IP inbounds into one block.
+2. **`portMap` for multi-port:** A single inbound can listen on multiple ports and forward each to a different destination.
+3. **`sendThrough: origin` on freedom outbound:** Binds outbound source IP to inbound listen IP (TCP only; UDP uses the pool when `enableSocketPool: true`).
+4. **`domainStrategy: useip` in freedom's sockopt:** Resolves destination to IP before dialing (required for family-mismatch guard).
+5. **`udpConfig` for QUIC:** `enableSocketPool`, `enableStickyResolver`, `preferIpv4` for the YouTube/QUIC chain.
+6. **UDP enabled on port 443 inbounds:** `network: tcp,udp`
+7. **QUIC allowed in routing:** (Do NOT block `protocol: quic`)
+8. **Policy with long idle timeout:** `policy: {levels: {0: {connIdle: 1800}}}`
 
 ### See HANDOFF.md for full architecture, design notes, and deployment details.
 
