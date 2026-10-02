@@ -60,6 +60,10 @@ message UDPConfig {
   bool enable_sticky_resolver = 2;
   bool prefer_ipv4 = 3;
   bool prefer_ipv6 = 4;
+  uint32 session_idle_timeout = 5;
+  uint32 pool_staleness_timeout = 6;
+  uint32 pool_idle_timeout = 7;
+  uint32 pool_unused_timeout = 8;
 }
 
 message Config {

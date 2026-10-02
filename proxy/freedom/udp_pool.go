@@ -21,7 +21,10 @@ import (
 type UDPSocketPool struct {
     mu      sync.Mutex
     sockets map[string]*pooledSocket
-    reaper  *time.Ticker
+    reaper           *time.Ticker
+    stalenessTimeout time.Duration
+    idleTimeout      time.Duration
+    unusedTimeout    time.Duration
 }
 
 type pooledSocket struct {
@@ -51,9 +54,12 @@ type pooledConn struct {
     scids  map[string]bool
 }
 
-func NewUDPSocketPool() *UDPSocketPool {
+func NewUDPSocketPool(staleness, idle, unused time.Duration) *UDPSocketPool {
     p := &UDPSocketPool{
-        sockets: make(map[string]*pooledSocket),
+        sockets:          make(map[string]*pooledSocket),
+        stalenessTimeout: staleness,
+        idleTimeout:      idle,
+        unusedTimeout:    unused,
     }
     p.startReaper()
     return p
@@ -74,8 +80,8 @@ func (p *UDPSocketPool) evictStale() {
     for key, sock := range p.sockets {
         sock.mu.Lock()
         isDead := sock.dead
-        isIdle := time.Since(sock.lastReplyTime) > 10*time.Minute && sock.refCount > 0
-        isUnused := time.Since(sock.lastUsed) > 5*time.Minute && sock.refCount == 0
+        isIdle := time.Since(sock.lastReplyTime) > p.idleTimeout && sock.refCount > 0
+        isUnused := time.Since(sock.lastUsed) > p.unusedTimeout && sock.refCount == 0
         sock.mu.Unlock()
 
         if isDead || isIdle || isUnused {
@@ -104,7 +110,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 		// assume the CDN edge rotated and is silently dropping packets.
 		// Mark it dead and force the creation of a fresh socket for this request.
 		sock.mu.Lock()
-		isStale := time.Since(sock.lastReplyTime) > 5*time.Minute
+		isStale := time.Since(sock.lastReplyTime) > p.stalenessTimeout
 		sock.mu.Unlock()
 		if isStale {
 			sock.MarkDead()

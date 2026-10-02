@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/freedom/udptimeout"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
@@ -523,7 +524,7 @@ func (w *udpWorker) clean() error {
 	}
 
 	for addr, conn := range w.activeConn {
-		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > 2*60 {
+		if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > udptimeout.SessionIdleSeconds() {
 			if !conn.inactive {
 				conn.setInactive()
 				if conn.dcid != nil {

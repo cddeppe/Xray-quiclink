@@ -433,6 +433,10 @@ type UDPConfig struct {
 	EnableStickyResolver bool                   `protobuf:"varint,2,opt,name=enable_sticky_resolver,json=enableStickyResolver,proto3" json:"enable_sticky_resolver,omitempty"`
 	PreferIpv4           bool                   `protobuf:"varint,3,opt,name=prefer_ipv4,json=preferIpv4,proto3" json:"prefer_ipv4,omitempty"`
 	PreferIpv6           bool                   `protobuf:"varint,4,opt,name=prefer_ipv6,json=preferIpv6,proto3" json:"prefer_ipv6,omitempty"`
+	SessionIdleTimeout   uint32                 `protobuf:"varint,5,opt,name=session_idle_timeout,json=sessionIdleTimeout,proto3" json:"session_idle_timeout,omitempty"`
+	PoolStalenessTimeout uint32                 `protobuf:"varint,6,opt,name=pool_staleness_timeout,json=poolStalenessTimeout,proto3" json:"pool_staleness_timeout,omitempty"`
+	PoolIdleTimeout      uint32                 `protobuf:"varint,7,opt,name=pool_idle_timeout,json=poolIdleTimeout,proto3" json:"pool_idle_timeout,omitempty"`
+	PoolUnusedTimeout    uint32                 `protobuf:"varint,8,opt,name=pool_unused_timeout,json=poolUnusedTimeout,proto3" json:"pool_unused_timeout,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -493,6 +497,34 @@ func (x *UDPConfig) GetPreferIpv6() bool {
 		return x.PreferIpv6
 	}
 	return false
+}
+
+func (x *UDPConfig) GetSessionIdleTimeout() uint32 {
+	if x != nil {
+		return x.SessionIdleTimeout
+	}
+	return 0
+}
+
+func (x *UDPConfig) GetPoolStalenessTimeout() uint32 {
+	if x != nil {
+		return x.PoolStalenessTimeout
+	}
+	return 0
+}
+
+func (x *UDPConfig) GetPoolIdleTimeout() uint32 {
+	if x != nil {
+		return x.PoolIdleTimeout
+	}
+	return 0
+}
+
+func (x *UDPConfig) GetPoolUnusedTimeout() uint32 {
+	if x != nil {
+		return x.PoolUnusedTimeout
+	}
+	return 0
 }
 
 type Config struct {

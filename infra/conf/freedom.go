@@ -198,6 +198,10 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
 			EnableStickyResolver: c.UDPConfig.EnableStickyResolver,
 			PreferIpv4:           c.UDPConfig.PreferIPv4,
 			PreferIpv6:           c.UDPConfig.PreferIPv6,
+			SessionIdleTimeout:   c.UDPConfig.SessionIdleTimeout,
+			PoolStalenessTimeout: c.UDPConfig.PoolStalenessTimeout,
+			PoolIdleTimeout:      c.UDPConfig.PoolIdleTimeout,
+			PoolUnusedTimeout:    c.UDPConfig.PoolUnusedTimeout,
 		}
 	}
 return config, nil
@@ -301,5 +305,9 @@ type UDPConfig struct {
 	EnableSocketPool     bool `json:"enableSocketPool"`
 	EnableStickyResolver bool `json:"enableStickyResolver"`
 	PreferIPv4           bool `json:"preferIpv4"`
-	PreferIPv6           bool `json:"preferIpv6"`
+	PreferIPv6           bool   `json:"preferIpv6"`
+	SessionIdleTimeout   uint32 `json:"sessionIdleTimeout"`
+	PoolStalenessTimeout uint32 `json:"poolStalenessTimeout"`
+	PoolIdleTimeout      uint32 `json:"poolIdleTimeout"`
+	PoolUnusedTimeout    uint32 `json:"poolUnusedTimeout"`
 }

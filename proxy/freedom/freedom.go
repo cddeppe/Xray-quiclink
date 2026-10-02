@@ -29,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/proxy/freedom/udptimeout"
 )
 
 
@@ -39,6 +40,13 @@ var (
 	defaultBlockPrivateRule *FinalRule
 	defaultBlockAllRule     *FinalRule
 )
+
+func secondsOrDefault(v, def uint32) uint32 {
+	if v > 0 {
+		return v
+	}
+	return def
+}
 
 func reloadEnvSettings() error {
 	const defaultFlagValue = "NOT_DEFINED_AT_ALL"
@@ -197,9 +205,18 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 
 	// Initialize UDP features from config
     if config.UdpConfig != nil {
+        udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
+
         if config.UdpConfig.EnableSocketPool {
-            h.socketPool = NewUDPSocketPool()
-            errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled")
+            staleness := secondsOrDefault(config.UdpConfig.GetPoolStalenessTimeout(), 300)
+            idle := secondsOrDefault(config.UdpConfig.GetPoolIdleTimeout(), 600)
+            unused := secondsOrDefault(config.UdpConfig.GetPoolUnusedTimeout(), 300)
+            h.socketPool = NewUDPSocketPool(
+                time.Duration(staleness)*time.Second,
+                time.Duration(idle)*time.Second,
+                time.Duration(unused)*time.Second,
+            )
+            errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (staleness=", staleness, "s idle=", idle, "s unused=", unused, "s)")
         }
         if config.UdpConfig.EnableStickyResolver {
             h.stickyResolver = NewStickyResolver(5 * time.Minute)
