@@ -289,7 +289,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	if origTargetAddr == nil {
 		origTargetAddr = ob.Target.Address
 	}
-	dialer.SetOutboundGateway(ctx, ob)
+	// Apply sendThrough for TCP always, for UDP only when pool is not enabled.
+	// When the UDP pool is enabled, outGateway must stay nil so the pool's
+	// wildcard-bound sockets are used (DCID demuxing requires a single socket
+	// per destination, which can't bind a specific source IP).
+	if destination.Network == net.Network_TCP || h.socketPool == nil {
+		dialer.SetOutboundGateway(ctx, ob)
+	}
 	outGateway := ob.Gateway
 	UDPOverride := net.UDPDestination(nil, 0)
 	if h.config.DestinationOverride != nil {
