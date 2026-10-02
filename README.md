@@ -1,10 +1,34 @@
-# Project X
+# xray-link
 
-## Fork Features: Transparent QUIC Proxying (cddeppe/Xray-core)
+A fork of [Xray-core](https://github.com/XTLS/Xray-core) focused on **multi-hop transparent proxying with deterministic source-IP handling**. Originally built to solve QUIC/HTTP3 proxying through a multi-hop chain (Home -> vps-de -> vps-al -> YouTube), now also supports multi-IP inbound listen and outbound source-IP binding.
 
-This fork solves a long-standing problem in the xray community: **how to transparently proxy QUIC/HTTP3 traffic (like YouTube) through a multi-hop chain without client-side certificates, TUN adapters, or DNS-to-VPS forwarding.**
+## Fork Features
+
+### 1. Transparent QUIC Proxying (since v26.9.9)
+
+Solves how to transparently proxy QUIC/HTTP3 traffic (like YouTube) through a multi-hop chain without client-side certificates, TUN adapters, or DNS-to-VPS forwarding.
 
 Standard xray fails in this scenario because it is a Layer-4 proxy, but QUIC is a Layer-7 protocol with strict connection validation. This fork bridges that gap.
+
+### 2. Multi-IP Inbound Listen (v26.10.0)
+
+The `listen` field on inbounds now accepts an **array** of IPs, producing one inbound handler per IP. Backward compatible with the single-string form.
+
+```json
+"listen": ["192.0.2.10", "2001:db8::10"]
+```
+
+Produces two underlying handlers with synthesized tags `<tag>#<ip>` so routing can target each individually. Consolidates configs from N*2 inbounds (one per IP per port) down to N inbounds (one per port, multi-IP).
+
+### 3. Deterministic Outbound Source IP (v26.10.1)
+
+For servers with multiple public IPs, `sendThrough: origin` on the freedom outbound binds the outbound dial's source IP to the inbound listen IP. Combined with three small patches:
+
+- `resolveSrcAddr` (system_dialer.go): skips source binding when destination is loopback or source/dest IP families mismatch (avoids EADDRNOTAVAIL)
+- `LookupForIP` (dialer.go): queries both A and AAAA DNS records regardless of source IP family (so IPv4-only domains resolve even with IPv6 source)
+- UDP pool bypass (freedom.go): bypasses the socket pool when sendThrough is configured, so QUIC honors the source IP
+
+This makes `sendThrough: origin` safe to use universally -- it kicks in when families match, and lets the kernel pick when they don't.
 
 ### The Problem
 
@@ -107,41 +131,99 @@ The standard 2-minute timeout in `worker.go` kills UDP sessions during video buf
 
 If a QUIC client migrates (NAT rebinding, CID rotation), xray tracks the new Connection ID and preserves the existing outbound socket. The destination server sees a consistent source IP.
 
+### Multi-IP Inbound + Deterministic Source IP (v26.10.0 + v26.10.1)
+
+#### Multi-IP Inbound Listen
+
+The `listen` field on `InboundDetourConfig` now accepts either a single string (backward compatible) or an array of strings. Each IP in the array produces one underlying inbound handler, with a synthesized tag of the form `<originalTag>#<ip>`.
+
+```json
+{
+  "listen": ["192.0.2.10", "2001:db8::10"],
+  "port": 443,
+  "protocol": "dokodemo-door",
+  "tag": "in-443",
+  "settings": { "network": "tcp,udp" },
+  "sniffing": { "enabled": true, "destOverride": ["tls", "quic"] }
+}
+```
+
+Produces two handlers: `in-443#192.0.2.10` and `in-443#2001:db8::10`. Routing rules can target each individually, or use the original tag for the first IP.
+
+#### Deterministic Outbound Source IP (`sendThrough: "origin"`)
+
+For servers with multiple public IPs, the kernel might pick a different source IP than the one the client connected to. `sendThrough: "origin"` forces the outbound dial's source IP to match the inbound listen IP:
+
+```json
+{
+  "protocol": "freedom",
+  "tag": "direct",
+  "sendThrough": "origin",
+  "streamSettings": {
+    "sockopt": {
+      "domainStrategy": "useip",
+      "tcpFastOpen": true,
+      "tcpNoDelay": true,
+      "tcpUserTimeout": 5000,
+      "tcpKeepAlive": 60
+    }
+  },
+  "settings": {
+    "udpConfig": {
+      "enableSocketPool": true,
+      "enableStickyResolver": true,
+      "preferIpv4": true
+    }
+  }
+}
+```
+
+Three patches make this safe:
+
+1. `transport/internet/system_dialer.go` -- `resolveSrcAddr` now takes `dest` as a second argument and returns nil (let kernel pick source) when dest is loopback or source/dest families mismatch.
+2. `transport/internet/dialer.go` -- `LookupForIP` now queries both A and AAAA records regardless of `localAddr` family. Previously, IPv6 source + IPv4-only destination returned empty DNS response.
+3. `proxy/freedom/freedom.go` -- bypass the UDP socket pool when `outGateway` is non-nil (sendThrough configured), so QUIC honors the source IP.
+
+`domainStrategy: useip` in the outbound's sockopt is required: it resolves the destination to an IP before the system dialer runs, so the family-mismatch guard can compare source and destination families.
+
+None of these patches touch the dispatcher, sniffer, inbound worker, routing, or config parser -- so SNI sniffing is unaffected by construction.
+
 ### Build and Install
 
+Pre-built binaries are available on the [releases page](https://github.com/cddeppe/Xray-link/releases).
+
 ```bash
-# AMD64
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o xray-fork-amd64 ./main
+# Download from latest release (AMD64)
+wget https://github.com/cddeppe/Xray-link/releases/latest/download/xray-linux-amd64 -O xray
+chmod +x xray
+sudo cp xray /usr/local/bin/xray
 
-# ARM64
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o xray-fork-arm64 ./main
-
-# Install
-sudo cp xray-fork-<arch> /usr/local/bin/xray
+# Or build from source
+GOOS=linux GOARCH=amd64 go build -o xray ./main      # AMD64
+GOOS=linux GOARCH=arm64 go build -o xray ./main      # ARM64
+sudo cp xray /usr/local/bin/xray
 ```
+
+### Release Tags
+
+- `v26.9.9-udp-fork` -- original UDP/QUIC fork (sticky resolver, socket pool, CID migration, 30-min timeout)
+- `v26.10.0-link` -- adds multi-IP inbound listen (`listen: [ip1, ip2]`)
+- `v26.10.1-link` -- adds safe `sendThrough: origin` (family-mismatch + loopback guards, UDP pool bypass)
 
 ### Configuration
 
-Add the `udpConfig` block to your freedom outbound in your xray config JSON. No environment variables needed.
+See `example-configs/vps-3959-consolidated.json` for a complete working example (uses documentation IP ranges 192.0.2.0/24 and 2001:db8::/32, not real IPs). Key points:
 
-```bash
-# Create systemd drop-in
-[Service]
-EOF
-```
-
-### Configuration Requirements
-
-Add the `udpConfig` block to your freedom outbound in your xray config JSON. No environment variables needed.
-
-Your xray config must have:
-1. **UDP enabled on port 443 inbounds:** `"network": "tcp,udp"`
-2. **QUIC allowed in routing:** (Do NOT block `protocol: "quic"`)
-3. **Policy with long idle timeout:** `"policy": {"levels": {"0": {"connIdle": 1800}}}`
+1. Multi-IP inbound listen: `listen: [v4-ip, v6-ip]` consolidates per-IP inbounds into one block.
+2. `portMap` for multi-port: a single inbound can listen on multiple ports and forward each to a different destination.
+3. `sendThrough: origin` on freedom outbound: binds outbound source IP to inbound listen IP.
+4. `domainStrategy: useip` in freedom's sockopt: resolves destination to IP before dialing (required for family-mismatch guard).
+5. `udpConfig` for QUIC: `enableSocketPool`, `enableStickyResolver`, `preferIpv4` for the YouTube/QUIC chain.
+6. UDP enabled on port 443 inbounds: `network: tcp,udp`
+7. QUIC allowed in routing: (Do NOT block `protocol: quic`)
+8. Policy with long idle timeout: `policy: {levels: {0: {connIdle: 1800}}}`
 
 ### See HANDOFF.md for full architecture, design notes, and deployment details.
-
-
 
 ## Support
 
