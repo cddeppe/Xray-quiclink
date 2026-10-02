@@ -89,9 +89,15 @@ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) 
 		return nil, errors.New("DNS client not initialized")
 	}
 
+	// Always query both IPv4 and IPv6 when resolving for dialing. The
+	// family-mismatch guard in resolveSrcAddr (system_dialer.go) handles
+	// the case where localAddr family != resolved IP family by skipping
+	// the source binding and letting the kernel pick. Restricting the
+	// DNS query to only the localAddr family breaks IPv6-source to
+	// IPv4-only-destination (and vice versa) dials.
 	ips, _, err := dnsClient.LookupIP(domain, dns.IPOption{
-		IPv4Enable: (localAddr == nil && strategy.PreferIP4()) || (localAddr != nil && localAddr.Family().IsIPv4() && (strategy.PreferIP4() || strategy.FallbackIP4())),
-		IPv6Enable: (localAddr == nil && strategy.PreferIP6()) || (localAddr != nil && localAddr.Family().IsIPv6() && (strategy.PreferIP6() || strategy.FallbackIP6())),
+		IPv4Enable: strategy.PreferIP4() || strategy.FallbackIP4(),
+		IPv6Enable: strategy.PreferIP6() || strategy.FallbackIP6(),
 	})
 	{ // Resolve fallback
 		if (len(ips) == 0 || err != nil) && strategy.HasFallback() && localAddr == nil {

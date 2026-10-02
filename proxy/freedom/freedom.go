@@ -414,7 +414,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// per-session socket path. This prevents the pool from breaking non-QUIC UDP.
 	var pooledConn *pooledConn
 	var peekedPackets buf.MultiBuffer
-	if destination.Network != net.Network_TCP && h.socketPool != nil {
+	if destination.Network != net.Network_TCP && h.socketPool != nil && outGateway == nil {
 		// Peek at the first packet(s) to check if this is QUIC traffic.
 		mb, peekErr := input.ReadMultiBuffer()
 		if peekErr == nil && len(mb) > 0 {
