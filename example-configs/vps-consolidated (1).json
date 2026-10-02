@@ -1,0 +1,100 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "dns": {
+    "cacheSize": 1000,
+    "disableCache": false,
+    "servers": ["127.0.0.1", "[::1]"]
+  },
+  "inbounds": [
+    {
+      "listen": ["192.0.2.10", "2001:db8::10"],
+      "port": 443,
+      "protocol": "dokodemo-door",
+      "tag": "in-443",
+      "settings": { "network": "tcp,udp" },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["tls", "quic"]
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true,
+          "tcpUserTimeout": 5000,
+          "tcpKeepAlive": 60
+        }
+      }
+    },
+    {
+      "listen": ["192.0.2.10", "2001:db8::10"],
+      "port": "3064,3066,3068,3389,3390,32410",
+      "protocol": "dokodemo-door",
+      "tag": "in-nas",
+      "settings": {
+        "network": "tcp",
+        "address": "nas.example.com",
+        "port": 3064,
+        "portMap": {
+          "3064": "nas.example.com:3064",
+          "3066": "nas.example.com:3066",
+          "3068": "nas.example.com:3068",
+          "3389": "nas.example.com:3389",
+          "3390": "nas.example.com:3390",
+          "32410": "nas.example.com:32400"
+        }
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpUserTimeout": 5000,
+          "tcpKeepAlive": 60
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "sendThrough": "origin",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "useip",
+          "tcpFastOpen": true,
+          "tcpNoDelay": true,
+          "tcpUserTimeout": 5000,
+          "tcpKeepAlive": 60
+        }
+      },
+      "settings": {
+        "udpConfig": {
+          "enableSocketPool": true,
+          "enableStickyResolver": true,
+          "preferIpv4": true
+        }
+      }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 1800,
+        "uplinkOnly": 30,
+        "downlinkOnly": 30,
+        "handshake": 4
+      }
+    }
+  }
+}
