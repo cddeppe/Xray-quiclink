@@ -28,8 +28,9 @@ var errSniffingTimeout = errors.New("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
-	cache  buf.MultiBuffer
+	reader   buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
+	cache    buf.MultiBuffer
+	cacheLen int32 // v26.10.13-link: maintained incrementally to avoid O(n) MultiBuffer.Len() walks inside the lock
 }
 
 func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
@@ -39,10 +40,22 @@ func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
 	}
 	r.Lock()
 	if !mb.IsEmpty() {
+		// v26.10.13-link: compute the incoming length ONCE, before
+		// MergeMulti nils out the src entries. This is O(len(mb))
+		// (number of NEW buffers, typically 1 for a UDP datagram)
+		// rather than O(len(r.cache)) (number of accumulated buffers).
+		incoming := int32(0)
+		for _, x := range mb {
+			incoming += x.Len()
+		}
 		r.cache, _ = buf.MergeMulti(r.cache, mb)
+		r.cacheLen += incoming
 	}
-	b.Clear()
-	rawBytes := b.Extend(min(r.cache.Len(), b.Cap()))
+	// v26.10.13-link: dropped the redundant b.Clear() before
+	// b.Extend() — Extend() updates b.end and the bytes at
+	// b.v[0:n] are about to be overwritten by Copy() anyway.
+	// Also use r.cacheLen (O(1)) instead of r.cache.Len() (O(n)).
+	rawBytes := b.Extend(min(r.cacheLen, b.Cap()))
 	n := r.cache.Copy(rawBytes)
 	b.Resize(0, int32(n))
 	r.Unlock()
@@ -56,6 +69,7 @@ func (r *cachedReader) readInternal() buf.MultiBuffer {
 	if r.cache != nil && !r.cache.IsEmpty() {
 		mb := r.cache
 		r.cache = nil
+		r.cacheLen = 0 // v26.10.13-link: keep cacheLen in sync
 		return mb
 	}
 
@@ -84,6 +98,7 @@ func (r *cachedReader) Interrupt() {
 	r.Lock()
 	if r.cache != nil {
 		r.cache = buf.ReleaseMulti(r.cache)
+		r.cacheLen = 0 // v26.10.13-link: keep cacheLen in sync
 	}
 	r.Unlock()
 	if p, ok := r.reader.(*pipe.Reader); ok {
@@ -290,6 +305,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 		go func() {
 			cReader := &cachedReader{
 				reader: outbound.Reader.(*pipe.Reader),
+				cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange (Initial + a few retransmits)
 			}
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
@@ -345,6 +361,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	} else {
 		cReader := &cachedReader{
 			reader: outbound.Reader.(buf.TimeoutReader),
+			cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange
 		}
 		outbound.Reader = cReader
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
