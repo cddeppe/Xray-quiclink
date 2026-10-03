@@ -8,8 +8,21 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 )
 
+// SniffHeader holds the metadata extracted from a TLS ClientHello.
+//
+// In addition to the SNI (Domain), v26.10.11-link adds:
+//   - alpn:   the first ALPN protocol from extension 0x10 (e.g. "h3",
+//     "doq", "h3-webtransport", "masque"). Empty if no ALPN extension
+//     was present.
+//   - hasECH: true if extension 0xfe0d (encrypted_client_hello, RFC
+//     9460) was present. When ECH is in use, the visible SNI is a
+//     cover name and the real SNI is encrypted inside the ECH
+//     extension. Routing layers should fall back to IP-based rules
+//     when HasECH() returns true rather than trusting the (cover) SNI.
 type SniffHeader struct {
 	domain string
+	alpn   string
+	hasECH bool
 }
 
 func (h *SniffHeader) Protocol() string {
@@ -18,6 +31,29 @@ func (h *SniffHeader) Protocol() string {
 
 func (h *SniffHeader) Domain() string {
 	return h.domain
+}
+
+// ALPN returns the first ALPN protocol from the ClientHello, or "" if
+// no ALPN extension was present. Multiple ALPN entries are common in
+// practice (clients offer several); only the first is returned for
+// simplicity. Routing rules can use this to distinguish HTTP/3 ("h3"),
+// DNS-over-QUIC ("doq"), WebTransport ("h3-webtransport"), or MASQUE
+// ("masque/...") traffic.
+func (h *SniffHeader) ALPN() string {
+	return h.alpn
+}
+
+// HasECH returns true if the ClientHello contained an
+// encrypted_client_hello extension (RFC 9460, extension ID 0xfe0d).
+// When true, the SNI returned by Domain() is a cover name and the
+// real SNI is encrypted inside the ECH extension. Routing layers
+// should fall back to IP-based rules or other heuristics rather than
+// trusting the cover SNI.
+//
+// We cannot decrypt the inner SNI without the server's ECH private
+// key, but knowing ECH is in use is enough to avoid misrouting.
+func (h *SniffHeader) HasECH() bool {
+	return h.hasECH
 }
 
 var (
@@ -29,8 +65,30 @@ func IsValidTLSVersion(major, minor byte) bool {
 	return major == 3
 }
 
-// ReadClientHello returns server name (if any) from TLS client hello message.
-// https://github.com/golang/go/blob/master/src/crypto/tls/handshake_messages.go#L300
+// Extension IDs we recognise.
+const (
+	extServerName               uint16 = 0x00
+	extALPN                     uint16 = 0x10
+	extEncryptedClientHello     uint16 = 0xfe0d
+)
+
+// ReadClientHello parses a TLS ClientHello message and populates h
+// with the SNI, ALPN, and ECH presence. Returns nil on success.
+//
+// If the SNI appears to be split across multiple QUIC packets (a byte
+// <= ' ' is found inside the SNI), returns protocol.ErrProtoNeedMoreData
+// so the caller can wait for more data before re-trying.
+//
+// Otherwise returns errNotClientHello on parse failures, or errNotTLS
+// if no SNI was found at all.
+//
+// v26.10.11-link change: previously ReadClientHello returned as soon
+// as it found the SNI, so ALPN and ECH extensions after SNI in the
+// extension list were never observed. Now we walk the entire
+// extension list to collect all three signals. The truncation check
+// (ErrProtoNeedMoreData) still fires immediately when a suspect byte
+// is seen inside the SNI, since in that case the rest of the
+// extensions cannot be trusted either.
 func ReadClientHello(data []byte, h *SniffHeader) error {
 	if len(data) < 42 {
 		return common.ErrNoClue
@@ -69,6 +127,12 @@ func ReadClientHello(data []byte, h *SniffHeader) error {
 		return errNotClientHello
 	}
 
+	// Walk all extensions collecting SNI / ALPN / ECH. The SNI
+	// truncation check fires immediately (returns ErrProtoNeedMoreData)
+	// so the caller can wait for more QUIC packets; in that case we
+	// discard any ALPN/ECH we may have already seen since the rest of
+	// the extensions cannot be trusted.
+	foundSNI := false
 	for len(data) != 0 {
 		if len(data) < 4 {
 			return errNotClientHello
@@ -80,7 +144,8 @@ func ReadClientHello(data []byte, h *SniffHeader) error {
 			return errNotClientHello
 		}
 
-		if extension == 0x00 { /* extensionServerName */
+		switch extension {
+		case extServerName:
 			d := data[:length]
 			if len(d) < 2 {
 				return errNotClientHello
@@ -115,17 +180,57 @@ func ReadClientHello(data []byte, h *SniffHeader) error {
 					if b == '.' {
 						return errNotClientHello
 					}
-					serverName := string(d[:nameLen])
-					h.domain = serverName
-					return nil
+					h.domain = string(d[:nameLen])
+					foundSNI = true
 				}
 				d = d[nameLen:]
 			}
+		case extALPN:
+			d := data[:length]
+			if len(d) < 2 {
+				return errNotClientHello
+			}
+			listLen := int(d[0])<<8 | int(d[1])
+			d = d[2:]
+			if len(d) != listLen {
+				return errNotClientHello
+			}
+			// Take the first ALPN entry. Format per RFC 7301:
+			//   1 byte: protocol name length
+			//   N bytes: protocol name
+			// Repeated for each offered protocol.
+			if len(d) > 0 {
+				nameLen := int(d[0])
+				if 1+nameLen > len(d) {
+					return errNotClientHello
+				}
+				if h.alpn == "" {
+					h.alpn = string(d[1 : 1+nameLen])
+				}
+			}
+		case extEncryptedClientHello:
+			// We can't decrypt the inner SNI without the server's
+			// ECH private key, but we can record that ECH is in use
+			// so routing can fall back to IP-based rules instead of
+			// trusting the (cover) SNI.
+			h.hasECH = true
 		}
 		data = data[length:]
 	}
 
-	return errNotTLS
+	if !foundSNI {
+		// No SNI extension found. If ECH was present the SNI may
+		// legitimately be absent (or a cover); otherwise the
+		// ClientHello is incomplete / not parseable.
+		if h.hasECH {
+			// ECH present without an outer SNI is valid — return
+			// success with hasECH=true and domain="". The routing
+			// layer should fall back to IP rules.
+			return nil
+		}
+		return errNotTLS
+	}
+	return nil
 }
 
 func SniffTLS(b []byte) (*SniffHeader, error) {
