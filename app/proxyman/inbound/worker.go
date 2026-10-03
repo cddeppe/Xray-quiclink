@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync"
 
-	"encoding/hex"
-
 	"github.com/xtls/xray-core/common/protocol/quic"
 	"sync/atomic"
 	"time"
@@ -259,8 +257,58 @@ func (*udpConn) SetWriteDeadline(time.Time) error {
 }
 
 type connID struct {
-	src  net.Destination
-	dest net.Destination
+	src    net.Destination
+	dest   net.Destination
+	srcKey srcKey // v26.10.16-link: precomputed for zero-alloc map lookups
+}
+
+// v26.10.16-link: srcKey is a zero-allocation map key for
+// source IP:port lookups. Replaces id.src.String() which
+// triggered 4 allocations per call (IP.String + Port.String +
+// two string concats). The struct is 18 bytes (16 IP + 2 port),
+// comparable, and hashable — Go's map uses it directly.
+//
+// IPv4 addresses are stored in IPv4-in-IPv6 mapped form
+// (::ffff:a.b.c.d) so that comparisons between IPv4 and IPv6
+// sources never accidentally collide.
+type srcKey struct {
+	ip   [16]byte
+	port uint16
+}
+
+// makeSrcKey computes a srcKey from a net.Destination. Called
+// once per packet in callback(); the result is stored in
+// connID and reused by tryQUICMigration, recordSrc, removeConn,
+// and clean() — zero string allocations on the inbound path.
+func makeSrcKey(d net.Destination) srcKey {
+	var k srcKey
+	ip := d.Address.IP()
+	if ip4 := ip.To4(); ip4 != nil {
+		// Store as IPv4-in-IPv6 mapped form for uniform comparison
+		copy(k.ip[12:], ip4)
+		k.ip[10] = 0xff
+		k.ip[11] = 0xff
+	} else {
+		copy(k.ip[:], ip.To16())
+	}
+	k.port = uint16(d.Port)
+	return k
+}
+
+// v26.10.16-link: dcidKey is a zero-allocation map key for
+// QUIC DCID lookups. Replaces hex.EncodeToString(dcid) which
+// allocated a 16-char string per call. The struct is 24 bytes
+// (20 CID + 4 len), comparable, and hashable.
+type dcidKey struct {
+	cid [quic.MaxCIDLen]byte
+	len int
+}
+
+func makeDCIDKey(dcid []byte) dcidKey {
+	var k dcidKey
+	k.len = len(dcid)
+	copy(k.cid[:], dcid)
+	return k
 }
 
 type udpWorker struct {
@@ -279,8 +327,8 @@ type udpWorker struct {
 
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
-	dcidIndex  map[string]connID
-	srcIndex   map[string]connID // src.String() -> connID, for CID rotation fallback
+	dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
+	srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
 
 	ctx  context.Context
 	cone bool
@@ -332,7 +380,8 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
 	id := connID{
-		src: source,
+		src:    source,
+		srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
 	}
 	if originalDest.IsValid() {
 		if !w.cone {
@@ -407,9 +456,9 @@ func (w *udpWorker) removeConn(id connID) {
 	w.Lock()
 	if conn, ok := w.activeConn[id]; ok {
 		if conn.dcid != nil {
-			delete(w.dcidIndex, hex.EncodeToString(conn.dcid))
+			delete(w.dcidIndex, makeDCIDKey(conn.dcid)) // v26.10.16-link: zero-alloc
 		}
-		delete(w.srcIndex, id.src.String())
+		delete(w.srcIndex, id.srcKey) // v26.10.16-link: zero-alloc
 		delete(w.activeConn, id)
 	} else {
 		delete(w.activeConn, id)
@@ -427,24 +476,28 @@ func (w *udpWorker) removeConn(id connID) {
 //     via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
 //     finds existing conn. New DCID is added to dcidIndex for future packets.
 func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
-	// v26.10.15-link: src-first fast path.
+	// v26.10.16-link: src-first fast path with zero-allocation struct keys.
 	//
 	// For steady-state 1-RTT traffic (99% of packets in a long-lived
 	// QUIC connection), the source IP:port is already in srcIndex and
-	// matches the existing conn. We check src FIRST so we can return
-	// nil (no migration) without parsing the DCID or hex-encoding it.
+	// matches the existing conn. We check src FIRST using id.srcKey
+	// (a precomputed 18-byte struct) so we can return nil (no
+	// migration) without parsing the DCID, hex-encoding it, or
+	// allocating any string. This eliminates 4 allocations per
+	// inbound packet (the old id.src.String() triggered IP.String +
+	// Port.String + two string concats).
 	//
 	// Only if src is unknown (new connection) OR src is known but the
 	// dest differs (CID rotation) do we parse the DCID.
-	srcKey := id.src.String()
+	sk := id.srcKey
 
 	w.Lock()
 
 	// Fast path: src is already known.
-	if oldID, found := w.srcIndex[srcKey]; found {
+	if oldID, found := w.srcIndex[sk]; found {
 		oldConn, ok := w.activeConn[oldID]
 		if !ok || oldConn.done.Done() {
-			delete(w.srcIndex, srcKey)
+			delete(w.srcIndex, sk)
 			// Fall through to slow path (will re-lock).
 		} else if oldID == id {
 			// Same src, same dest → same connection, no migration.
@@ -457,17 +510,17 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 			if err != nil || len(dcid) == 0 {
 				return nil
 			}
-			dcidHex := hex.EncodeToString(dcid)
+			dk := makeDCIDKey(dcid)
 			w.Lock()
 			// Re-check srcIndex under lock in case it changed.
-			oldID2, found2 := w.srcIndex[srcKey]
+			oldID2, found2 := w.srcIndex[sk]
 			if !found2 {
 				w.Unlock()
 				return nil
 			}
 			oldConn2, ok2 := w.activeConn[oldID2]
 			if !ok2 || oldConn2.done.Done() {
-				delete(w.srcIndex, srcKey)
+				delete(w.srcIndex, sk)
 				w.Unlock()
 				return nil
 			}
@@ -476,9 +529,9 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 			oldConn2.dcid = dcid
 			delete(w.activeConn, oldID2)
 			w.activeConn[id] = oldConn2
-			w.srcIndex[srcKey] = id
-			w.dcidIndex[dcidHex] = id
-			errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex, " from ", id.src)
+			w.srcIndex[sk] = id
+			w.dcidIndex[dk] = id
+			errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcid, " from ", id.src)
 			w.Unlock()
 			return oldConn2
 		}
@@ -492,30 +545,30 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 	if err != nil || len(dcid) == 0 {
 		return nil
 	}
-	dcidHex := hex.EncodeToString(dcid)
+	dk := makeDCIDKey(dcid)
 
 	w.Lock()
 	defer w.Unlock()
 
-	if oldID, found := w.dcidIndex[dcidHex]; found {
+	if oldID, found := w.dcidIndex[dk]; found {
 		oldConn, ok := w.activeConn[oldID]
 		if !ok || oldConn.done.Done() {
-			delete(w.dcidIndex, dcidHex)
+			delete(w.dcidIndex, dk)
 			return nil
 		}
 		if oldID == id {
 			return nil // same conn, normal packet (shouldn't happen
 			// since src was unknown, but defensive)
 		}
-		oldSrcKey := oldID.src.String()
+		oldSK := oldID.srcKey
 		*oldConn.src = id.src
 		oldConn.updateActivity()
 		delete(w.activeConn, oldID)
 		w.activeConn[id] = oldConn
-		w.dcidIndex[dcidHex] = id
-		delete(w.srcIndex, oldSrcKey)
-		w.srcIndex[id.src.String()] = id
-		errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex, " from ", oldID.src, " to ", id.src)
+		w.dcidIndex[dk] = id
+		delete(w.srcIndex, oldSK)
+		w.srcIndex[id.srcKey] = id
+		errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcid, " from ", oldID.src, " to ", id.src)
 		return oldConn
 	}
 
@@ -524,11 +577,10 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 
 // recordSrc associates a source IP:port with a connID for future CID rotation lookup.
 func (w *udpWorker) recordSrc(id connID, conn *udpConn) {
-	srcKey := id.src.String()
 	w.Lock()
 	defer w.Unlock()
-	if _, exists := w.srcIndex[srcKey]; !exists {
-		w.srcIndex[srcKey] = id
+	if _, exists := w.srcIndex[id.srcKey]; !exists {
+		w.srcIndex[id.srcKey] = id
 	}
 }
 
@@ -542,13 +594,13 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
 	if len(dcid) == 0 {
 		return
 	}
-	dcidHex := hex.EncodeToString(dcid)
+	dk := makeDCIDKey(dcid)
 
 	w.Lock()
 	defer w.Unlock()
 
-	if _, exists := w.dcidIndex[dcidHex]; !exists {
-		w.dcidIndex[dcidHex] = id
+	if _, exists := w.dcidIndex[dk]; !exists {
+		w.dcidIndex[dk] = id
 		conn.dcid = dcid
 	}
 }
@@ -574,9 +626,9 @@ func (w *udpWorker) clean() error {
 			if !conn.inactive {
 				conn.setInactive()
 				if conn.dcid != nil {
-					delete(w.dcidIndex, hex.EncodeToString(conn.dcid))
+					delete(w.dcidIndex, makeDCIDKey(conn.dcid))
 				}
-				delete(w.srcIndex, addr.src.String())
+				delete(w.srcIndex, addr.srcKey)
 				delete(w.activeConn, addr)
 			}
 			conn.Close()
@@ -585,8 +637,8 @@ func (w *udpWorker) clean() error {
 
 	if len(w.activeConn) == 0 {
 		w.activeConn = make(map[connID]*udpConn, 16)
-		w.dcidIndex = make(map[string]connID)
-		w.srcIndex = make(map[string]connID)
+		w.dcidIndex = make(map[dcidKey]connID)
+		w.srcIndex = make(map[srcKey]connID)
 	}
 
 	return nil
@@ -594,8 +646,8 @@ func (w *udpWorker) clean() error {
 
 func (w *udpWorker) Start() error {
 	w.activeConn = make(map[connID]*udpConn, 16)
-	w.dcidIndex = make(map[string]connID)
-	w.srcIndex = make(map[string]connID)
+	w.dcidIndex = make(map[dcidKey]connID)
+	w.srcIndex = make(map[srcKey]connID)
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
 	if err != nil {

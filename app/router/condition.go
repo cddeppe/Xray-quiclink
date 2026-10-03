@@ -57,7 +57,7 @@ func NewDomainMatcher(rules []*geodata.DomainRule) (*DomainMatcher, error) {
 }
 
 func (m *DomainMatcher) ApplyDomain(domain string) bool {
-	return m.DomainMatcher.MatchAny(strings.ToLower(domain))
+	return m.DomainMatcher.MatchAny(lowercaseASCII(domain))
 }
 
 // Apply implements Condition.
@@ -66,7 +66,34 @@ func (m *DomainMatcher) Apply(ctx routing.Context) bool {
 	if len(domain) == 0 {
 		return false
 	}
-	return m.DomainMatcher.MatchAny(strings.ToLower(domain))
+	return m.DomainMatcher.MatchAny(lowercaseASCII(domain))
+}
+
+// lowercaseASCII returns the lowercase form of an ASCII string.
+// If the input is already lowercase ASCII, returns the original
+// string without allocating (v26.10.16-link optimization).
+//
+// SNI is case-insensitive per RFC 6066 §3, and our TLS/QUIC sniffers
+// already lowercase the SNI at extraction time (v26.10.15-link).
+// This means the routing context's domain is almost always already
+// lowercase — strings.ToLower would allocate a new string every call
+// even though no characters change. This fast path avoids the alloc.
+func lowercaseASCII(s string) string {
+	// Fast path: scan for any uppercase ASCII. If none, return as-is.
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			// Slow path: allocate and lowercase
+			b := make([]byte, len(s))
+			copy(b, s)
+			for j := i; j < len(b); j++ {
+				if b[j] >= 'A' && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
 }
 
 type MatcherAsType byte

@@ -2,7 +2,6 @@ package freedom
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"io"
 	stdnet "net"
@@ -31,13 +30,13 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-	mu            sync.Mutex
+	mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
 	conn          stdnet.PacketConn
 	dest          *stdnet.UDPAddr
 	refCount      int
 	lastUsed      time.Time
 	lastReplyTime time.Time
-	demux         map[string]chan<- readResult
+	demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
 	closed        chan struct{}
 	closeOnce     sync.Once
 	dead          bool
@@ -48,6 +47,25 @@ type pooledSocket struct {
 	droppedReplies atomic.Int64
 }
 
+// v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
+// lookups in the pooled socket's demux map. Replaces hex.EncodeToString(dcid)
+// which allocated a 16-char string per reply packet. The struct is 24
+// bytes (20 CID + 4 len), comparable, and hashable.
+type dcidKey struct {
+	cid [quic.MaxCIDLen]byte
+	len int
+}
+
+func makeDCIDKey(dcid []byte) dcidKey {
+	var k dcidKey
+	k.len = len(dcid)
+	copy(k.cid[:], dcid)
+	return k
+}
+
+// cidKey is the string form for the scids map and the pooledConn.RegisterCID
+// path. Kept as string because SCID registration happens once per connection
+// (not per packet), so the alloc cost is negligible.
 type readResult struct {
 	data []byte
 	addr stdnet.Addr
@@ -62,7 +80,11 @@ type pooledConn struct {
 	// can check it without acquiring mu. mu is still needed to
 	// protect scids map mutations during Close.
 	closed atomic.Bool
-	scids  map[string]bool
+	// v26.10.16-link: scidsDCID stores the SCIDs we've registered
+	// in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
+	// so Close() can index demux directly without converting from
+	// hex string. Replaces the old scids map[string]bool.
+	scidsDCID map[dcidKey]bool
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration) *UDPSocketPool {
@@ -144,7 +166,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 		sock = &pooledSocket{
 			conn:     pc,
 			dest:     dest,
-			demux:    make(map[string]chan<- readResult),
+			demux:    make(map[dcidKey]chan<- readResult),
 			closed:   make(chan struct{}),
 			lastUsed: time.Now(),
 		}
@@ -168,10 +190,10 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 
 	inbox := make(chan readResult, 32)
 	conn := &pooledConn{
-		socket: sock,
-		inbox:  inbox,
-		done:   make(chan struct{}),
-		scids:  make(map[string]bool),
+		socket:    sock,
+		inbox:     inbox,
+		done:      make(chan struct{}),
+		scidsDCID: make(map[dcidKey]bool),
 	}
 	return conn, nil
 }
@@ -209,10 +231,25 @@ func (s *pooledSocket) readLoop() {
 		if err != nil {
 			continue
 		}
-		dcidHex := hex.EncodeToString(dcid)
+		// v26.10.16-link: zero-alloc dcidKey struct instead of
+		// hex.EncodeToString(dcid) which allocated a 16-char string
+		// per reply packet.
+		dk := makeDCIDKey(dcid)
 
+		// v26.10.16-link: use RLock for the demux read path (was
+		// Lock, blocking all RegisterCID calls which need write
+		// locks). The demux map is only mutated by RegisterCID
+		// and Close (which use Lock), so RLock is correct here.
+		s.mu.RLock()
+		ch, ok := s.demux[dk]
+		s.mu.RUnlock()
+
+		// Update timestamps under Lock. This is a short critical
+		// section but still serializes with RegisterCID. A future
+		// optimization could make these atomic.Int64 fields, but
+		// that requires updating evictStale to read them atomically
+		// too — defer to avoid risk.
 		s.mu.Lock()
-		ch, ok := s.demux[dcidHex]
 		s.lastUsed = time.Now()
 		s.lastReplyTime = time.Now()
 		s.mu.Unlock()
@@ -274,7 +311,10 @@ func (c *pooledConn) RegisterCID(cid []byte) {
 	if len(cid) == 0 {
 		return
 	}
-	cidHex := hex.EncodeToString(cid)
+	// v26.10.16-link: use zero-alloc dcidKey for both the scids set
+	// and the demux map. Eliminates hex.EncodeToString per SCID
+	// registration (was 1 string alloc; now zero).
+	dk := makeDCIDKey(cid)
 
 	// v26.10.15-link: atomic closed check avoids acquiring mu
 	// when the conn is already closed.
@@ -282,15 +322,15 @@ func (c *pooledConn) RegisterCID(cid []byte) {
 		return
 	}
 	c.mu.Lock()
-	already := c.scids[cidHex]
+	already := c.scidsDCID[dk]
 	if !already {
-		c.scids[cidHex] = true
+		c.scidsDCID[dk] = true
 	}
 	c.mu.Unlock()
 
 	if !already {
 		c.socket.mu.Lock()
-		c.socket.demux[cidHex] = c.inbox
+		c.socket.demux[dk] = c.inbox
 		c.socket.mu.Unlock()
 	}
 }
@@ -357,9 +397,12 @@ func (c *pooledConn) Close() error {
 	close(c.done)
 
 	c.mu.Lock()
-	for cidHex := range c.scids {
-		if existing, ok := c.socket.demux[cidHex]; ok && existing == c.inbox {
-			delete(c.socket.demux, cidHex)
+	// v26.10.16-link: scids now stores dcidKey (struct, zero-alloc)
+	// instead of string. This lets Close() index the demux map directly
+	// without converting back from hex string to dcidKey.
+	for dk := range c.scidsDCID {
+		if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+			delete(c.socket.demux, dk)
 		}
 	}
 	c.mu.Unlock()
