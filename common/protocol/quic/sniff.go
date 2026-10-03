@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
+	"encoding/hex"
 	"io"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/apernet/quic-go/quicvarint"
 	"github.com/xtls/xray-core/common"
@@ -67,11 +72,207 @@ var (
 	}
 )
 
+// ============================================================
+// Per-DCID sniffer state cache (v26.10.10-link)
+//
+// QUIC Initial packets retransmit heavily on lossy links (mobile,
+// multi-hop). Each retransmit triggered the full ~13µs HKDF + AES
+// pipeline even though the traffic secrets are a pure function of
+// (dcid, version). Worse, once the SNI was extracted, subsequent
+// Initial / Handshake / 1-RTT packets for the same connection still
+// ran the entire sniffer even though the routing decision was
+// already made.
+//
+// The cache stores per-DCID state: the derived keys (so retransmits
+// skip HKDF + aes.NewCipher + AEADAESGCMTLS13) and the extracted SNI
+// (so post-Initial packets skip the sniffer entirely).
+//
+// The cache is bounded at 256 entries with a 5-minute TTL. QUIC DCIDs
+// are 8 random bytes (16^16 namespace), so collision is essentially
+// impossible. Per-state mutexes allow different connections to be
+// sniffed concurrently; same-DCID processing is serialised (which is
+// correct — QUIC requires ordered Initial processing).
+// ============================================================
+
+const (
+	sniffCacheMaxEntries  = 256
+	sniffCacheTTLSeconds   = 300 // 5 minutes
+)
+
+// quicConnKeys holds the HKDF-derived keys and cipher instances for a
+// single QUIC connection's Initial packet. The keys are a pure function
+// of (dcid, version), so they can be cached and reused across Initial
+// retransmits.
+type quicConnKeys struct {
+	hpKey []byte
+	key   []byte
+	iv    []byte
+	block cipher.Block // *aes.Cipher
+	aead  cipher.AEAD  // AEADAESGCMTLS13(key, iv)
+}
+
+// quicSniffState accumulates per-DCID state across multiple sniff calls.
+// Once the SNI has been extracted, subsequent sniff calls for the same
+// DCID return the cached SNI without redoing the crypto work.
+type quicSniffState struct {
+	mu       sync.Mutex
+	keys     *quicConnKeys
+	keysVer  uint32 // which version the keys were derived for (0 = none)
+	sni      string // "" if not yet extracted
+	lastUsed atomic.Int64
+}
+
+type sniffCache struct {
+	mu     sync.Mutex
+	m      map[string]*quicSniffState
+	maxLen int
+}
+
+var globalSniffCache = &sniffCache{
+	m:      make(map[string]*quicSniffState),
+	maxLen: sniffCacheMaxEntries,
+}
+
+// sniffCacheGet returns the sniff state for dcid, creating a new entry
+// if needed. Returns nil if dcid is empty.
+func sniffCacheGet(dcid []byte) *quicSniffState {
+	if len(dcid) == 0 {
+		return nil
+	}
+	key := hex.EncodeToString(dcid)
+	c := globalSniffCache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s, ok := c.m[key]
+	if !ok {
+		if len(c.m) >= c.maxLen {
+			c.evictLocked()
+		}
+		s = &quicSniffState{}
+		c.m[key] = s
+	}
+	s.lastUsed.Store(time.Now().Unix())
+	return s
+}
+
+// evictLocked removes expired and/or least-recently-used entries until
+// the cache has at least one free slot. Caller must hold c.mu.
+func (c *sniffCache) evictLocked() {
+	// First pass: drop expired entries.
+	now := time.Now().Unix()
+	for k, s := range c.m {
+		if now-s.lastUsed.Load() > sniffCacheTTLSeconds {
+			delete(c.m, k)
+		}
+	}
+	// If still at capacity, evict the single least-recently-used entry.
+	if len(c.m) >= c.maxLen {
+		var oldestKey string
+		var oldestTime int64 = 1 << 62
+		for k, s := range c.m {
+			t := s.lastUsed.Load()
+			if t < oldestTime {
+				oldestTime = t
+				oldestKey = k
+			}
+		}
+		if oldestKey != "" {
+			delete(c.m, oldestKey)
+		}
+	}
+}
+
+// cachedSNI returns the previously-extracted SNI for this DCID, or "".
+// Safe for concurrent use.
+func (s *quicSniffState) cachedSNI() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sni
+}
+
+// setSNI caches the extracted SNI for this DCID.
+func (s *quicSniffState) setSNI(sni string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sni = sni
+}
+
+// deriveKeys returns the cached keys for (dcid, version) if available,
+// otherwise derives them from the QUIC Initial salt and stores them.
+// The caller must not hold s.mu.
+func (s *quicSniffState) deriveKeys(dcid []byte, ver uint32, salt []byte, label string) (*quicConnKeys, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.keys != nil && s.keysVer == ver {
+		return s.keys, nil
+	}
+	initialSecret := hkdf.Extract(crypto.SHA256.New, dcid, salt)
+	secret, err := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
+	if err != nil {
+		return nil, errNotQUIC
+	}
+	hpKey, err := hkdfExpandLabel(secret, label+" hp", 16)
+	if err != nil {
+		return nil, errNotQUIC
+	}
+	key, err := hkdfExpandLabel(secret, label+" key", 16)
+	if err != nil {
+		return nil, errNotQUIC
+	}
+	iv, err := hkdfExpandLabel(secret, label+" iv", 12)
+	if err != nil {
+		return nil, errNotQUIC
+	}
+	block, err := aes.NewCipher(hpKey)
+	if err != nil {
+		return nil, err
+	}
+	aead := AEADAESGCMTLS13(key, iv)
+	keys := &quicConnKeys{
+		hpKey: hpKey,
+		key:   key,
+		iv:    iv,
+		block: block,
+		aead:  aead,
+	}
+	s.keys = keys
+	s.keysVer = ver
+	return keys, nil
+}
+
+// ============================================================
+// SniffQUIC — public entry point
+// ============================================================
+
 func SniffQUIC(b []byte) (*SniffHeader, error) {
 	if len(b) == 0 {
 		return nil, common.ErrNoClue
 	}
 
+	// Peek the first packet's DCID. If we've already sniffed this DCID
+	// before, short-circuit the entire sniffer with the cached SNI.
+	// Even if we haven't seen the SNI yet, the DCID lets us reuse
+	// cached HKDF-derived keys for Initial retransmits.
+	if dcid, _, err := ParseDCID(b); err == nil && len(dcid) > 0 {
+		state := sniffCacheGet(dcid)
+		if state != nil {
+			if sni := state.cachedSNI(); sni != "" {
+				return &SniffHeader{domain: sni}, nil
+			}
+			return sniffQUICBody(b, state)
+		}
+	}
+
+	// No DCID could be extracted (short packet with non-8-byte DCID,
+	// Version Negotiation, or non-QUIC). Fall through to the full
+	// parser without caching; it will return the appropriate error.
+	return sniffQUICBody(b, nil)
+}
+
+// sniffQUICBody is the full packet-processing pipeline. state may be
+// nil (no cache entry) or a per-DCID state (used for key caching and
+// SNI storage).
+func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
 	// Crypto data separated across packets
 	cryptoLen := int32(0)
 	cryptoDataBuf := buf.NewWithSize(32767)
@@ -88,6 +289,12 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 	// sniffed datagram, which is negligible compared to the AES-GCM work
 	// already required.
 	b = bytes.Clone(b)
+
+	// datagramDCID is the DCID of the first long-header packet in this
+	// datagram. RFC 9000 §12.2 mandates that all coalesced packets in
+	// a datagram share the same DCID; a mismatch indicates a malformed
+	// or hostile packet and we reject the whole datagram.
+	var datagramDCID []byte
 
 	// Parse QUIC packets
 	for len(b) > 0 {
@@ -125,6 +332,18 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		if l, err := buffer.ReadByte(); err != nil {
 			return nil, errNotQUIC
 		} else if common.Error2(buffer.ReadBytes(int32(l))) != nil {
+			return nil, errNotQUIC
+		}
+
+		// Coalesced DCID consistency check (RFC 9000 §12.2).
+		// All coalesced long-header packets in a single datagram MUST
+		// share the same DCID. A mismatch would cause CRYPTO data
+		// from packet N to be decrypted with keys derived from
+		// packet N-1's DCID, producing garbage that silently corrupts
+		// SNI extraction.
+		if datagramDCID == nil {
+			datagramDCID = destConnID
+		} else if !bytes.Equal(destConnID, datagramDCID) {
 			return nil, errNotQUIC
 		}
 
@@ -168,21 +387,45 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			continue
 		}
 
-		salt := s.initialSalt
-		label := s.labelPrefix
-		initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, salt)
-		secret, err := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
-		if err != nil {
-			return nil, errNotQUIC
+		// Use cached keys if we've seen this DCID before (Initial
+		// retransmit), otherwise derive and cache them. The keys are
+		// a pure function of (dcid, version), so caching is safe.
+		var block cipher.Block
+		var quicCipher cipher.AEAD
+		if state != nil {
+			keys, err := state.deriveKeys(destConnID, versionNumber, s.initialSalt, s.labelPrefix)
+			if err != nil {
+				return nil, err
+			}
+			block = keys.block
+			quicCipher = keys.aead
+		} else {
+			salt := s.initialSalt
+			label := s.labelPrefix
+			initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, salt)
+			secret, err := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
+			if err != nil {
+				return nil, errNotQUIC
+			}
+			hpKey, err := hkdfExpandLabel(secret, label+" hp", 16)
+			if err != nil {
+				return nil, errNotQUIC
+			}
+			block, err = aes.NewCipher(hpKey)
+			if err != nil {
+				return nil, err
+			}
+			key, err := hkdfExpandLabel(secret, label+" key", 16)
+			if err != nil {
+				return nil, errNotQUIC
+			}
+			iv, err := hkdfExpandLabel(secret, label+" iv", 12)
+			if err != nil {
+				return nil, errNotQUIC
+			}
+			quicCipher = AEADAESGCMTLS13(key, iv)
 		}
-		hpKey, err := hkdfExpandLabel(secret, label+" hp", 16)
-		if err != nil {
-			return nil, errNotQUIC
-		}
-		block, err := aes.NewCipher(hpKey)
-		if err != nil {
-			return nil, err
-		}
+
 		if len(b) < hdrLen+4+block.BlockSize() {
 			return nil, errNotQUIC
 		}
@@ -195,17 +438,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			b[hdrLen+i] ^= mask[i+1]
 		}
 
-		key, err := hkdfExpandLabel(secret, label+" key", 16)
-		if err != nil {
-			return nil, errNotQUIC
-		}
-		iv, err := hkdfExpandLabel(secret, label+" iv", 12)
-		if err != nil {
-			return nil, errNotQUIC
-		}
-		cipher := AEADAESGCMTLS13(key, iv)
-
-		nonce := cache.Extend(int32(cipher.NonceSize()))
+		nonce := cache.Extend(int32(quicCipher.NonceSize()))
 		_, err = buffer.Read(nonce[len(nonce)-packetNumberLength:])
 		if err != nil {
 			return nil, err
@@ -213,7 +446,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 
 		extHdrLen := hdrLen + packetNumberLength
 		data := b[extHdrLen : int(packetLen)+hdrLen]
-		decrypted, err := cipher.Open(b[extHdrLen:extHdrLen], nonce, data, b[:extHdrLen])
+		decrypted, err := quicCipher.Open(b[extHdrLen:extHdrLen], nonce, data, b[:extHdrLen])
 		if err != nil {
 			return nil, err
 		}
@@ -307,6 +540,12 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			// So we continue to sniff rest packets.
 			b = restPayload
 			continue
+		}
+		// Cache the extracted SNI for this DCID so subsequent
+		// packets (Initial retransmits, Handshake, 1-RTT) skip the
+		// sniffer entirely.
+		if state != nil {
+			state.setSNI(tlsHdr.Domain())
 		}
 		return &SniffHeader{domain: tlsHdr.Domain()}, nil
 	}
