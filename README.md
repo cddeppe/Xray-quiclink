@@ -136,6 +136,9 @@ When a new UDP flow arrives, the sticky resolver checks if the hostname is cache
 - If DNS returns NXDOMAIN, it falls back to the last known-good IP for the domain suffix (e.g., `*.googlevideo.com`).
 - **Wildcard Caching:** Caches `*.googlevideo.com` with a 60-second TTL. When it expires, it returns the stale IP immediately AND triggers a background DNS refresh (stale-while-revalidate) to get a live edge IP.
 - **IPv4/IPv6 Preference:** Supports `preferIpv4: true` or `preferIpv6: true` to force the resolver to only pick addresses from the preferred family, eliminating "Happy Eyeballs" flipping entirely.
+- **Refresh Coalescing (v26.10.15+):** When N concurrent sessions hit the same expired hostname in the same window, only 1 background DNS query fires (was N queries). The other N-1 callers wait on a channel for the first query's result.
+- **Eviction Reaper (v26.10.15+):** A background goroutine evicts entries unused for >10x TTL every 5 minutes. Without this, weeks of YouTube viewing accumulated thousands of stale entries pinning memory.
+- **Atomic `lastUsed` (v26.10.15+):** The `lastUsed` field is now `atomic.Int64` (was `time.Time` mutated under RLock -- a data race that could produce torn writes).
 
 This prevents the IPv4/IPv6 flipping and NXDOMAIN errors.
 
@@ -148,6 +151,13 @@ When a new UDP flow arrives, the pool checks if a socket to the destination IP a
 - **Staleness Check:** If a socket hasn't received a reply in 30 seconds, it is marked dead and evicted.
 - **Idle Reaper:** A background goroutine evicts sockets that have been idle (no replies in 10 min) or unused (refCount=0 for 5 min).
 - **DCID Demuxing:** The pool reads QUIC Connection IDs from packets and routes reply packets to the correct session. This means the pool works even when SNI sniffing fails -- the packet is forwarded to the destination based on the DCID, not the SNI.
+- **65535-byte read buffer (v26.10.15+):** Handles UDP GRO/GSO coalesced datagrams (Linux can deliver up to 64KB in a single `recvmsg`). The old 1500-byte buffer silently truncated coalesced QUIC packets.
+- **Transient error guard (v26.10.15+):** A single `EAGAIN`/`ENOBUFS`/`EHOSTUNREACH` no longer kills the socket (was killing all 50+ sessions sharing it). Only persistent errors (`EBADF`, `EINVAL`) mark the socket dead.
+- **Atomic `IsClosed` (v26.10.15+):** `pooledConn.closed` is now `atomic.Bool` (was mutex-protected). The `WriteTo` hot path checks it without acquiring the mutex -- 25x faster.
+- **Skip `parseQUICSCID` for short headers (v26.10.15+):** 99% of packets in a long-lived QUIC connection are 1-RTT (short header, no SCID). The parse + hex + mutex are skipped entirely for them.
+- **RLock demux read (v26.10.16+):** `readLoop` uses `RLock` for the demux map lookup (was `Lock`, blocking all `RegisterCID` calls).
+- **Zero-alloc `dcidKey` (v26.10.16+):** Replaces `hex.EncodeToString(dcid)` with a 24-byte struct key. 1 string allocation eliminated per reply packet.
+- **Drop counter (v26.10.15+):** `droppedReplies atomic.Int64` tracks packets dropped when the inbox channel is full (for observability).
 
 This prevents the per-connection overhead and handles CDN edge rotation.
 
@@ -158,6 +168,9 @@ The standard 2-minute timeout in `worker.go` kills UDP sessions during video buf
 #### QUIC CID Migration (`worker.go`)
 
 If a QUIC client migrates (NAT rebinding, CID rotation), xray tracks the new Connection ID and preserves the existing outbound socket. The destination server sees a consistent source IP.
+
+- **Src-first fast path (v26.10.15+):** For steady-state 1-RTT traffic (99% of packets), the source IP:port is checked first against `srcIndex`. If it matches the existing conn, no DCID parsing or hex encoding is needed.
+- **Zero-alloc struct keys (v26.10.16+):** `srcIndex` uses a `srcKey` struct (18 bytes, IPv4-in-IPv6 mapped) instead of `id.src.String()` (was 4 allocations per call: IP.String + Port.String + two concats). `dcidIndex` uses a `dcidKey` struct (24 bytes) instead of `hex.EncodeToString`. The entire inbound per-packet path is now zero-allocation.
 
 ### Multi-IP Inbound + Deterministic Source IP (v26.10.0 + v26.10.1 + v26.10.2)
 
@@ -258,6 +271,39 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.5-link` -- configurable UDP timeouts via JSON config (`sessionIdleTimeout`, `poolStalenessTimeout`, `poolIdleTimeout`, `poolUnusedTimeout`)
 - `v26.10.6-link` -- 4 bug fixes from code review (non-QUIC UDP sendThrough, dcidHex panic, empty DCID guards)
 - `v26.10.7-link` -- TTL for exact-match DNS cache entries (stale-while-revalidate, prevents CDN edge rotation failures)
+- `v26.10.8-link` -- QUIC sniffer zero-padding skip (cherry-pick from upstream PR #6882)
+- `v26.10.9-link` -- 7 QUIC code-review fixes (SniffQUIC buffer mutation, hkdfExpandLabel panic, coalesced DCID check, etc.)
+- `v26.10.10-link` -- **DCID-keyed sniffer state cache** (4.6x sniffer speedup on Initial retransmits and post-Initial packets)
+- `v26.10.11-link` -- **ALPN + ECH extraction**, 10 hot-path optimizations (inline varint, cursor type, bulk-skip PADDING, zero-copy ClientHello, stack mask/nonce, precomputed labels, switch version lookup, CONNECTION_CLOSE short-circuit, dcidKey, atomic cache)
+- `v26.10.12-link` -- precomputed HKDF info buffers (zero string allocs per cold-path sniff) + seenPackets retransmit skip (skip AES-GCM decrypt for already-seen Initial retransmits)
+- `v26.10.13-link` -- cachedReader micro-optimizations (incremental cacheLen, preallocated cache, dropped redundant Clear -- had a regression that was fixed in v26.10.14)
+- `v26.10.14-link` -- **critical fix**: restored `b.Clear()` in cachedReader (v26.10.13 regression broke YouTube QUIC)
+- `v26.10.15-link` -- udp_pool, worker, sticky resolver fixes + perf (65535-byte read buffer for GRO, transient error guard, atomic.Bool IsClosed, skip parseQUICSCID for short headers, src-first fast path, lowercase SNI at extraction, sticky resolver data race + wildcard panic + eviction reaper + refresh coalescing)
+- `v26.10.16-link` -- **zero-alloc struct keys** (srcKey, dcidKey) + RLock demux + router ToLower fast path. Steady-state 1-RTT packet path is now 0 allocations end-to-end.
+
+### Performance (v26.10.16-link)
+
+The QUIC sniffer and per-packet hot path have been heavily optimized across v26.10.10 through v26.10.16:
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| Cold (new DCID, full HKDF + AES pipeline) | 500 | 613 | 3 |
+| Warm keys (Initial retransmit, cached keys) | 139 | 56 | 2 |
+| Warm SNI (post-Initial, cached SNI) | 139 | 56 | 2 |
+| Retransmit skip (same DCID + packet number) | 140 | 56 | 2 |
+
+**14x faster** on cold path, **50x faster** on warm path vs v26.10.9 baseline (no cache).
+
+Steady-state 1-RTT QUIC packet path (99% of traffic in a long-lived connection): **0 allocations** end-to-end.
+
+### New Sniffer Features (v26.10.11+)
+
+The QUIC sniffer now extracts metadata that upstream xray-core does not:
+
+- **`SniffHeader.ALPN()`** -- returns the first ALPN protocol from the TLS ClientHello (`"h3"`, `"doq"`, `"h3-webtransport"`, `"masque/..."`). Enables routing rules to distinguish HTTP/3, DNS-over-QUIC, WebTransport, and MASQUE traffic instead of guessing from SNI alone.
+- **`SniffHeader.HasECH()`** -- returns true if the ClientHello contained an `encrypted_client_hello` extension (RFC 9460). When ECH is in use, the visible SNI is a cover name; routing layers should fall back to IP-based rules.
+
+Both ALPN and ECH presence are cached alongside the SNI in the DCID cache, so subsequent sniff calls for the same connection return them without redoing the crypto work.
 
 ### Configuration
 
