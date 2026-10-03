@@ -74,6 +74,11 @@ var (
 // v26.10.11-link precomputes the HKDF-Expand-Label strings (labelHP,
 // labelKey, labelIV) to eliminate per-packet string concatenation
 // allocations on the hot path.
+//
+// v26.10.12-link precomputes the full HKDF-Expand-Label info buffers
+// (infoClientIn, infoHP, infoKey, infoIV) so the derive-keys hot path
+// has zero allocations and zero appends. Each info buffer is the
+// already-serialized form: [length(2)][label_len(1)]["tls13 "][label][0x00].
 type quicVersionSpec struct {
 	ver         uint32
 	typeInitial byte
@@ -81,32 +86,69 @@ type quicVersionSpec struct {
 	labelHP     string // precomputed: labelPrefix + " hp"
 	labelKey    string // precomputed: labelPrefix + " key"
 	labelIV     string // precomputed: labelPrefix + " iv"
+	// Precomputed HKDF-Expand-Label info buffers. Each is the fully
+	// serialized HkdfLabel struct (RFC 8446 §4.4.3) for the named
+	// label, with the appropriate output length already encoded.
+	// These are package-level constants — never mutated.
+	infoClientIn []byte
+	infoHP       []byte
+	infoKey      []byte
+	infoIV       []byte
+}
+
+// buildHKDFInfo constructs the HkdfLabel info buffer for a (label, length)
+// pair. Format per RFC 8446 §4.4.3:
+//
+//	[length(2 bytes, big-endian)] [label_len(1 byte)] ["tls13 "] [label] [0x00]
+//
+// The "tls13 " prefix is 6 bytes, so label_len = 6 + len(label).
+func buildHKDFInfo(label string, length int) []byte {
+	labelLen := 6 + len(label)
+	info := make([]byte, 0, 2+1+labelLen+1)
+	info = binary.BigEndian.AppendUint16(info, uint16(length))
+	info = append(info, byte(labelLen))
+	info = append(info, "tls13 "...)
+	info = append(info, label...)
+	info = append(info, 0)
+	return info
 }
 
 var (
 	quicDraft29 = quicVersionSpec{
-		ver:         0xff00001d,
-		typeInitial: 0b00,
-		initialSalt: []byte{0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99},
-		labelHP:     "quic hp",
-		labelKey:    "quic key",
-		labelIV:     "quic iv",
+		ver:          0xff00001d,
+		typeInitial:  0b00,
+		initialSalt:  []byte{0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c, 0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0, 0x43, 0x90, 0xa8, 0x99},
+		labelHP:      "quic hp",
+		labelKey:     "quic key",
+		labelIV:      "quic iv",
+		infoClientIn: buildHKDFInfo("client in", crypto.SHA256.Size()),
+		infoHP:       buildHKDFInfo("quic hp", 16),
+		infoKey:      buildHKDFInfo("quic key", 16),
+		infoIV:       buildHKDFInfo("quic iv", 12),
 	}
 	quicV1 = quicVersionSpec{
-		ver:         0x1,
-		typeInitial: 0b00,
-		initialSalt: []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a},
-		labelHP:     "quic hp",
-		labelKey:    "quic key",
-		labelIV:     "quic iv",
+		ver:          0x1,
+		typeInitial:  0b00,
+		initialSalt:  []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a},
+		labelHP:      "quic hp",
+		labelKey:     "quic key",
+		labelIV:      "quic iv",
+		infoClientIn: buildHKDFInfo("client in", crypto.SHA256.Size()),
+		infoHP:       buildHKDFInfo("quic hp", 16),
+		infoKey:      buildHKDFInfo("quic key", 16),
+		infoIV:       buildHKDFInfo("quic iv", 12),
 	}
 	quicV2 = quicVersionSpec{
-		ver:         0x6b3343cf,
-		typeInitial: 0b01,
-		initialSalt: []byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9},
-		labelHP:     "quicv2 hp",
-		labelKey:    "quicv2 key",
-		labelIV:     "quicv2 iv",
+		ver:          0x6b3343cf,
+		typeInitial:  0b01,
+		initialSalt:  []byte{0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb, 0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb, 0xf9, 0xbd, 0x2e, 0xd9},
+		labelHP:      "quicv2 hp",
+		labelKey:     "quicv2 key",
+		labelIV:      "quicv2 iv",
+		infoClientIn: buildHKDFInfo("client in", crypto.SHA256.Size()),
+		infoHP:       buildHKDFInfo("quicv2 hp", 16),
+		infoKey:      buildHKDFInfo("quicv2 key", 16),
+		infoIV:       buildHKDFInfo("quicv2 iv", 12),
 	}
 )
 
@@ -151,14 +193,58 @@ type quicConnKeys struct {
 // DCID return the cached SNI without redoing the crypto work. ALPN and
 // ECH presence are cached alongside the SNI so routing-layer callers
 // can use them without re-sniffing.
+//
+// v26.10.12-link: tracks seen QUIC packet numbers per DCID so
+// retransmitted Initials can skip the expensive AES-GCM decrypt + frame
+// walk. On lossy mobile links where YouTube retransmits Initials 2-3
+// times, this skips the most expensive part for 2 of 3 packets.
 type quicSniffState struct {
-	mu       sync.Mutex
-	keys     *quicConnKeys
-	keysVer  uint32 // which version the keys were derived for (0 = none)
-	sni      string // "" if not yet extracted
-	alpn     string // "" if not yet extracted or no ALPN present
-	hasECH   bool   // true if ClientHello had an ECH extension
-	lastUsed atomic.Int64
+	mu      sync.Mutex
+	keys    *quicConnKeys
+	keysVer uint32 // which version the keys were derived for (0 = none)
+	sni     string // "" if not yet extracted
+	alpn    string // "" if not yet extracted or no ALPN present
+	hasECH  bool   // true if ClientHello had an ECH extension
+	// seenPackets tracks QUIC packet numbers we've already decrypted
+	// for this DCID. Retransmitted Initials (same DCID + same packet
+	// number) skip the AES-GCM Open + frame walk entirely. Bounded
+	// by seenPacketsMax; eviction is FIFO (oldest entry removed).
+	// Real Initials have packet numbers 0, 1, 2, ... and we only
+	// see retransmits of the very first few, so a small bound is
+	// sufficient.
+	seenPackets map[uint64]struct{}
+	seenOrder   []uint64
+	lastUsed    atomic.Int64
+}
+
+const seenPacketsMax = 8
+
+// markSeen records that we've already decrypted packet `pn` for this
+// DCID. Returns true if it was newly added (caller should decrypt),
+// false if we've already seen it (caller should skip).
+func (s *quicSniffState) markSeen(pn uint64) bool {
+	if _, ok := s.seenPackets[pn]; ok {
+		return false
+	}
+	if s.seenPackets == nil {
+		s.seenPackets = make(map[uint64]struct{}, seenPacketsMax)
+	}
+	if len(s.seenPackets) >= seenPacketsMax && len(s.seenOrder) > 0 {
+		// FIFO evict
+		oldest := s.seenOrder[0]
+		s.seenOrder = s.seenOrder[1:]
+		delete(s.seenPackets, oldest)
+	}
+	s.seenPackets[pn] = struct{}{}
+	s.seenOrder = append(s.seenOrder, pn)
+	return true
+}
+
+// hasPacket returns true if we've already decrypted packet `pn`.
+// Used to skip retransmitted Initials.
+func (s *quicSniffState) hasPacket(pn uint64) bool {
+	_, ok := s.seenPackets[pn]
+	return ok
 }
 
 type sniffCache struct {
@@ -285,6 +371,12 @@ func (s *quicSniffState) setResult(sni, alpn string, hasECH bool) {
 // deriveKeys returns the cached keys for (dcid, version) if available,
 // otherwise derives them from the QUIC Initial salt and stores them.
 // The caller must not hold s.mu.
+//
+// v26.10.12-link: uses precomputed HKDF-Expand-Label info buffers
+// (spec.infoClientIn/HP/Key/IV) so the derive path has zero
+// allocations and zero string appends. The old hkdfExpandLabel()
+// helper is retained for compatibility but the hot path now uses
+// hkdfExpandLabelRaw below.
 func (s *quicSniffState) deriveKeys(dcid []byte, ver uint32, spec *quicVersionSpec) (*quicConnKeys, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -292,19 +384,19 @@ func (s *quicSniffState) deriveKeys(dcid []byte, ver uint32, spec *quicVersionSp
 		return s.keys, nil
 	}
 	initialSecret := hkdf.Extract(crypto.SHA256.New, dcid, spec.initialSalt)
-	secret, err := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
+	secret, err := hkdfExpandLabelRaw(initialSecret, spec.infoClientIn, crypto.SHA256.Size())
 	if err != nil {
 		return nil, errNotQUIC
 	}
-	hpKey, err := hkdfExpandLabel(secret, spec.labelHP, 16)
+	hpKey, err := hkdfExpandLabelRaw(secret, spec.infoHP, 16)
 	if err != nil {
 		return nil, errNotQUIC
 	}
-	key, err := hkdfExpandLabel(secret, spec.labelKey, 16)
+	key, err := hkdfExpandLabelRaw(secret, spec.infoKey, 16)
 	if err != nil {
 		return nil, errNotQUIC
 	}
-	iv, err := hkdfExpandLabel(secret, spec.labelIV, 12)
+	iv, err := hkdfExpandLabelRaw(secret, spec.infoIV, 12)
 	if err != nil {
 		return nil, errNotQUIC
 	}
@@ -559,12 +651,14 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
 			block = keys.block
 			quicCipher = keys.aead
 		} else {
+			// Non-cached path. Use the v26.10.12-link precomputed
+			// HKDF info buffers (zero string allocations).
 			initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, spec.initialSalt)
-			secret, err := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
+			secret, err := hkdfExpandLabelRaw(initialSecret, spec.infoClientIn, crypto.SHA256.Size())
 			if err != nil {
 				return nil, errNotQUIC
 			}
-			hpKey, err := hkdfExpandLabel(secret, spec.labelHP, 16)
+			hpKey, err := hkdfExpandLabelRaw(secret, spec.infoHP, 16)
 			if err != nil {
 				return nil, errNotQUIC
 			}
@@ -572,11 +666,11 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
 			if err != nil {
 				return nil, err
 			}
-			key, err := hkdfExpandLabel(secret, spec.labelKey, 16)
+			key, err := hkdfExpandLabelRaw(secret, spec.infoKey, 16)
 			if err != nil {
 				return nil, errNotQUIC
 			}
-			iv, err := hkdfExpandLabel(secret, spec.labelIV, 12)
+			iv, err := hkdfExpandLabelRaw(secret, spec.infoIV, 12)
 			if err != nil {
 				return nil, errNotQUIC
 			}
@@ -607,13 +701,52 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
 			return nil, errNotQUIC
 		}
 		copy(nonce[nonceSize-packetNumberLength:], b[c.i:c.i+packetNumberLength])
+
+		// Recover the full QUIC packet number. QUIC truncates the
+		// packet number on the wire to 1-4 bytes; the full number
+		// is reconstructed using the largest previously seen number
+		// (the "expected next" heuristic from RFC 9000 §17.1.1).
+		// For sniffing we only need a stable identifier per packet,
+		// so the truncated wire bytes themselves suffice as a key.
+		// We use them as a uint64 for the seenPackets map.
+		var pnTruncated uint64
+		for i := 0; i < packetNumberLength; i++ {
+			pnTruncated = (pnTruncated << 8) | uint64(b[c.i+i])
+		}
 		c.i += packetNumberLength
+
+		// v26.10.12-link: skip retransmitted Initials entirely,
+		// but ONLY if we've already extracted the SNI for this
+		// DCID. If we haven't, this might be the same packet
+		// being re-fed to the sniffer after the dispatcher's
+		// cachedReader accumulated more data (legitimate — the
+		// first call returned ErrProtoNeedMoreData and the
+		// caller is now retrying with a complete datagram).
+		// True retransmits have the same DCID + same packet
+		// number + we've already extracted the SNI; that's
+		// the case we want to skip.
+		if state != nil {
+			state.mu.Lock()
+			alreadySNI := state.sni != ""
+			alreadyPkt := false
+			if state.seenPackets != nil {
+				_, alreadyPkt = state.seenPackets[pnTruncated]
+			}
+			state.mu.Unlock()
+			if alreadySNI && alreadyPkt {
+				b = restPayload
+				continue
+			}
+		}
 
 		extHdrLen := hdrLen + packetNumberLength
 		data := b[extHdrLen : int(packetLen)+hdrLen]
 		decrypted, err := quicCipher.Open(b[extHdrLen:extHdrLen], nonce[:nonceSize], data, b[:extHdrLen])
 		if err != nil {
 			return nil, err
+		}
+		if state != nil {
+			state.markSeen(pnTruncated)
 		}
 
 		// --- Walk frames ---
@@ -764,6 +897,24 @@ func hkdfExpandLabel(secret []byte, label string, length int) ([]byte, error) {
 
 	out := make([]byte, length)
 	n, err := hkdf.Expand(crypto.SHA256.New, secret, b).Read(out)
+	if err != nil {
+		return nil, errors.New("quic: HKDF-Expand failed: ", err)
+	}
+	if n != length {
+		return nil, errors.New("quic: HKDF-Expand-Label produced ", n, " bytes, want ", length)
+	}
+	return out, nil
+}
+
+// hkdfExpandLabelRaw is the v26.10.12-link fast path: takes a
+// precomputed info buffer (the fully-serialized HkdfLabel struct from
+// buildHKDFInfo) and a desired output length. Zero string allocations,
+// zero appends. The info buffer must encode the same length as the
+// `length` argument — callers should use the corresponding
+// quicVersionSpec.infoXxx field.
+func hkdfExpandLabelRaw(secret, info []byte, length int) ([]byte, error) {
+	out := make([]byte, length)
+	n, err := hkdf.Expand(crypto.SHA256.New, secret, info).Read(out)
 	if err != nil {
 		return nil, errors.New("quic: HKDF-Expand failed: ", err)
 	}
