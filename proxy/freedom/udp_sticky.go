@@ -34,16 +34,23 @@ func NewStickyResolver(ttl time.Duration) *StickyResolver {
 }
 
 // Resolve returns a sticky IP for the given hostname.
-// Exact matches are permanent. Wildcard matches expire after 5 minutes.
-// When a wildcard expires, we return the stale IP immediately AND
+// Both exact and wildcard matches expire after the TTL (default 5 minutes).
+// When an entry expires, we return the stale IP immediately AND
 // trigger a background refresh (stale-while-revalidate).
 func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Address, error) {
-    // Check exact match first (permanent, no TTL)
+    // Check exact match first (with TTL, stale-while-revalidate)
     s.mu.RLock()
     if entry, ok := s.entries[hostname]; ok {
+        if time.Since(entry.lastUsed) < s.ttl {
+            s.mu.RUnlock()
+            entry.lastUsed = time.Now()
+            return entry.ip, nil
+        }
+        staleIP := entry.ip
         s.mu.RUnlock()
-        entry.lastUsed = time.Now()
-        return entry.ip, nil
+        go s.refreshExact(hostname)
+        errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
+        return staleIP, nil
     }
 
     // Check wildcard match (e.g., *.googlevideo.com)
@@ -97,6 +104,44 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
     s.entries[hostname] = &stickyEntry{ip: ip, lastUsed: time.Now()}
     s.mu.Unlock()
 
+    errors.LogInfo(ctx, "sticky: background refresh completed for ", hostname, " -> ", ip)
+}
+
+// refreshExact does a background DNS resolution and updates the exact-match cache.
+// This runs in a goroutine so the current request isn't blocked.
+func (s *StickyResolver) refreshExact(hostname string) {
+    ctx := context.Background()
+    addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+    if err != nil || len(addrs) == 0 {
+        errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname)
+        return
+    }
+
+    // Apply preference
+    var selectedAddr net.IP
+    if s.PreferIPv4 || s.PreferIPv6 {
+        for _, addr := range addrs {
+            if s.PreferIPv4 && len(addr.IP) == net.IPv4len {
+                selectedAddr = addr.IP
+                break
+            }
+            if s.PreferIPv6 && len(addr.IP) == net.IPv6len {
+                selectedAddr = addr.IP
+                break
+            }
+        }
+    }
+    if selectedAddr == nil {
+        selectedAddr = addrs[0].IP
+    }
+    ip := net.IPAddress(selectedAddr)
+    if ip == nil {
+        return
+    }
+
+    s.mu.Lock()
+    s.entries[hostname] = &stickyEntry{ip: ip, lastUsed: time.Now()}
+    s.mu.Unlock()
     errors.LogInfo(ctx, "sticky: background refresh completed for ", hostname, " -> ", ip)
 }
 
