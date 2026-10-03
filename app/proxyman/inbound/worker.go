@@ -314,7 +314,15 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		src:      &srcCopy,
 	}
 	conn.output = func(b []byte) (int, error) {
-		return w.hub.WriteTo(b, *conn.src)
+		// Snapshot src under w.Lock() so we race-free against
+		// tryQUICMigration()'s `*conn.src = id.src` reassignment. The
+		// outbound hub.WriteTo call is performed outside the lock so
+		// a slow network write does not block the inbound worker's
+		// packet-processing loop.
+		w.Lock()
+		srcCopy := *conn.src
+		w.Unlock()
+		return w.hub.WriteTo(b, srcCopy)
 	}
 	w.activeConn[id] = conn
 

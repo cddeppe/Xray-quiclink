@@ -342,40 +342,12 @@ func (c *pooledConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *pooledConn) SetWriteDeadline(time.Time) error { return nil }
 
 func parseQUICSCID(b []byte) ([]byte, bool, error) {
-    if len(b) < 1 {
-        return nil, false, quic.ErrTooShort
-    }
-    firstByte := b[0]
-
-    if firstByte&0x80 != 0 {
-        if firstByte&0x40 == 0 {
-            return nil, true, quic.ErrNotQUIC
-        }
-        if len(b) < 6 {
-            return nil, true, quic.ErrTooShort
-        }
-        dcidLen := int(b[5])
-        if dcidLen > quic.MaxCIDLen {
-            return nil, true, quic.ErrBadCILen
-        }
-        scidLenOffset := 6 + dcidLen
-        if len(b) < scidLenOffset+1 {
-            return nil, true, quic.ErrTooShort
-        }
-        scidLen := int(b[scidLenOffset])
-        if scidLen > quic.MaxCIDLen {
-            return nil, true, quic.ErrBadCILen
-        }
-        scidEnd := scidLenOffset + 1 + scidLen
-        if len(b) < scidEnd {
-            return nil, true, quic.ErrTooShort
-        }
-        scid := make([]byte, scidLen)
-        copy(scid, b[scidLenOffset+1:scidEnd])
-        return scid, true, nil
-    }
-
-    return nil, false, nil
+    // Thin wrapper around quic.ParseSCID so that the freedom package does not
+    // duplicate long-header parsing logic. Keeping the local name preserves
+    // the call-site shape (one less import-qualified call) and lets us swap
+    // the implementation in a single place if the QUIC spec ever grows a new
+    // long-header variant that requires version-specific SCID handling.
+    return quic.ParseSCID(b)
 }
 
 // ============================================================
