@@ -26,13 +26,11 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/proxy/freedom/udptimeout"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
-	"github.com/xtls/xray-core/proxy/freedom/udptimeout"
 )
-
-
 
 var (
 	useSplice               atomic.Bool
@@ -66,6 +64,7 @@ func init() {
 		if streamSettings, ok := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig); ok && streamSettings.SocketSettings != nil {
 			h.resolveStrategy = streamSettings.SocketSettings.DomainStrategy
 			h.usesDialerProxy = len(streamSettings.SocketSettings.DialerProxy) > 0
+			h.socketConfig = streamSettings.SocketSettings // v26.10.17-link
 		}
 		if err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
 			return h.Init(config.(*Config), pm)
@@ -110,6 +109,10 @@ type Handler struct {
 	usesDialerProxy bool
 	socketPool      *UDPSocketPool
 	stickyResolver  *StickyResolver
+	// v26.10.17-link: sockopt config from freedom outbound's streamSettings.
+	// Passed to the UDP pool so pool sockets honor SO_BINDTODEVICE + SO_MARK
+	// for WireGuard.
+	socketConfig *internet.SocketConfig
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -204,27 +207,28 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.policyManager = pm
 
 	// Initialize UDP features from config
-    if config.UdpConfig != nil {
-        udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
+	if config.UdpConfig != nil {
+		udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
 
-        if config.UdpConfig.EnableSocketPool {
-            staleness := secondsOrDefault(config.UdpConfig.GetPoolStalenessTimeout(), 300)
-            idle := secondsOrDefault(config.UdpConfig.GetPoolIdleTimeout(), 600)
-            unused := secondsOrDefault(config.UdpConfig.GetPoolUnusedTimeout(), 300)
-            h.socketPool = NewUDPSocketPool(
-                time.Duration(staleness)*time.Second,
-                time.Duration(idle)*time.Second,
-                time.Duration(unused)*time.Second,
-            )
-            errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (staleness=", staleness, "s idle=", idle, "s unused=", unused, "s)")
-        }
-        if config.UdpConfig.EnableStickyResolver {
-            h.stickyResolver = NewStickyResolver(5 * time.Minute)
-            h.stickyResolver.PreferIPv4 = config.UdpConfig.PreferIpv4
-            h.stickyResolver.PreferIPv6 = config.UdpConfig.PreferIpv6
-            errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (PreferIPv4:", config.UdpConfig.PreferIpv4, "PreferIPv6:", config.UdpConfig.PreferIpv6, ")")
-        }
-    }
+		if config.UdpConfig.EnableSocketPool {
+			staleness := secondsOrDefault(config.UdpConfig.GetPoolStalenessTimeout(), 300)
+			idle := secondsOrDefault(config.UdpConfig.GetPoolIdleTimeout(), 600)
+			unused := secondsOrDefault(config.UdpConfig.GetPoolUnusedTimeout(), 300)
+			h.socketPool = NewUDPSocketPool(
+				time.Duration(staleness)*time.Second,
+				time.Duration(idle)*time.Second,
+				time.Duration(unused)*time.Second,
+				h.socketConfig, // v26.10.17-link: pass sockopt for interface binding
+			)
+			errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (staleness=", staleness, "s idle=", idle, "s unused=", unused, "s)")
+		}
+		if config.UdpConfig.EnableStickyResolver {
+			h.stickyResolver = NewStickyResolver(5 * time.Minute)
+			h.stickyResolver.PreferIPv4 = config.UdpConfig.PreferIpv4
+			h.stickyResolver.PreferIPv6 = config.UdpConfig.PreferIpv6
+			errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (PreferIPv4:", config.UdpConfig.PreferIpv4, "PreferIPv6:", config.UdpConfig.PreferIpv6, ")")
+		}
+	}
 
 	if h.usesDialerProxy { // freedom is not the final outbound, final rules do not apply
 		if len(config.FinalRules) > 0 {
@@ -914,4 +918,3 @@ func GenerateRandomBytes(n int64) ([]byte, error) {
 
 	return b, nil
 }
-
