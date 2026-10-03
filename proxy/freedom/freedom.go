@@ -306,13 +306,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	if origTargetAddr == nil {
 		origTargetAddr = ob.Target.Address
 	}
-	// Apply sendThrough for TCP always, for UDP only when pool is not enabled.
-	// When the UDP pool is enabled, outGateway must stay nil so the pool's
-	// wildcard-bound sockets are used (DCID demuxing requires a single socket
-	// per destination, which can't bind a specific source IP).
-	if destination.Network == net.Network_TCP || h.socketPool == nil {
-		dialer.SetOutboundGateway(ctx, ob)
-	}
+	// Always call SetOutboundGateway so sendThrough is honored for TCP and
+	// for non-QUIC UDP fallback. For QUIC UDP that uses the pool, outGateway
+	// is cleared after the pool peek (see below) so the pool's wildcard-bound
+	// sockets are used (DCID demuxing requires a single socket per destination).
+	dialer.SetOutboundGateway(ctx, ob)
 	outGateway := ob.Gateway
 	UDPOverride := net.UDPDestination(nil, 0)
 	if h.config.DestinationOverride != nil {
@@ -437,7 +435,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// per-session socket path. This prevents the pool from breaking non-QUIC UDP.
 	var pooledConn *pooledConn
 	var peekedPackets buf.MultiBuffer
-	if destination.Network != net.Network_TCP && h.socketPool != nil && outGateway == nil {
+	if destination.Network != net.Network_TCP && h.socketPool != nil {
 		// Peek at the first packet(s) to check if this is QUIC traffic.
 		mb, peekErr := input.ReadMultiBuffer()
 		if peekErr == nil && len(mb) > 0 {
@@ -456,6 +454,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 						return errors.New("failed to acquire pooled UDP conn").Base(err)
 					}
 					defer pooledConn.Close()
+					// Pool uses wildcard socket; clear outGateway for QUIC path.
+					// Non-QUIC UDP keeps outGateway (sendThrough honored).
+					outGateway = nil
 				}
 			}
 			// If not QUIC, pooledConn stays nil — existing per-session path is used.

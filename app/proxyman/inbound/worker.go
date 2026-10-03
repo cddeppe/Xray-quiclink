@@ -423,6 +423,9 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 	if err != nil {
 		return nil
 	}
+	if len(dcid) == 0 {
+		return nil
+	}
 	dcidHex := hex.EncodeToString(dcid)
 
 	w.Lock()
@@ -444,7 +447,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 			delete(w.srcIndex, oldSrcKey)
 			w.srcIndex[id.src.String()] = id
 
-			errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex[:8], " from ", oldID.src, " to ", id.src)
+			errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex, " from ", oldID.src, " to ", id.src)
 			return oldConn
 		}
 	}
@@ -472,7 +475,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 		w.srcIndex[srcKey] = id
 		w.dcidIndex[dcidHex] = id // Add new DCID for future lookups
 
-		errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex[:8], " from ", id.src)
+		errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex, " from ", id.src)
 		return oldConn
 	}
 
@@ -494,6 +497,9 @@ func (w *udpWorker) recordSrc(id connID, conn *udpConn) {
 func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
 	dcid, _, err := quic.ParseDCID(packet)
 	if err != nil {
+		return
+	}
+	if len(dcid) == 0 {
 		return
 	}
 	dcidHex := hex.EncodeToString(dcid)
