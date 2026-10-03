@@ -255,6 +255,8 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.2-link` -- separates TCP/UDP sendThrough (TCP honors source-IP binding, UDP uses pool for DCID demuxing)
 - `v26.10.3-link` -- fixes sticky resolver to honor `preferIpv4`/`preferIpv6` (was picking `addrs[0]` regardless)
 - `v26.10.4-link` -- increases pool staleness timeout from 30s to 5min (prevents YouTube stalls during buffering)
+- `v26.10.5-link` -- configurable UDP timeouts via JSON config (`sessionIdleTimeout`, `poolStalenessTimeout`, `poolIdleTimeout`, `poolUnusedTimeout`)
+- `v26.10.6-link` -- 4 bug fixes from code review (non-QUIC UDP sendThrough, dcidHex panic, empty DCID guards)
 
 ### Configuration
 
@@ -262,9 +264,25 @@ See the sanitized example config for a complete working example (uses documentat
 
 1. **Multi-IP inbound listen:** `listen: [v4-ip, v6-ip]` consolidates per-IP inbounds into one block.
 2. **`portMap` for multi-port:** A single inbound can listen on multiple ports and forward each to a different destination.
-3. **`sendThrough: origin` on freedom outbound:** Binds outbound source IP to inbound listen IP (TCP only; UDP uses the pool when `enableSocketPool: true`).
+3. **`sendThrough: origin` on freedom outbound:** Binds outbound source IP to inbound listen IP. TCP always honors sendThrough. UDP honors sendThrough for non-QUIC traffic; QUIC uses the pool (when `enableSocketPool: true`) with DCID demuxing (v26.10.2+). Non-QUIC UDP also honors sendThrough when the pool is enabled (v26.10.6 fix).
 4. **`domainStrategy: useip` in freedom's sockopt:** Resolves destination to IP before dialing (required for family-mismatch guard).
-5. **`udpConfig` for QUIC:** `enableSocketPool`, `enableStickyResolver`, `preferIpv4` for the YouTube/QUIC chain.
+5. **`udpConfig` for QUIC:** `enableSocketPool`, `enableStickyResolver`, `preferIpv4` for the YouTube/QUIC chain. Configurable timeouts (v26.10.5+):
+   ```json
+   "udpConfig": {
+     "enableSocketPool": true,
+     "enableStickyResolver": true,
+     "preferIpv4": true,
+     "sessionIdleTimeout": 1800,
+     "poolStalenessTimeout": 300,
+     "poolIdleTimeout": 600,
+     "poolUnusedTimeout": 300
+   }
+   ```
+   All values in seconds. Omit or set 0 to use defaults:
+   - `sessionIdleTimeout`: 1800 (30 min) -- UDP session idle timeout
+   - `poolStalenessTimeout`: 300 (5 min) -- pool socket staleness check
+   - `poolIdleTimeout`: 600 (10 min) -- pool socket idle eviction
+   - `poolUnusedTimeout`: 300 (5 min) -- pool socket unused eviction
 6. **UDP enabled on port 443 inbounds:** `network: tcp,udp`
 7. **QUIC allowed in routing:** (Do NOT block `protocol: quic`)
 8. **Policy with long idle timeout:** `policy: {levels: {0: {connIdle: 1800}}}`
