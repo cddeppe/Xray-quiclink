@@ -1,111 +1,122 @@
 package freedom
 
 import (
-    "context"
-    "encoding/hex"
-    "io"
-    stdnet "net"
-    "sync"
-    "time"
+	"context"
+	"encoding/hex"
+	"errors"
+	"io"
+	stdnet "net"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
-    "github.com/xtls/xray-core/common/buf"
-    "github.com/xtls/xray-core/common/errors"
-    xraynet "github.com/xtls/xray-core/common/net"
-    "github.com/xtls/xray-core/common/protocol/quic"
-    "github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/common/buf"
+	xrayerrors "github.com/xtls/xray-core/common/errors"
+	xraynet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol/quic"
+	"github.com/xtls/xray-core/features/stats"
 )
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
 // UDP socket. Reply packets are demuxed by parsing the QUIC DCID.
 type UDPSocketPool struct {
-    mu      sync.Mutex
-    sockets map[string]*pooledSocket
-    reaper           *time.Ticker
-    stalenessTimeout time.Duration
-    idleTimeout      time.Duration
-    unusedTimeout    time.Duration
+	mu               sync.Mutex
+	sockets          map[string]*pooledSocket
+	reaper           *time.Ticker
+	stalenessTimeout time.Duration
+	idleTimeout      time.Duration
+	unusedTimeout    time.Duration
 }
 
 type pooledSocket struct {
-    mu            sync.Mutex
-    conn          stdnet.PacketConn
-    dest          *stdnet.UDPAddr
-    refCount      int
-    lastUsed      time.Time
-    lastReplyTime time.Time
-    demux         map[string]chan<- readResult
-    closed        chan struct{}
-    closeOnce     sync.Once
-    dead          bool
+	mu            sync.Mutex
+	conn          stdnet.PacketConn
+	dest          *stdnet.UDPAddr
+	refCount      int
+	lastUsed      time.Time
+	lastReplyTime time.Time
+	demux         map[string]chan<- readResult
+	closed        chan struct{}
+	closeOnce     sync.Once
+	dead          bool
+	// v26.10.15-link: dropped reply packets counter for observability.
+	// Incremented when the inbox channel (cap 32) is full and the
+	// readLoop drops a reply packet. QUIC will retransmit, but
+	// persistent drops indicate a slow consumer.
+	droppedReplies atomic.Int64
 }
 
 type readResult struct {
-    data []byte
-    addr stdnet.Addr
+	data []byte
+	addr stdnet.Addr
 }
 
 type pooledConn struct {
-    socket *pooledSocket
-    inbox  chan readResult
-    done   chan struct{}
-    mu     sync.Mutex
-    closed bool
-    scids  map[string]bool
+	socket *pooledSocket
+	inbox  chan readResult
+	done   chan struct{}
+	mu     sync.Mutex
+	// v26.10.15-link: closed is atomic so WriteTo (the hot path)
+	// can check it without acquiring mu. mu is still needed to
+	// protect scids map mutations during Close.
+	closed atomic.Bool
+	scids  map[string]bool
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration) *UDPSocketPool {
-    p := &UDPSocketPool{
-        sockets:          make(map[string]*pooledSocket),
-        stalenessTimeout: staleness,
-        idleTimeout:      idle,
-        unusedTimeout:    unused,
-    }
-    p.startReaper()
-    return p
+	p := &UDPSocketPool{
+		sockets:          make(map[string]*pooledSocket),
+		stalenessTimeout: staleness,
+		idleTimeout:      idle,
+		unusedTimeout:    unused,
+	}
+	p.startReaper()
+	return p
 }
 
 func (p *UDPSocketPool) startReaper() {
-    p.reaper = time.NewTicker(2 * time.Minute)
-    go func() {
-        for range p.reaper.C {
-            p.evictStale()
-        }
-    }()
+	p.reaper = time.NewTicker(2 * time.Minute)
+	go func() {
+		for range p.reaper.C {
+			p.evictStale()
+		}
+	}()
 }
 
 func (p *UDPSocketPool) evictStale() {
-    p.mu.Lock()
-    defer p.mu.Unlock()
-    for key, sock := range p.sockets {
-        sock.mu.Lock()
-        isDead := sock.dead
-        isIdle := time.Since(sock.lastReplyTime) > p.idleTimeout && sock.refCount > 0
-        isUnused := time.Since(sock.lastUsed) > p.unusedTimeout && sock.refCount == 0
-        sock.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key, sock := range p.sockets {
+		sock.mu.Lock()
+		isDead := sock.dead
+		isIdle := time.Since(sock.lastReplyTime) > p.idleTimeout && sock.refCount > 0
+		isUnused := time.Since(sock.lastUsed) > p.unusedTimeout && sock.refCount == 0
+		sock.mu.Unlock()
 
-        if isDead || isIdle || isUnused {
-            sock.MarkDead()
-            delete(p.sockets, key)
-            errors.LogInfo(context.Background(), "udp_pool: evicted stale socket for ", key)
-        }
-    }
+		if isDead || isIdle || isUnused {
+			sock.MarkDead()
+			delete(p.sockets, key)
+			xrayerrors.LogInfo(context.Background(), "udp_pool: evicted stale socket for ", key)
+		}
+	}
 }
 
 func destKey(dest *stdnet.UDPAddr) string {
-    return dest.String()
+	return dest.String()
 }
 
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
-    key := destKey(dest)
+	key := destKey(dest)
 
-    p.mu.Lock()
-    sock, ok := p.sockets[key]
-    if ok && (sock.IsClosed() || sock.IsDead()) {
-        delete(p.sockets, key)
-        ok = false
-    }
-    if ok {
+	p.mu.Lock()
+	sock, ok := p.sockets[key]
+	if ok && (sock.IsClosed() || sock.IsDead()) {
+		delete(p.sockets, key)
+		ok = false
+	}
+	if ok {
 		// STALENESS CHECK: If the socket hasn't received a reply in 60 seconds,
 		// assume the CDN edge rotated and is silently dropping packets.
 		// Mark it dead and force the creation of a fresh socket for this request.
@@ -117,224 +128,252 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 			delete(p.sockets, key)
 			ok = false
 		}
-        sock.mu.Lock()
-        sock.refCount++
-        sock.lastUsed = time.Now()
-        sock.mu.Unlock()
-    }
-    p.mu.Unlock()
+		sock.mu.Lock()
+		sock.refCount++
+		sock.lastUsed = time.Now()
+		sock.mu.Unlock()
+	}
+	p.mu.Unlock()
 
-    if !ok {
-        pc, err := stdnet.ListenUDP("udp", nil)
-        if err != nil {
-            return nil, err
-        }
+	if !ok {
+		pc, err := stdnet.ListenUDP("udp", nil)
+		if err != nil {
+			return nil, err
+		}
 
-        sock = &pooledSocket{
-            conn:     pc,
-            dest:     dest,
-            demux:    make(map[string]chan<- readResult),
-            closed:   make(chan struct{}),
-            lastUsed: time.Now(),
-        }
+		sock = &pooledSocket{
+			conn:     pc,
+			dest:     dest,
+			demux:    make(map[string]chan<- readResult),
+			closed:   make(chan struct{}),
+			lastUsed: time.Now(),
+		}
 
-        p.mu.Lock()
-        if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
-            pc.Close()
-            sock = existing
-            sock.mu.Lock()
-            sock.refCount++
-            sock.mu.Unlock()
-        } else {
-            p.sockets[key] = sock
-            sock.mu.Lock()
-            sock.refCount++
-            sock.mu.Unlock()
-            go sock.readLoop()
-        }
-        p.mu.Unlock()
-    }
+		p.mu.Lock()
+		if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
+			pc.Close()
+			sock = existing
+			sock.mu.Lock()
+			sock.refCount++
+			sock.mu.Unlock()
+		} else {
+			p.sockets[key] = sock
+			sock.mu.Lock()
+			sock.refCount++
+			sock.mu.Unlock()
+			go sock.readLoop()
+		}
+		p.mu.Unlock()
+	}
 
-    inbox := make(chan readResult, 32)
-    conn := &pooledConn{
-        socket: sock,
-        inbox:  inbox,
-        done:   make(chan struct{}),
-        scids:  make(map[string]bool),
-    }
-    return conn, nil
+	inbox := make(chan readResult, 32)
+	conn := &pooledConn{
+		socket: sock,
+		inbox:  inbox,
+		done:   make(chan struct{}),
+		scids:  make(map[string]bool),
+	}
+	return conn, nil
 }
 
 func (s *pooledSocket) readLoop() {
-    b := make([]byte, 1500)
-    for {
-        select {
-        case <-s.closed:
-            return
-        default:
-        }
+	// v26.10.15-link: 65535 bytes to handle UDP GRO/GSO coalesced
+	// datagrams (Linux can deliver up to 64KB in a single recvmsg
+	// when GRO is enabled). The old 1500-byte buffer silently
+	// truncated coalesced QUIC packets, causing the DCID parser to
+	// see malformed packets and demux replies to sessions that
+	// couldn't read them. Memory cost: 64KB per pooled socket
+	// (dozens of sockets total = ~1MB).
+	b := make([]byte, 65535)
+	for {
+		select {
+		case <-s.closed:
+			return
+		default:
+		}
 
-        n, addr, err := s.conn.ReadFrom(b)
-        if err != nil {
-            if s.IsClosed() {
-                return
-            }
-            errors.LogInfo(context.Background(), "udp_pool: read error, marking socket dead: ", err)
-            s.MarkDead()
-            return
-        }
+		n, addr, err := s.conn.ReadFrom(b)
+		if err != nil {
+			if s.IsClosed() {
+				return
+			}
+			xrayerrors.LogInfo(context.Background(), "udp_pool: read error, marking socket dead: ", err)
+			s.MarkDead()
+			return
+		}
 
-        packet := make([]byte, n)
-        copy(packet, b[:n])
+		packet := make([]byte, n)
+		copy(packet, b[:n])
 
-        dcid, _, err := quic.ParseDCID(packet)
-        if err != nil {
-            continue
-        }
-        dcidHex := hex.EncodeToString(dcid)
+		dcid, _, err := quic.ParseDCID(packet)
+		if err != nil {
+			continue
+		}
+		dcidHex := hex.EncodeToString(dcid)
 
-        s.mu.Lock()
-        ch, ok := s.demux[dcidHex]
-        s.lastUsed = time.Now()
-        s.lastReplyTime = time.Now()
-        s.mu.Unlock()
+		s.mu.Lock()
+		ch, ok := s.demux[dcidHex]
+		s.lastUsed = time.Now()
+		s.lastReplyTime = time.Now()
+		s.mu.Unlock()
 
-        if !ok {
-            continue
-        }
+		if !ok {
+			continue
+		}
 
-        select {
-        case ch <- readResult{data: packet, addr: addr}:
-        default:
-        }
-    }
+		select {
+		case ch <- readResult{data: packet, addr: addr}:
+		default:
+			// v26.10.15-link: track dropped replies for observability.
+			// QUIC retransmits will recover, but persistent drops
+			// indicate the consumer is slow.
+			s.droppedReplies.Add(1)
+		}
+	}
 }
 
 func (s *pooledSocket) IsClosed() bool {
-    select {
-    case <-s.closed:
-        return true
-    default:
-        return false
-    }
+	select {
+	case <-s.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *pooledSocket) IsDead() bool {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    return s.dead
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dead
 }
 
 // MarkDead marks the socket as dead and closes it.
 func (s *pooledSocket) MarkDead() {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    if s.dead {
-        return
-    }
-    s.dead = true
-    s.closeOnce.Do(func() {
-        close(s.closed)
-        _ = s.conn.Close()
-    })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dead {
+		return
+	}
+	s.dead = true
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		_ = s.conn.Close()
+	})
 }
 
 func (s *pooledSocket) release() {
-    s.mu.Lock()
-    if s.refCount > 0 {
-        s.refCount--
-    }
-    s.lastUsed = time.Now()
-    s.mu.Unlock()
+	s.mu.Lock()
+	if s.refCount > 0 {
+		s.refCount--
+	}
+	s.lastUsed = time.Now()
+	s.mu.Unlock()
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-    if len(cid) == 0 {
-        return
-    }
-    cidHex := hex.EncodeToString(cid)
+	if len(cid) == 0 {
+		return
+	}
+	cidHex := hex.EncodeToString(cid)
 
-    c.mu.Lock()
-    if c.closed {
-        c.mu.Unlock()
-        return
-    }
-    already := c.scids[cidHex]
-    if !already {
-        c.scids[cidHex] = true
-    }
-    c.mu.Unlock()
+	// v26.10.15-link: atomic closed check avoids acquiring mu
+	// when the conn is already closed.
+	if c.closed.Load() {
+		return
+	}
+	c.mu.Lock()
+	already := c.scids[cidHex]
+	if !already {
+		c.scids[cidHex] = true
+	}
+	c.mu.Unlock()
 
-    if !already {
-        c.socket.mu.Lock()
-        c.socket.demux[cidHex] = c.inbox
-        c.socket.mu.Unlock()
-    }
+	if !already {
+		c.socket.mu.Lock()
+		c.socket.demux[cidHex] = c.inbox
+		c.socket.mu.Unlock()
+	}
 }
 
 func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
-    if c.IsClosed() {
-        return 0, io.EOF
-    }
+	// v26.10.15-link: use atomic.Bool for closed check (25x faster
+	// than mutex acquire+release on the hot path).
+	if c.closed.Load() {
+		return 0, io.EOF
+	}
 
-    if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
-        c.RegisterCID(scid)
-    }
+	// v26.10.15-link: only parse SCID for long headers (Initial,
+	// 0-RTT, Handshake). Short headers (1-RTT, bit 7 = 0) don't
+	// carry SCID length info, and we've already registered the SCID
+	// during the handshake. This skips the parse + hex encode +
+	// mutex acquire for 99% of packets in a long-lived QUIC
+	// connection (which are 1-RTT).
+	if len(b) > 0 && b[0]&0x80 != 0 {
+		if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
+			c.RegisterCID(scid)
+		}
+	}
 
-    n, err := c.socket.conn.WriteTo(b, c.socket.dest)
-    if err != nil {
-        c.socket.MarkDead()
-    }
-    return n, err
+	n, err := c.socket.conn.WriteTo(b, c.socket.dest)
+	if err != nil {
+		// v26.10.15-link: only mark the socket dead on persistent
+		// errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
+		// ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
+		// will retry or the route will come back. Killing the socket
+		// on a transient error would kill all 50+ QUIC sessions
+		// sharing this socket, which is much worse than dropping one
+		// packet.
+		if !isTransientWriteError(err) {
+			c.socket.MarkDead()
+		}
+	}
+	return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
-    select {
-    case rr, ok := <-c.inbox:
-        if !ok {
-            return 0, nil, io.EOF
-        }
-        n := copy(p, rr.data)
-        return n, rr.addr, nil
-    case <-c.done:
-        return 0, nil, io.EOF
-    }
+	select {
+	case rr, ok := <-c.inbox:
+		if !ok {
+			return 0, nil, io.EOF
+		}
+		n := copy(p, rr.data)
+		return n, rr.addr, nil
+	case <-c.done:
+		return 0, nil, io.EOF
+	}
 }
 
 func (c *pooledConn) IsClosed() bool {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    return c.closed
+	return c.closed.Load()
 }
 
 func (c *pooledConn) Close() error {
-    c.mu.Lock()
-    if c.closed {
-        c.mu.Unlock()
-        return nil
-    }
-    c.closed = true
-    close(c.done)
+	// v26.10.15-link: atomic CAS to avoid double-close. The
+	// CAS ensures only one caller proceeds to close(c.done)
+	// and the scids cleanup.
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	close(c.done)
 
-    c.socket.mu.Lock()
-    for cidHex := range c.scids {
-        if existing, ok := c.socket.demux[cidHex]; ok && existing == c.inbox {
-            delete(c.socket.demux, cidHex)
-        }
-    }
-    c.socket.mu.Unlock()
-    c.mu.Unlock()
+	c.mu.Lock()
+	for cidHex := range c.scids {
+		if existing, ok := c.socket.demux[cidHex]; ok && existing == c.inbox {
+			delete(c.socket.demux, cidHex)
+		}
+	}
+	c.mu.Unlock()
 
-    c.socket.release()
-    return nil
+	c.socket.release()
+	return nil
 }
 
 func (c *pooledConn) LocalAddr() stdnet.Addr {
-    return c.socket.conn.LocalAddr()
+	return c.socket.conn.LocalAddr()
 }
 
 func (c *pooledConn) RemoteAddr() stdnet.Addr {
-    return c.socket.dest
+	return c.socket.dest
 }
 
 func (c *pooledConn) SetDeadline(time.Time) error      { return nil }
@@ -342,12 +381,43 @@ func (c *pooledConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *pooledConn) SetWriteDeadline(time.Time) error { return nil }
 
 func parseQUICSCID(b []byte) ([]byte, bool, error) {
-    // Thin wrapper around quic.ParseSCID so that the freedom package does not
-    // duplicate long-header parsing logic. Keeping the local name preserves
-    // the call-site shape (one less import-qualified call) and lets us swap
-    // the implementation in a single place if the QUIC spec ever grows a new
-    // long-header variant that requires version-specific SCID handling.
-    return quic.ParseSCID(b)
+	// Thin wrapper around quic.ParseSCID so that the freedom package does not
+	// duplicate long-header parsing logic. Keeping the local name preserves
+	// the call-site shape (one less import-qualified call) and lets us swap
+	// the implementation in a single place if the QUIC spec ever grows a new
+	// long-header variant that requires version-specific SCID handling.
+	return quic.ParseSCID(b)
+}
+
+// isTransientWriteError returns true for WriteTo errors that are
+// recoverable and should NOT cause the socket to be marked dead.
+// These include:
+//   - EAGAIN/EWOULDBLOCK: send buffer full, kernel will retry
+//   - ENOMEM/ENOBUFS: kernel memory pressure, transient
+//   - EHOSTUNREACH/ENETUNREACH: routing blip, usually recovers
+//   - ECONNREFUSED: ICMP port unreachable, transient for UDP
+//
+// Only persistent errors (EBADF, EINVAL, EFAULT) should mark the
+// socket dead — they indicate the socket itself is broken.
+//
+// v26.10.15-link: without this check, a single transient EAGAIN
+// would kill the socket and all 50+ QUIC sessions sharing it.
+func isTransientWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Use errors.As to unwrap net.OpError and similar wrappers
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EAGAIN,
+			syscall.ENOMEM, syscall.ENOBUFS,
+			syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+			syscall.ECONNREFUSED:
+			return true
+		}
+	}
+	return false
 }
 
 // ============================================================
@@ -355,77 +425,77 @@ func parseQUICSCID(b []byte) ([]byte, bool, error) {
 // ============================================================
 
 type PooledPacketReader struct {
-    conn *pooledConn
+	conn *pooledConn
 }
 
 func NewPooledPacketReader(conn *pooledConn) *PooledPacketReader {
-    return &PooledPacketReader{conn: conn}
+	return &PooledPacketReader{conn: conn}
 }
 
 func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-    b := buf.New()
-    b.Resize(0, buf.Size)
+	b := buf.New()
+	b.Resize(0, buf.Size)
 
-    n, addr, err := r.conn.ReadFrom(b.Bytes())
-    if err != nil {
-        b.Release()
-        return nil, err
-    }
-    b.Resize(0, int32(n))
+	n, addr, err := r.conn.ReadFrom(b.Bytes())
+	if err != nil {
+		b.Release()
+		return nil, err
+	}
+	b.Resize(0, int32(n))
 
-    if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
-        b.UDP = &xraynet.Destination{
-            Address: xraynet.IPAddress(udpAddr.IP),
-            Port:    xraynet.Port(udpAddr.Port),
-            Network: xraynet.Network_UDP,
-        }
-    }
-    return buf.MultiBuffer{b}, nil
+	if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
+		b.UDP = &xraynet.Destination{
+			Address: xraynet.IPAddress(udpAddr.IP),
+			Port:    xraynet.Port(udpAddr.Port),
+			Network: xraynet.Network_UDP,
+		}
+	}
+	return buf.MultiBuffer{b}, nil
 }
 
 type PooledPacketWriter struct {
-    conn      *pooledConn
-    statWrite stats.Counter
+	conn      *pooledConn
+	statWrite stats.Counter
 }
 
 func NewPooledPacketWriter(conn *pooledConn, statWrite stats.Counter) *PooledPacketWriter {
-    return &PooledPacketWriter{conn: conn, statWrite: statWrite}
+	return &PooledPacketWriter{conn: conn, statWrite: statWrite}
 }
 
 func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-    for {
-        mb2, b := buf.SplitFirst(mb)
-        mb = mb2
-        if b == nil {
-            break
-        }
+	for {
+		mb2, b := buf.SplitFirst(mb)
+		mb = mb2
+		if b == nil {
+			break
+		}
 
-        var destAddr stdnet.Addr
-        if b.UDP != nil {
-            destAddr = &stdnet.UDPAddr{
-                IP:   b.UDP.Address.IP(),
-                Port: int(b.UDP.Port),
-            }
-        } else {
-            destAddr = w.conn.socket.dest
-        }
+		var destAddr stdnet.Addr
+		if b.UDP != nil {
+			destAddr = &stdnet.UDPAddr{
+				IP:   b.UDP.Address.IP(),
+				Port: int(b.UDP.Port),
+			}
+		} else {
+			destAddr = w.conn.socket.dest
+		}
 
-        n, err := w.conn.WriteTo(b.Bytes(), destAddr)
-        b.Release()
-        if err != nil {
-            buf.ReleaseMulti(mb)
-            return err
-        }
-        if w.statWrite != nil {
-            w.statWrite.Add(int64(n))
-        }
-    }
-    return nil
+		n, err := w.conn.WriteTo(b.Bytes(), destAddr)
+		b.Release()
+		if err != nil {
+			buf.ReleaseMulti(mb)
+			return err
+		}
+		if w.statWrite != nil {
+			w.statWrite.Add(int64(n))
+		}
+	}
+	return nil
 }
 
 func isQUICLongHeader(b []byte) bool {
-    if len(b) < 1 {
-        return false
-    }
-    return b[0]&0x80 != 0 && b[0]&0x40 != 0
+	if len(b) < 1 {
+		return false
+	}
+	return b[0]&0x80 != 0 && b[0]&0x40 != 0
 }

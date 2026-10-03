@@ -20,9 +20,9 @@ import (
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/proxy/freedom/udptimeout"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/proxy/freedom/udptimeout"
 	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria"
@@ -280,7 +280,7 @@ type udpWorker struct {
 	checker    *task.Periodic
 	activeConn map[connID]*udpConn
 	dcidIndex  map[string]connID
-	srcIndex   map[string]connID  // src.String() -> connID, for CID rotation fallback
+	srcIndex   map[string]connID // src.String() -> connID, for CID rotation fallback
 
 	ctx  context.Context
 	cone bool
@@ -421,17 +421,75 @@ func (w *udpWorker) removeConn(id connID) {
 // that has migrated. Returns the existing conn if migration is detected, nil otherwise.
 //
 // Handles two migration patterns:
-// 1. Source port change with same DCID (Chrome desktop path probing, NAT rebind).
-//    DCID lookup finds existing conn, source is updated.
-// 2. CID rotation with source port change (Android YouTube aggressive CID rotation
-//    via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
-//    finds existing conn. New DCID is added to dcidIndex for future packets.
+//  1. Source port change with same DCID (Chrome desktop path probing, NAT rebind).
+//     DCID lookup finds existing conn, source is updated.
+//  2. CID rotation with source port change (Android YouTube aggressive CID rotation
+//     via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
+//     finds existing conn. New DCID is added to dcidIndex for future packets.
 func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
-	dcid, _, err := quic.ParseDCID(packet)
-	if err != nil {
-		return nil
+	// v26.10.15-link: src-first fast path.
+	//
+	// For steady-state 1-RTT traffic (99% of packets in a long-lived
+	// QUIC connection), the source IP:port is already in srcIndex and
+	// matches the existing conn. We check src FIRST so we can return
+	// nil (no migration) without parsing the DCID or hex-encoding it.
+	//
+	// Only if src is unknown (new connection) OR src is known but the
+	// dest differs (CID rotation) do we parse the DCID.
+	srcKey := id.src.String()
+
+	w.Lock()
+
+	// Fast path: src is already known.
+	if oldID, found := w.srcIndex[srcKey]; found {
+		oldConn, ok := w.activeConn[oldID]
+		if !ok || oldConn.done.Done() {
+			delete(w.srcIndex, srcKey)
+			// Fall through to slow path (will re-lock).
+		} else if oldID == id {
+			// Same src, same dest → same connection, no migration.
+			w.Unlock()
+			return nil
+		} else {
+			// Same src, different dest → CID rotation. Need the DCID.
+			w.Unlock()
+			dcid, _, err := quic.ParseDCID(packet)
+			if err != nil || len(dcid) == 0 {
+				return nil
+			}
+			dcidHex := hex.EncodeToString(dcid)
+			w.Lock()
+			// Re-check srcIndex under lock in case it changed.
+			oldID2, found2 := w.srcIndex[srcKey]
+			if !found2 {
+				w.Unlock()
+				return nil
+			}
+			oldConn2, ok2 := w.activeConn[oldID2]
+			if !ok2 || oldConn2.done.Done() {
+				delete(w.srcIndex, srcKey)
+				w.Unlock()
+				return nil
+			}
+			*oldConn2.src = id.src
+			oldConn2.updateActivity()
+			oldConn2.dcid = dcid
+			delete(w.activeConn, oldID2)
+			w.activeConn[id] = oldConn2
+			w.srcIndex[srcKey] = id
+			w.dcidIndex[dcidHex] = id
+			errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex, " from ", id.src)
+			w.Unlock()
+			return oldConn2
+		}
 	}
-	if len(dcid) == 0 {
+	w.Unlock()
+
+	// Slow path: src is unknown. Parse DCID and check dcidIndex for
+	// migration (source port change with same DCID — Chrome path
+	// probing, NAT rebind).
+	dcid, _, err := quic.ParseDCID(packet)
+	if err != nil || len(dcid) == 0 {
 		return nil
 	}
 	dcidHex := hex.EncodeToString(dcid)
@@ -439,51 +497,25 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 	w.Lock()
 	defer w.Unlock()
 
-	// Case 1: DCID lookup (handles source port change with same DCID)
 	if oldID, found := w.dcidIndex[dcidHex]; found {
 		oldConn, ok := w.activeConn[oldID]
 		if !ok || oldConn.done.Done() {
 			delete(w.dcidIndex, dcidHex)
-		} else if oldID != id {
-			oldSrcKey := oldID.src.String()
-			*oldConn.src = id.src
-			oldConn.updateActivity()
-
-			delete(w.activeConn, oldID)
-			w.activeConn[id] = oldConn
-			w.dcidIndex[dcidHex] = id
-			delete(w.srcIndex, oldSrcKey)
-			w.srcIndex[id.src.String()] = id
-
-			errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex, " from ", oldID.src, " to ", id.src)
-			return oldConn
-		}
-	}
-
-	// Case 2: src IP:port lookup (handles CID rotation with source port change)
-	srcKey := id.src.String()
-	if oldID, found := w.srcIndex[srcKey]; found {
-		oldConn, ok := w.activeConn[oldID]
-		if !ok || oldConn.done.Done() {
-			delete(w.srcIndex, srcKey)
 			return nil
 		}
-
 		if oldID == id {
-			return nil // same conn, normal packet
+			return nil // same conn, normal packet (shouldn't happen
+			// since src was unknown, but defensive)
 		}
-
-		// CID rotation: same source IP:port, new DCID
+		oldSrcKey := oldID.src.String()
 		*oldConn.src = id.src
 		oldConn.updateActivity()
-		oldConn.dcid = dcid
-
 		delete(w.activeConn, oldID)
 		w.activeConn[id] = oldConn
-		w.srcIndex[srcKey] = id
-		w.dcidIndex[dcidHex] = id // Add new DCID for future lookups
-
-		errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex, " from ", id.src)
+		w.dcidIndex[dcidHex] = id
+		delete(w.srcIndex, oldSrcKey)
+		w.srcIndex[id.src.String()] = id
+		errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex, " from ", oldID.src, " to ", id.src)
 		return oldConn
 	}
 
