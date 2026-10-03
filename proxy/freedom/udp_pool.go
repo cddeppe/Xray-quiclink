@@ -15,6 +15,8 @@ import (
 	xraynet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/quic"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/internet"
+	"golang.org/x/sys/unix"
 )
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
@@ -27,6 +29,11 @@ type UDPSocketPool struct {
 	stalenessTimeout time.Duration
 	idleTimeout      time.Duration
 	unusedTimeout    time.Duration
+	// v26.10.17-link: sockopt config for interface binding (SO_BINDTODEVICE)
+	// and fwmark (SO_MARK). Without these, pool sockets bypass the
+	// WireGuard policy routing and QUIC traffic leaks outside the
+	// tunnel. Set via NewUDPSocketPool from the freedom Handler.Init.
+	sockopt *internet.SocketConfig
 }
 
 type pooledSocket struct {
@@ -87,15 +94,46 @@ type pooledConn struct {
 	scidsDCID map[dcidKey]bool
 }
 
-func NewUDPSocketPool(staleness, idle, unused time.Duration) *UDPSocketPool {
+func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
 	p := &UDPSocketPool{
 		sockets:          make(map[string]*pooledSocket),
 		stalenessTimeout: staleness,
 		idleTimeout:      idle,
 		unusedTimeout:    unused,
+		sockopt:          sockopt,
 	}
 	p.startReaper()
 	return p
+}
+
+// listenUDPWithSockopt creates a UDP socket and applies the pool's
+// sockopt config (interface binding, fwmark, UDP_GRO). This is the
+// v26.10.17-link fix for WireGuard: without SO_BINDTODEVICE, pool
+// sockets bypass the WG policy routing and QUIC traffic leaks.
+func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
+	pc, err := stdnet.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	if p.sockopt == nil {
+		return pc, nil
+	}
+	// pc is *net.UDPConn which implements SyscallConn. Get the raw fd
+	// via Control so we can apply SO_BINDTODEVICE, SO_MARK, UDP_GRO.
+	rawConn, err := pc.SyscallConn()
+	if err != nil {
+		return pc, nil
+	}
+	err = rawConn.Control(func(fd uintptr) {
+		optErr := applyPoolSocketOptions(int(fd), p.sockopt)
+		if optErr != nil {
+			xrayerrors.LogWarning(context.Background(), "udp_pool: failed to apply sockopt on pool socket: ", optErr)
+		}
+	})
+	if err != nil {
+		return pc, nil
+	}
+	return pc, nil
 }
 
 func (p *UDPSocketPool) startReaper() {
@@ -158,7 +196,11 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 	p.mu.Unlock()
 
 	if !ok {
-		pc, err := stdnet.ListenUDP("udp", nil)
+		// v26.10.17-link: create the socket with interface binding,
+		// fwmark, and UDP_GRO so QUIC traffic through the pool follows
+		// the WireGuard policy routing instead of leaking via the
+		// default route.
+		pc, err := p.listenUDPWithSockopt()
 		if err != nil {
 			return nil, err
 		}
@@ -445,6 +487,33 @@ func parseQUICSCID(b []byte) ([]byte, bool, error) {
 //
 // v26.10.15-link: without this check, a single transient EAGAIN
 // would kill the socket and all 50+ QUIC sessions sharing it.
+// applyPoolSocketOptions applies interface binding, fwmark, and UDP_GRO
+// to a pool socket's file descriptor. Linux-only; on other platforms
+// the syscall constants don't exist and this function isn't called.
+//
+// v26.10.17-link: critical fix for WireGuard. Without SO_BINDTODEVICE,
+// pool sockets bypass the WG policy routing and QUIC traffic leaks
+// outside the tunnel. Without SO_MARK, packets don't get the fwmark
+// that wg-quick uses for policy routing.
+func applyPoolSocketOptions(fd int, sockopt *internet.SocketConfig) error {
+	if sockopt.Interface != "" {
+		if err := syscall.BindToDevice(fd, sockopt.Interface); err != nil {
+			return xrayerrors.New("failed to set SO_BINDTODEVICE on pool socket: ", err)
+		}
+	}
+	if sockopt.Mark != 0 {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_MARK, int(sockopt.Mark)); err != nil {
+			return xrayerrors.New("failed to set SO_MARK on pool socket: ", err)
+		}
+	}
+	// UDP_GRO: kernel coalesces multiple UDP packets into one recvmsg.
+	// Linux 5.x+; older kernels silently reject this (logged at debug).
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_UDP, unix.UDP_GRO, 1); err != nil {
+		xrayerrors.LogDebug(context.Background(), "udp_pool: UDP_GRO not supported (kernel < 5.x?): ", err)
+	}
+	return nil
+}
+
 func isTransientWriteError(err error) bool {
 	if err == nil {
 		return false
