@@ -67,9 +67,9 @@ func IsValidTLSVersion(major, minor byte) bool {
 
 // Extension IDs we recognise.
 const (
-	extServerName               uint16 = 0x00
-	extALPN                     uint16 = 0x10
-	extEncryptedClientHello     uint16 = 0xfe0d
+	extServerName           uint16 = 0x00
+	extALPN                 uint16 = 0x10
+	extEncryptedClientHello uint16 = 0xfe0d
 )
 
 // ReadClientHello parses a TLS ClientHello message and populates h
@@ -180,7 +180,28 @@ func ReadClientHello(data []byte, h *SniffHeader) error {
 					if b == '.' {
 						return errNotClientHello
 					}
-					h.domain = string(d[:nameLen])
+					// v26.10.15-link: SNI is case-insensitive
+					// per RFC 6066 §3. Lowercase the SNI so
+					// downstream routers don't need to call
+					// strings.ToLower per-rule per-connection.
+					//
+					// We do NOT mutate the caller's buffer
+					// in-place (the TLS path doesn't clone
+					// the buffer, unlike the QUIC path).
+					// Instead we copy to a local buffer,
+					// lowercase it, and convert to string.
+					// The QUIC path also benefits because
+					// it clones once at the start of
+					// SniffQUIC, so the SNI bytes are
+					// already in our private buffer.
+					sniBytes := make([]byte, nameLen)
+					copy(sniBytes, d[:nameLen])
+					for i := range sniBytes {
+						if sniBytes[i] >= 'A' && sniBytes[i] <= 'Z' {
+							sniBytes[i] += 'a' - 'A'
+						}
+					}
+					h.domain = string(sniBytes)
 					foundSNI = true
 				}
 				d = d[nameLen:]
