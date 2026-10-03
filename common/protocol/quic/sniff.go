@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/aes"
 	"encoding/binary"
@@ -78,6 +79,16 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 	cache := buf.New()
 	defer cache.Release()
 
+	// SniffQUIC decrypts the QUIC Initial packet in place (HP removal via XOR
+	// and AEAD Open both write back into the buffer). The dispatcher hands us
+	// a slice into a shared buf.Buffer; mutating it would corrupt the buffer
+	// viewed by other sniffers in the chain (bittorrent UTP, fake-DNS) and
+	// the cached reader that feeds downstream. Clone once up front so the
+	// caller's buffer is never modified. The cost is one allocation per
+	// sniffed datagram, which is negligible compared to the AES-GCM work
+	// already required.
+	b = bytes.Clone(b)
+
 	// Parse QUIC packets
 	for len(b) > 0 {
 		buffer := buf.FromBytes(b)
@@ -147,9 +158,11 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 
 		restPayload := b[hdrLen+int(packetLen):]
 		// cachedReader can concatenate zero-padded UDP datagrams.
-		for len(restPayload) > 0 && restPayload[0] == 0 {
-			restPayload = restPayload[1:]
-		}
+		// Coalesced QUIC packets may be separated by zero-padding bytes
+		// (PADDING frames filling the alignment gap before the next
+		// packet); trim them so the next loop iteration sees the real
+		// first byte of the following packet.
+		restPayload = bytes.TrimLeft(restPayload, "\x00")
 		if !isQUICInitial { // Skip this packet if it's not initial packet
 			b = restPayload
 			continue
@@ -158,8 +171,14 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		salt := s.initialSalt
 		label := s.labelPrefix
 		initialSecret := hkdf.Extract(crypto.SHA256.New, destConnID, salt)
-		secret := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
-		hpKey := hkdfExpandLabel(secret, label+" hp", 16)
+		secret, err := hkdfExpandLabel(initialSecret, "client in", crypto.SHA256.Size())
+		if err != nil {
+			return nil, errNotQUIC
+		}
+		hpKey, err := hkdfExpandLabel(secret, label+" hp", 16)
+		if err != nil {
+			return nil, errNotQUIC
+		}
 		block, err := aes.NewCipher(hpKey)
 		if err != nil {
 			return nil, err
@@ -176,8 +195,14 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 			b[hdrLen+i] ^= mask[i+1]
 		}
 
-		key := hkdfExpandLabel(secret, label+" key", 16)
-		iv := hkdfExpandLabel(secret, label+" iv", 12)
+		key, err := hkdfExpandLabel(secret, label+" key", 16)
+		if err != nil {
+			return nil, errNotQUIC
+		}
+		iv, err := hkdfExpandLabel(secret, label+" iv", 12)
+		if err != nil {
+			return nil, errNotQUIC
+		}
 		cipher := AEADAESGCMTLS13(key, iv)
 
 		nonce := cache.Extend(int32(cipher.NonceSize()))
@@ -289,7 +314,7 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 	return nil, protocol.ErrProtoNeedMoreData
 }
 
-func hkdfExpandLabel(secret []byte, label string, length int) []byte {
+func hkdfExpandLabel(secret []byte, label string, length int) ([]byte, error) {
 	b := make([]byte, 0, 2+1+6+len(label)+1)
 	b = binary.BigEndian.AppendUint16(b, uint16(length))
 	b = append(b, byte(6+len(label)))
@@ -299,10 +324,17 @@ func hkdfExpandLabel(secret []byte, label string, length int) []byte {
 
 	out := make([]byte, length)
 	n, err := hkdf.Expand(crypto.SHA256.New, secret, b).Read(out)
-	if err != nil || n != length {
-		panic("quic: HKDF-Expand-Label invocation failed unexpectedly")
+	if err != nil {
+		// HKDF-Expand can only fail if the reader returns an error, which
+		// for HMAC-SHA256 only happens on truly broken inputs (e.g.
+		// SHA256 not registered). Treat as a soft failure so a single
+		// malformed QUIC packet cannot panic the whole xray process.
+		return nil, errors.New("quic: HKDF-Expand failed: ", err)
 	}
-	return out
+	if n != length {
+		return nil, errors.New("quic: HKDF-Expand-Label produced ", n, " bytes, want ", length)
+	}
+	return out, nil
 }
 
 // readShortQUICVarint wraps quicvarint.Read with a max limit for length related fields.
