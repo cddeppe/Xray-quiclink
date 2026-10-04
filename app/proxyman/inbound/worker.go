@@ -502,6 +502,41 @@ func (w *udpWorker) removeConn(id connID) {
 //     via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
 //     finds existing conn. New DCID is added to dcidIndex for future packets.
 func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
+        // v26.10.36-link: 1-RTT short-header packets are zero-overhead here.
+        // The SNI was already extracted from the Initial; the conn is
+        // already in srcIndex under id.srcKey. We don't need to parse
+        // DCID or acquire w.Lock() for the 99% case in a long-lived
+        // QUIC connection.
+        //
+        // v26.10.10 introduced the same regression here as in SniffQUIC:
+        // every 1-RTT packet paid ParseDCID + dcidKey + w.Lock + map
+        // lookup, all of which miss because the conn is already known
+        // by srcKey (handled by the fast path below). At 1000+ pps this
+        // was 80ns + 1 mutex per packet of pure waste.
+        //
+        // v26.10.35 fixed the sniffer half; v26.10.36 fixes the worker
+        // half. A 1-RTT packet now does: 1 byte test + RLock + 1 map
+        // lookup (srcIndex) + RUnlock + return nil.
+        if len(packet) > 0 && packet[0]&0x80 == 0 {
+                // Short header — existing conn, no migration lookup needed.
+                // The srcIndex fast path below will return nil for this case.
+                // Use RLock instead of Lock since we only read maps.
+                w.RLock()
+                _, found := w.srcIndex[id.srcKey]
+                w.RUnlock()
+                if found {
+                        // Conn is known, no migration. Return nil so the
+                        // caller falls through to getConnection (which will
+                        // also hit the same srcIndex lookup — slight waste
+                        // but keeps the code simple; the fast path is still
+                        // 1 mutex + 1 lookup total).
+                        return nil
+                }
+                // src is unknown — must be a new connection OR a migration
+                // we haven't seen yet. Fall through to the full path with
+                // ParseDCID + dcidIndex lookup.
+        }
+
         // v26.10.16-link: src-first fast path with zero-allocation struct keys.
         //
         // For steady-state 1-RTT traffic (99% of packets in a long-lived
@@ -669,6 +704,13 @@ func (w *udpWorker) recordSrc(id connID, conn *udpConn) {
 // recordDCID associates a QUIC DCID with a connID for future migration lookup.
 // Only records on first sighting of a DCID.
 func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
+        // v26.10.36-link: 1-RTT short-header packets have no DCID length field
+        // (it's implicit — 8 bytes for Chrome/Firefox/Safari). The existing
+        // conn already has its DCID recorded from the Initial. Skip the parse
+        // + map write for 99% of packets in a long-lived QUIC connection.
+        if len(packet) > 0 && packet[0]&0x80 == 0 {
+                return
+        }
         dcid, _, err := quic.ParseDCID(packet)
         if err != nil {
                 return
