@@ -355,24 +355,22 @@ func (s *pooledSocket) readLoop() {
                 s.mu.Unlock()
 
                 if !ok {
-                        // v26.10.27-link: broadcast-on-miss. QUIC clients can
-                        // issue NEW_CONNECTION_ID frames advertising new CIDs
-                        // the server may use as DCID in replies. Android YouTube
-                        // uses aggressive CID rotation. When the server uses a
-                        // new DCID, the demux map has no entry. Instead of
-                        // silently dropping, broadcast to ALL sessions on this
-                        // socket. Each session's QUIC stack will discard
-                        // packets with non-matching DCIDs. ~10-50 sessions per
-                        // socket — acceptable overhead vs silently dropping.
-                        s.mu.RLock()
-                        for _, ch := range s.demux {
-                                select {
-                                case ch <- readResult{data: packet, addr: addr}:
-                                default:
-                                        s.droppedReplies.Add(1)
-                                }
-                        }
-                        s.mu.RUnlock()
+                        // v26.10.29-link: silent drop on demux miss.
+                        //
+                        // v26.10.27 tried broadcast-on-miss (sending to ALL
+                        // sessions on the socket) but this caused cascading
+                        // stalls — flooding wrong sessions' inbox channels
+                        // with non-matching packets, filling the 256-cap
+                        // channels with garbage so the real reply was dropped.
+                        //
+                        // The silent drop is correct: NEW_CONNECTION_ID
+                        // rotation is handled by the inbound worker's
+                        // tryQUICMigration (source IP:port → connection mapping).
+                        // The pool's demux is only for the reply path. If a
+                        // reply arrives with an unknown DCID, it's either a
+                        // NEW_CONNECTION_ID reply (rare) or a stray packet
+                        // from a different connection sharing the CDN edge.
+                        // Dropping is safer than broadcasting.
                         continue
                 }
 
