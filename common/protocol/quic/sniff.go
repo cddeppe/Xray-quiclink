@@ -510,29 +510,31 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 		return nil, common.ErrNoClue
 	}
 
-	// Extract the DCID as a string key without allocating an
-	// intermediate []byte. If we've already sniffed this DCID before,
-	// short-circuit the entire sniffer with the cached result.
+	// v26.10.35-link: short-header (1-RTT) packets are zero-overhead.
+	// The SNI was already extracted from the Initial; the dispatcher
+	// doesn't re-route on 1-RTT packets. Return immediately without
+	// any cache work, matching v26.10.9's behavior.
+	//
+	// v26.10.10 introduced a regression here: every 1-RTT packet paid
+	// a dcidKey string alloc + sniffCache mutex.Lock + map lookup,
+	// even though the result was always "not Initial, try next packet".
+	// At 1000+ pps through the sniffer this cascaded into backpressure
+	// → pipe overflow → QUIC retransmits → YouTube Shorts stalling
+	// and "doesn't feel snappy" swiping.
+	//
+	// v26.10.34's H3 fix used peek() instead of get() for short
+	// headers (preventing cache pollution) but still paid the mutex
+	// and string alloc on every 1-RTT packet. v26.10.35 skips all of
+	// it — the cheap byte test below is the entire hot path for 1-RTT.
+	if b[0]&0x80 == 0 {
+		return nil, errNotQUICInitial
+	}
+
+	// Long-header path: extract DCID, check cache, fall through to body.
 	if key, ok := dcidKey(b); ok {
-		// v26.10.34-link (H3 fix): short-header (1-RTT) packets never contain
-		// a ClientHello, so look them up read-only and never create an entry.
-		// Long-header packets (Initial/Handshake/0-RTT) may populate the cache.
-		// Prevents cache-pollution DoS from adversarial 1-RTT traffic with
-		// random DCIDs.
-		isLongHeader := b[0]&0x80 != 0
-		var state *quicSniffState
-		if isLongHeader {
-			state = globalSniffCache.get(key)
-		} else {
-			state, _ = globalSniffCache.peek(key)
-		}
-		if state != nil {
-			if sni, alpn, hasECH, ok := state.cachedResult(); ok {
-				return &SniffHeader{domain: sni, alpn: alpn, hasECH: hasECH}, nil
-			}
-		}
-		if !isLongHeader {
-			return nil, errNotQUICInitial
+		state := globalSniffCache.get(key)
+		if sni, alpn, hasECH, ok := state.cachedResult(); ok {
+			return &SniffHeader{domain: sni, alpn: alpn, hasECH: hasECH}, nil
 		}
 		return sniffQUICBody(b, state)
 	}
