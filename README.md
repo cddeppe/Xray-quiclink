@@ -337,20 +337,22 @@ See the sanitized example config for a complete working example (uses documentat
    - `poolUnusedTimeout`: 300 (5 min) -- pool socket unused eviction
 6. **UDP enabled on port 443 inbounds:** `network: tcp,udp`
 7. **QUIC allowed in routing:** (Do NOT block `protocol: quic`)
-8. **Policy with long idle timeout and disabled one-directional timeouts:**
+8. **Policy with long idle timeout:**
    ```json
    "policy": {
      "levels": {
        "0": {
          "connIdle": 1800,
-         "uplinkOnly": 0,
-         "downlinkOnly": 0,
+         "uplinkOnly": 1800,
+         "downlinkOnly": 1800,
          "handshake": 4
        }
      }
    }
    ```
-   **CRITICAL:** `uplinkOnly` and `downlinkOnly` MUST be set to `0` (disabled) for QUIC/HTTP3 streaming (YouTube, Hulu, Disney+). These timers kill the connection after N seconds of no traffic in one direction. During video buffering, the client receives data (downlink active) but sends nothing (uplink silent). After 30 seconds of uplink silence, `uplinkOnly` fires and kills the connection — video stalls until you switch to the next video and back (which creates a new connection). Setting both to `0` disables this behavior; `connIdle: 1800` (30 min of complete silence) is the only timeout that should apply.
+   **CRITICAL:** `uplinkOnly` and `downlinkOnly` MUST be set to a large value (e.g., 1800 = 30 min) for QUIC/HTTP3 streaming (YouTube, Hulu, Disney+). These timers kill the connection after N seconds of no traffic in one direction. During video buffering, the client receives data (downlink active) but may send nothing (uplink silent). After the one-directional silence period, the timer fires and kills the connection — video stalls until you switch to the next video and back (which creates a new connection).
+
+   **Do NOT set these to 0.** In xray's `ActivityTimer.SetTimeout`, `timeout == 0` means "finish immediately" (kill the connection), NOT "disable the timer". Setting `uplinkOnly: 0` will kill every connection the moment the uplink phase ends. Use a large value like 1800 (30 min) instead — YouTube always has downlink traffic (video data) and periodic uplink traffic (QUIC ACKs), so 30 minutes is safe.
 
 ### Troubleshooting: YouTube/Hulu/Disney+ video stalls
 
@@ -358,7 +360,7 @@ See the sanitized example config for a complete working example (uses documentat
 
 **Root cause:** The `uplinkOnly` / `downlinkOnly` policy timers kill QUIC connections during one-directional streaming pauses. YouTube buffers video data (downlink active) but the client has nothing to send (uplink silent). After 30 seconds of one-directional silence, the timer fires and kills the connection.
 
-**Fix:** Set `uplinkOnly: 0` and `downlinkOnly: 0` in the policy config (see item 8 above). This is a config-only fix — no binary change needed.
+**Fix:** Set `uplinkOnly` and `downlinkOnly` to a large value (e.g., 1800 = 30 min) in the policy config (see item 8 above). This is a config-only fix — no binary change needed. **Do NOT set these to 0** — in xray's `ActivityTimer`, `0` means "kill immediately", not "disabled".
 
 **Other things to check:**
 - `sessionIdleTimeout: 1800` in `udpConfig` — must be high enough to survive buffering pauses (30 min recommended)
