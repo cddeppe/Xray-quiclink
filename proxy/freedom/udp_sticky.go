@@ -26,14 +26,12 @@ type StickyResolver struct {
         wildcardTTL time.Duration
         PreferIPv4  bool
         PreferIPv6  bool
-        // v26.10.15-link: refresh coalescing. When a refresh is in progress
-        // for a hostname, the channel is closed when the refresh completes.
-        // Concurrent callers wait on the channel instead of firing their own
-        // DNS query.
+        // v26.10.27-link: callback to invalidate pool sockets when
+        // the resolver gets a new IP. Set by the freedom Handler.
+        onIPChanged func(oldIP, newIP string)
         refreshing   map[string]chan struct{}
         refreshingMu sync.Mutex
-        // v26.10.15-link: stop channel for the reaper goroutine.
-        stopCh chan struct{}
+        stopCh       chan struct{}
 }
 
 type stickyEntry struct {
@@ -172,11 +170,20 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
 
         now := time.Now().UnixNano()
         s.mu.Lock()
+        oldIP := ""
+        if oldEntry, ok := s.entries[hostname]; ok {
+                oldIP = oldEntry.ip.String()
+        }
         s.entries[wildcardKey] = &stickyEntry{ip: ip}
         s.entries[wildcardKey].lastUsed.Store(now)
         s.entries[hostname] = &stickyEntry{ip: ip}
         s.entries[hostname].lastUsed.Store(now)
         s.mu.Unlock()
+
+        // v26.10.27-link: notify pool to invalidate old-IP sockets
+        if s.onIPChanged != nil && oldIP != "" && oldIP != ip.String() {
+                s.onIPChanged(oldIP, ip.String())
+        }
 
         errors.LogInfo(ctx, "sticky: background refresh completed for ", hostname, " -> ", ip)
 }
@@ -203,10 +210,20 @@ func (s *StickyResolver) refreshExact(hostname string) {
         }
 
         s.mu.Lock()
+        oldIP := ""
+        if oldEntry, ok := s.entries[hostname]; ok {
+                oldIP = oldEntry.ip.String()
+        }
         entry := &stickyEntry{ip: ip}
         entry.lastUsed.Store(time.Now().UnixNano())
         s.entries[hostname] = entry
         s.mu.Unlock()
+
+        // v26.10.27-link: notify pool to invalidate old-IP sockets
+        if s.onIPChanged != nil && oldIP != "" && oldIP != ip.String() {
+                s.onIPChanged(oldIP, ip.String())
+        }
+
         errors.LogInfo(ctx, "sticky: background refresh completed for ", hostname, " -> ", ip)
 }
 
