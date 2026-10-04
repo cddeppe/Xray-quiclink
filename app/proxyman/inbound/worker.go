@@ -343,17 +343,20 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 return conn, true
         }
 
-        // v26.10.24-link: larger pipe with blocking (no DiscardOverflow).
-        // The old 16KB pipe with DiscardOverflow silently dropped packets
-        // when the outbound consumer fell behind during YouTube burst
-        // downloads. QUIC would retransmit, but the retransmits also got
-        // dropped (pipe still full), causing 5-10 second micro-stalls.
+        // v26.10.25-link: 256KB pipe with DiscardOverflow (not blocking).
         //
-        // 256KB + blocking provides proper backpressure: if the outbound
-        // is slow, the pipe blocks the writer, the kernel's UDP receive
-        // buffer fills, and the kernel applies flow control via ECN. This
-        // is the correct behavior for QUIC.
-        pReader, pWriter := pipe.New(pipe.WithSizeLimit(256 * 1024))
+        // v26.10.24 tried removing DiscardOverflow (blocking writes) but
+        // this was wrong: if the outbound truly stalls (CDN edge rotation),
+        // the blocking pipe freezes the entire inbound worker's callback
+        // loop, preventing ANY new connections from being processed.
+        // That's a worse failure mode than dropping packets.
+        //
+        // The correct fix: keep DiscardOverflow but increase the size from
+        // 16KB to 256KB. 16KB was only ~14 QUIC packets — YouTube burst
+        // downloads overflowed it immediately. 256KB (~213 packets) absorbs
+        // most bursts. When it does overflow, the drop is far enough apart
+        // that QUIC retransmits recover quickly.
+        pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(256*1024))
         srcCopy := id.src
         conn := &udpConn{
                 reader: pReader,
