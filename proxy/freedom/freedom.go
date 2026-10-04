@@ -4,7 +4,9 @@ import (
         "context"
         "crypto/rand"
         "io"
+        stderrors "errors"
         "strings"
+        "syscall"
         "sync/atomic"
         "time"
 
@@ -301,6 +303,32 @@ func isValidAddress(addr *net.IPOrDomain) bool {
         return a != net.AnyIP && a != net.AnyIPv6
 }
 
+// isNetworkUnreachableOnV6 returns true if the error is ENETUNREACH
+// on a connection to an IPv6 destination. This indicates the local
+// IPv6 gateway is reachable (connect succeeded) but can't route to
+// the global IPv6 internet. The connection should be retried with IPv4.
+//
+// v26.10.30-link
+func isNetworkUnreachableOnV6(err error, dest net.Destination) bool {
+        if err == nil {
+                return false
+        }
+        // Check if destination is IPv6
+        if dest.Address.Family().IsDomain() {
+                return false // can't tell from a domain
+        }
+        if dest.Address.Family() != net.AddressFamilyIPv6 {
+                return false
+        }
+        // Check if the error contains ENETUNREACH
+        var errno syscall.Errno
+        if stderrors.As(err, &errno) {
+                return errno == syscall.ENETUNREACH
+        }
+        // Also check the error string for "network is unreachable"
+        return strings.Contains(err.Error(), "network is unreachable")
+}
+
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
         outbounds := session.OutboundsFromContext(ctx)
@@ -417,7 +445,36 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 return nil
         })
         if err != nil {
-                return errors.New("failed to open connection to ", destination).Base(err)
+                // v26.10.30-link: if the first write on a fresh connection
+                // fails with ENETUNREACH (broken IPv6 — connect succeeds but
+                // the gateway can't route), detect it and retry with IPv4.
+                if isNetworkUnreachableOnV6(err, destination) {
+                        errors.LogWarning(ctx, "freedom: connection to ", destination, " failed with network unreachable on IPv6, falling back to IPv4")
+                        // Resolve the domain to IPv4 only and retry
+                        v4Dest := destination
+                        if destination.Address.Family().IsDomain() {
+                                if ips, e := internet.LookupForIP(destination.Address.Domain(), internet.DomainStrategy_USE_IP4, outGateway); e == nil && len(ips) > 0 {
+                                        v4Dest.Address = net.IPAddress(ips[0])
+                                }
+                        } else if ip := destination.Address.IP(); ip != nil {
+                                if ip4 := ip.To4(); ip4 != nil {
+                                        v4Dest.Address = net.IPAddress(ip4)
+                                }
+                        }
+                        if v4Dest.Address != destination.Address {
+                                err = retry.ExponentialBackoff(5, 100).On(func() error {
+                                        rawConn, derr := dialer.Dial(ctx, v4Dest)
+                                        if derr != nil {
+                                                return derr
+                                        }
+                                        conn = rawConn
+                                        return nil
+                                })
+                        }
+                }
+                if err != nil {
+                        return errors.New("failed to open connection to ", destination).Base(err)
+                }
         }
         if blockedDest != nil {
                 return h.blackhole(ctx, input, output, blockedRule, blockedDest)
