@@ -308,24 +308,22 @@ func (s *pooledSocket) readLoop() {
                         continue
                 }
 
-                // v26.10.20-link: blocking send instead of drop.
-                // The old select{}-with-default silently dropped packets
-                // when the inbox channel (was cap 32, now 256) was full.
-                // This caused QUIC retransmit storms that stalled YouTube —
-                // the connection would freeze until you switched to the
-                // next video and back (which drained the channel).
+                // v26.10.21-link: non-blocking send with large channel (256).
                 //
-                // Blocking provides proper backpressure: if the consumer
-                // is slow, readLoop slows down, the kernel's UDP receive
-                // buffer fills, and the kernel applies flow control via
-                // ECN marking. This is the correct behavior for QUIC.
+                // The blocking send (v26.10.20) was WRONG for the shared-socket
+                // model: one slow/stale session's full channel would block the
+                // entire readLoop, starving ALL other sessions sharing the same
+                // socket. This made YouTube stalls WORSE when swiping quickly
+                // between videos (many sessions, one stale session blocks all).
                 //
-                // We check s.closed so we don't block forever on a
-                // dead socket whose sessions have all closed.
+                // The correct approach for a shared readLoop:
+                // 1. Large channel (256) so drops are rare during bursts
+                // 2. Non-blocking send so one slow session doesn't starve others
+                // 3. Track drops for observability
                 select {
                 case ch <- readResult{data: packet, addr: addr}:
-                case <-s.closed:
-                        return
+                default:
+                        s.droppedReplies.Add(1)
                 }
         }
 }
