@@ -28,7 +28,7 @@ type StickyResolver struct {
         PreferIPv6  bool
         // v26.10.27-link: callback to invalidate pool sockets when
         // the resolver gets a new IP. Set by the freedom Handler.
-        onIPChanged func(oldIP, newIP string)
+        onIPChanged  func(oldIP, newIP string)
         refreshing   map[string]chan struct{}
         refreshingMu sync.Mutex
         stopCh       chan struct{}
@@ -57,6 +57,18 @@ func NewStickyResolver(ttl time.Duration) *StickyResolver {
         }
         go s.reaper()
         return s
+}
+
+// Close stops the reaper goroutine. Safe to call multiple times.
+// v26.10.34-link (M4 fix): without this, every SIGHUP reload leaks one
+// reaper goroutine + one time.Ticker per freedom outbound.
+func (s *StickyResolver) Close() {
+        select {
+        case <-s.stopCh:
+                // already closed
+        default:
+                close(s.stopCh)
+        }
 }
 
 // reaper periodically evicts entries that haven't been used in a while.
@@ -155,7 +167,11 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
         }
         defer s.finishRefresh(hostname)
 
-        ctx := context.Background()
+        // v26.10.34-link (M3 fix): bound DNS refresh so a hung resolver
+        // doesn't stall all subsequent resolves for this hostname
+        // (startRefresh blocks on <-ch for follow-up callers).
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
         addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
         if err != nil || len(addrs) == 0 {
                 errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname, ": ", err)
@@ -216,7 +232,10 @@ func (s *StickyResolver) refreshExact(hostname string) {
         }
         defer s.finishRefresh(hostname)
 
-        ctx := context.Background()
+        // v26.10.34-link (M3 fix): bound DNS refresh so a hung resolver
+        // doesn't stall all subsequent resolves for this hostname.
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
         addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
         if err != nil || len(addrs) == 0 {
                 errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname)
@@ -237,6 +256,17 @@ func (s *StickyResolver) refreshExact(hostname string) {
         entry := &stickyEntry{ip: ip}
         entry.lastUsed.Store(time.Now().UnixNano())
         s.entries[hostname] = entry
+        // v26.10.34-link (M2 fix): invalidate sibling exact entries pointing
+        // at the old IP so they re-resolve on next use. Mirrors the S1 fix in
+        // refreshWildcard — without this, sibling subdomains keep using a
+        // dead IP for up to ttl (default 300s) after the resolver knows better.
+        if oldIP != "" && oldIP != ip.String() {
+                for host, entry := range s.entries {
+                        if host != hostname && !strings.HasPrefix(host, "*.") && entry.ip.String() == oldIP {
+                                delete(s.entries, host)
+                        }
+                }
+        }
         s.mu.Unlock()
 
         // v26.10.27-link: notify pool to invalidate old-IP sockets

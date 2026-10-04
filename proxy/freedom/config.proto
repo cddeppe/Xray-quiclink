@@ -64,6 +64,10 @@ message UDPConfig {
   uint32 pool_staleness_timeout = 6;
   uint32 pool_idle_timeout = 7;
   uint32 pool_unused_timeout = 8;
+  // v26.10.34-link (C4 fix): proto binding for stickyResolverTtl JSON field.
+  // Without this, the next protoc regeneration silently drops the field
+  // and users cannot configure the TTL the code reads.
+  uint32 sticky_resolver_ttl = 9;
 }
 
 message Config {
