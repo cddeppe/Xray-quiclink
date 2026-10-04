@@ -2,6 +2,7 @@ package inbound
 
 import (
         "context"
+        "encoding/hex"
         "sync"
 
         "github.com/xtls/xray-core/common/protocol/quic"
@@ -380,9 +381,15 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 // outbound hub.WriteTo call is performed outside the lock so
                 // a slow network write does not block the inbound worker's
                 // packet-processing loop.
-                w.Lock()
+                //
+                // v26.10.34-link (M10 fix): use RLock instead of Lock. The
+                // closure only READS *conn.src; the writer (*oldConn.src =
+                // id.src in tryQUICMigration) already uses w.Lock(). RLock
+                // allows multiple outbound packets to snapshot concurrently
+                // instead of serializing against every inbound packet.
+                w.RLock()
                 srcCopy := *conn.src
-                w.Unlock()
+                w.RUnlock()
                 return w.hub.WriteTo(b, srcCopy)
         }
         w.activeConn[id] = conn
@@ -568,14 +575,34 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         w.activeConn[id] = oldConn2
                                         w.srcIndex[sk] = id
                                         w.dcidIndex[dk] = id
-                                        errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcid, " from ", id.src)
+                                        // v26.10.34-link (M11 fix): defer log to
+                                        // after w.Unlock() — errors.LogInfo does
+                                        // formatted I/O and can block on a slow
+                                        // logger sink, blocking ALL inbound packet
+                                        // processing for this worker while held.
+                                        dcidHex := hex.EncodeToString(dcid)
+                                        oldSrc := oldID2.src
+                                        newSrc := id.src
                                         w.Unlock()
+                                        errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex, " from ", oldSrc, " to ", newSrc)
+                                        // v26.10.34-link (C2 fix): the original code
+                                        // had a w.Unlock() at the fall-through case
+                                        // AND a w.Unlock() at the end of the outer
+                                        // block. When the fall-through ran, it
+                                        // double-unlocked and panicked. We return
+                                        // here on the rotation path; the
+                                        // fall-through below does NOT unlock — the
+                                        // single w.Unlock() at the end of the
+                                        // outer block releases it.
                                         return oldConn2
                                 }
                         }
                         // Not a CID rotation — different QUIC connection.
                         // Fall through to slow path (dcidIndex lookup).
-                        w.Unlock()
+                        // v26.10.34-link (C2 fix): do NOT unlock here. The
+                        // single w.Unlock() at the end of the outer block (after
+                        // this if/else) releases the lock acquired at L544.
+                        // Unlocking here would double-unlock and panic.
                 }
         }
         w.Unlock()
@@ -590,15 +617,16 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
         dk := makeDCIDKey(dcid)
 
         w.Lock()
-        defer w.Unlock()
 
         if oldID, found := w.dcidIndex[dk]; found {
                 oldConn, ok := w.activeConn[oldID]
                 if !ok || oldConn.done.Done() {
                         delete(w.dcidIndex, dk)
+                        w.Unlock()
                         return nil
                 }
                 if oldID == id {
+                        w.Unlock()
                         return nil // same conn, normal packet (shouldn't happen
                         // since src was unknown, but defensive)
                 }
@@ -610,10 +638,22 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                 w.dcidIndex[dk] = id
                 delete(w.srcIndex, oldSK)
                 w.srcIndex[id.srcKey] = id
-                errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcid, " from ", oldID.src, " to ", id.src)
+                // v26.10.34-link (M11+L11 fix): defer log to after w.Unlock()
+                // (formatted I/O under lock blocks inbound processing), and
+                // print DCID as hex (was raw []byte which xray formats as
+                // decimal "[1 2 3 ...]"). Use hex.EncodeToString for readability.
+                // Note: removed `defer w.Unlock()` from this function — the
+                // explicit unlocks on each return path replace it. Mixing the
+                // two would double-unlock.
+                dcidHex := hex.EncodeToString(dcid)
+                oldSrc := oldID.src
+                newSrc := id.src
+                w.Unlock()
+                errors.LogInfo(context.Background(), "QUIC migration detected: DCID ", dcidHex, " from ", oldSrc, " to ", newSrc)
                 return oldConn
         }
 
+        w.Unlock()
         return nil
 }
 
