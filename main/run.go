@@ -108,8 +108,13 @@ func executeRun(cmd *base.Command, args []string) {
         // On SIGHUP, re-read the config file and atomically swap the
         // routing rules without killing existing TCP/UDP connections.
         // On SIGINT/SIGTERM, exit as before.
+        //
+        // v26.10.34-link (M13 fix): buffer size 4 (was 1) so SIGTERM/SIGINT
+        // sent during a SIGHUP reload are not silently dropped. Without this,
+        // the channel is full with the in-flight SIGHUP; the operator must
+        // re-send the termination signal after the reload completes.
         {
-                osSignals := make(chan os.Signal, 1)
+                osSignals := make(chan os.Signal, 4)
                 signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
                 for {
                         sig := <-osSignals
@@ -182,21 +187,48 @@ func readConfDir(dirPath string) {
         }
 }
 
+// v26.10.34-link (H4 fix): readConfDirInto appends matching config files from
+// dirPath into dst. It does NOT mutate the global configFiles, so it is safe
+// to call repeatedly from the SIGHUP reload path. The original readConfDir
+// above is kept for the startup path.
+func readConfDirInto(dirPath string, dst cmdarg.Arg) cmdarg.Arg {
+        confs, err := os.ReadDir(dirPath)
+        if err != nil {
+                return dst
+        }
+        for _, f := range confs {
+                matched, err := regexp.MatchString(getRegepxByFormat(), f.Name())
+                if err != nil {
+                        continue
+                }
+                if matched {
+                        dst = append(dst, path.Join(dirPath, f.Name()))
+                }
+        }
+        return dst
+}
+
 func getConfigFilePath(verbose bool) cmdarg.Arg {
+        // v26.10.34-link (H4 fix): snapshot flag-provided files so a reload
+        // doesn't keep appending directory entries to the global on every
+        // invocation. Without this, after N reloads with D files, configFiles
+        // has D*(N+1) entries and core.LoadConfig reads/parses each duplicate.
+        files := make(cmdarg.Arg, len(configFiles))
+        copy(files, configFiles)
+
         if dirExists(configDir) {
                 if verbose {
                         log.Println("Using confdir from arg:", configDir)
                 }
-                readConfDir(configDir)
+                files = readConfDirInto(configDir, files)
         } else if envConfDir := platform.GetConfDirPath(); dirExists(envConfDir) {
                 if verbose {
                         log.Println("Using confdir from env:", envConfDir)
                 }
-                readConfDir(envConfDir)
+                files = readConfDirInto(envConfDir, files)
         }
-
-        if len(configFiles) > 0 {
-                return configFiles
+        if len(files) > 0 {
+                return files
         }
 
         if workingDir, err := os.Getwd(); err == nil {
@@ -262,6 +294,18 @@ func startXray() (core.Server, error) {
 func reloadConfig(server core.Server) error {
         files := getConfigFilePath(false)
 
+        // v26.10.34-link (L9 fix): refuse "stdin:" explicitly. On a daemonized
+        // process (systemd with StandardInput=null), io.ReadAll(os.Stdin)
+        // returns EOF and LoadConfig fails to parse an empty stream. Worse,
+        // if stdin is still attached to a tty/pipe, the reload blocks forever
+        // reading stdin, freezing the signal loop. Either way, SIGHUP reload
+        // from stdin is never useful — fail fast with a clear error.
+        for _, f := range files {
+                if f == "stdin:" {
+                        return errors.New("cannot reload from stdin: SIGHUP reload requires a config file or confdir")
+                }
+        }
+
         c, err := core.LoadConfig(getConfigFormat(), files)
         if err != nil {
                 return errors.New("failed to reload config files: [", files.String(), "]").Base(err)
@@ -284,7 +328,18 @@ func reloadConfig(server core.Server) error {
                         if feature == nil {
                                 return errors.New("router feature not found")
                         }
-                        if r, ok := feature.(interface{ ReloadRules(*router.Config, bool) error }); ok {
+                        if r, ok := feature.(interface {
+                                ReloadRules(*router.Config, bool) error
+                        }); ok {
+                                // v26.10.34-link (L10 fix): ReloadRules(rc, false)
+                                // REPLACES the entire ruleset from the config file.
+                                // Any rules added via the gRPC API since startup
+                                // are silently discarded. Warn the operator.
+                                if existingR, ok := feature.(interface{ RuleCount() int }); ok {
+                                        if existingR.RuleCount() > len(rc.Rule) {
+                                                errors.LogWarning(context.Background(), "SIGHUP reload will replace ", existingR.RuleCount(), " active rules with ", len(rc.Rule), " rules from config. Any API-added rules will be discarded.")
+                                        }
+                                }
                                 if err := r.ReloadRules(rc, false); err != nil {
                                         return errors.New("failed to reload routing rules").Base(err)
                                 }
