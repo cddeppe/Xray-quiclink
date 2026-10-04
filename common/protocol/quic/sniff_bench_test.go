@@ -94,3 +94,38 @@ func BenchmarkSniffQUICRetransmitSkip(b *testing.B) {
 		_, _ = quic.SniffQUIC(pkt)
 	}
 }
+
+
+// BenchmarkSniffQUIC1RTT measures the cost of SniffQUIC on a 1-RTT
+// short-header packet. This is the hot path: 99% of packets in a
+// long-lived QUIC connection are 1-RTT. Before v26.10.35, every 1-RTT
+// packet paid a dcidKey string alloc + sniffCache mutex.Lock + map
+// lookup + bytes.Clone, even though the result was always "not Initial".
+//
+// v26.10.35 fixed the sniffer half: short-header packets return
+// immediately with one byte test, zero allocs, zero mutex.
+// v26.10.36 fixed the worker half: tryQUICMigration and recordDCID
+// also short-circuit on short-header packets.
+//
+// A real 1-RTT short-header packet:
+//   - First byte: 0x40-0x7F (fixed bit = 1, short header)
+//   - 8-byte DCID (the default for Chrome/Firefox/Safari)
+//   - Encrypted packet number + frames
+//
+// We construct a minimal valid short header (9 bytes: 1 type + 8 DCID).
+// The sniffer should reject it without any allocation or mutex acquire.
+func BenchmarkSniffQUIC1RTT(b *testing.B) {
+	// 1-RTT short header: bit 7 = 0, bit 6 = 1 (fixed bit), then 8-byte DCID.
+	// The rest of the packet is encrypted — the sniffer only reads the
+	// first byte to classify it as a short header, so 9 bytes is enough.
+	pkt := []byte{
+		0x40, // short header (bit 7=0, bit 6=1)
+		0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, // 8-byte DCID
+		0x00, 0x01, 0x02, 0x03, // dummy payload bytes
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = quic.SniffQUIC(pkt)
+	}
+}

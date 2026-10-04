@@ -69,6 +69,13 @@ var (
 	errNotQUICInitial = errors.New("not initial packet")
 )
 
+// v26.10.36-link: ErrNotQUICInitial is exported so the dispatcher can
+// detect "this is a QUIC packet but not an Initial" and short-circuit
+// the sniffer loop. Without this, every 1-RTT packet through the
+// dispatcher's sniffer would also try SniffUTP (which always fails on
+// QUIC packets but costs CPU parsing).
+var ErrNotQUICInitial = errNotQUICInitial
+
 // quicVersionSpec describes a QUIC version's Initial packet parameters.
 //
 // v26.10.11-link precomputes the HKDF-Expand-Label strings (labelHP,

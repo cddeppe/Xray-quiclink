@@ -72,6 +72,17 @@ func (s *Sniffer) Sniff(c context.Context, payload []byte, network net.Network) 
 			return nil, err
 		}
 
+		// v26.10.36-link: if QUIC says "this is QUIC but not Initial",
+		// stop the sniffer loop. There's no point trying UTP or
+			// fake-DNS — they will all fail. Without this short-circuit,
+			// every 1-RTT packet would pay the cost of trying every other
+			// sniffer, all of which return errors. The previous behavior
+			// was to fall through to errUnknownContent, which the
+			// dispatcher handles the same way — but it wasted CPU.
+		if err == quic.ErrNotQUICInitial {
+			return nil, errUnknownContent
+		}
+
 		if err == nil && result != nil {
 			return result, nil
 		}
