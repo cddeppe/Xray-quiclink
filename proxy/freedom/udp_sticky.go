@@ -174,15 +174,35 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
         if oldEntry, ok := s.entries[hostname]; ok {
                 oldIP = oldEntry.ip.String()
         }
+        // S1 fix: also capture old wildcard IP for sibling invalidation.
+        oldWildcardIP := ""
+        if oldWcEntry, ok := s.entries[wildcardKey]; ok {
+                oldWildcardIP = oldWcEntry.ip.String()
+        }
         s.entries[wildcardKey] = &stickyEntry{ip: ip}
         s.entries[wildcardKey].lastUsed.Store(now)
         s.entries[hostname] = &stickyEntry{ip: ip}
         s.entries[hostname].lastUsed.Store(now)
+        // S1 fix: invalidate sibling exact entries pointing at old wildcard IP.
+        // When YouTube rotates CDN edge, sibling subdomains (r1, r2, r3...)
+        // still have the old dead IP. Delete them so they re-resolve on next use.
+        if oldWildcardIP != "" && oldWildcardIP != ip.String() {
+                for host, entry := range s.entries {
+                        if !strings.HasPrefix(host, "*.") && entry.ip.String() == oldWildcardIP {
+                                delete(s.entries, host)
+                        }
+                }
+        }
         s.mu.Unlock()
 
         // v26.10.27-link: notify pool to invalidate old-IP sockets
-        if s.onIPChanged != nil && oldIP != "" && oldIP != ip.String() {
-                s.onIPChanged(oldIP, ip.String())
+        // Use oldWildcardIP if available (broader invalidation), else oldIP
+        notifyIP := oldWildcardIP
+        if notifyIP == "" {
+                notifyIP = oldIP
+        }
+        if s.onIPChanged != nil && notifyIP != "" && notifyIP != ip.String() {
+                s.onIPChanged(notifyIP, ip.String())
         }
 
         errors.LogInfo(ctx, "sticky: background refresh completed for ", hostname, " -> ", ip)

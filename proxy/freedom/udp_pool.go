@@ -493,9 +493,18 @@ func (c *pooledConn) RegisterCID(cid []byte) {
         c.mu.Unlock()
 
         if !already {
+                // H4 fix: re-check closed under lock before mutating demux.
+                // Between the first closed check and here, another goroutine
+                // could call Close() which clears scidsDCID from demux.
+                c.mu.Lock()
+                if c.closed.Load() {
+                        c.mu.Unlock()
+                        return
+                }
                 c.socket.mu.Lock()
                 c.socket.demux[dk] = c.inbox
                 c.socket.mu.Unlock()
+                c.mu.Unlock()
         }
 }
 
@@ -637,12 +646,13 @@ func applyPoolSocketOptions(fd int, sockopt *internet.SocketConfig) error {
                 if custom.System != "" && custom.System != "linux" {
                         continue
                 }
-                if !strings.HasPrefix("udp", custom.Network) {
+                // H1 fix: was strings.HasPrefix("udp", custom.Network) — backwards.
+                if custom.Network != "" && !strings.Contains(custom.Network, "udp") {
                         continue
                 }
                 level, _ := strconv.Atoi(custom.Level)
                 if level == 0 {
-                        level = 0x6 // default TCP level
+                        level = syscall.SOL_SOCKET // L7 fix: was 0x6 (IPPROTO_TCP), wrong for UDP
                 }
                 opt, _ := strconv.Atoi(custom.Opt)
                 if opt == 0 {
