@@ -238,7 +238,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 p.mu.Unlock()
         }
 
-        inbox := make(chan readResult, 32)
+        inbox := make(chan readResult, 256) // v26.10.20-link: was 32, increased to 256 to absorb YouTube reply bursts
         conn := &pooledConn{
                 socket:    sock,
                 inbox:     inbox,
@@ -308,13 +308,24 @@ func (s *pooledSocket) readLoop() {
                         continue
                 }
 
+                // v26.10.20-link: blocking send instead of drop.
+                // The old select{}-with-default silently dropped packets
+                // when the inbox channel (was cap 32, now 256) was full.
+                // This caused QUIC retransmit storms that stalled YouTube —
+                // the connection would freeze until you switched to the
+                // next video and back (which drained the channel).
+                //
+                // Blocking provides proper backpressure: if the consumer
+                // is slow, readLoop slows down, the kernel's UDP receive
+                // buffer fills, and the kernel applies flow control via
+                // ECN marking. This is the correct behavior for QUIC.
+                //
+                // We check s.closed so we don't block forever on a
+                // dead socket whose sessions have all closed.
                 select {
                 case ch <- readResult{data: packet, addr: addr}:
-                default:
-                        // v26.10.15-link: track dropped replies for observability.
-                        // QUIC retransmits will recover, but persistent drops
-                        // indicate the consumer is slow.
-                        s.droppedReplies.Add(1)
+                case <-s.closed:
+                        return
                 }
         }
 }
