@@ -224,12 +224,19 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 }
                 if config.UdpConfig.EnableStickyResolver {
                         // v26.10.23-link: configurable sticky resolver TTL.
-                        // Default 300s (5 min). Lower values detect CDN edge
-                        // rotation faster but do more DNS queries.
                         stickyTtl := secondsOrDefault(config.UdpConfig.GetStickyResolverTtl(), 300)
                         h.stickyResolver = NewStickyResolver(time.Duration(stickyTtl) * time.Second)
                         h.stickyResolver.PreferIPv4 = config.UdpConfig.PreferIpv4
                         h.stickyResolver.PreferIPv6 = config.UdpConfig.PreferIpv6
+                        // v26.10.27-link: when resolver gets a new IP, invalidate
+                        // pool sockets to the old IP so new connections use the
+                        // fresh IP immediately (closes the TTL/staleness gap).
+                        if h.socketPool != nil {
+                                pool := h.socketPool
+                                h.stickyResolver.onIPChanged = func(oldIP, _ string) {
+                                        pool.InvalidateByIP(oldIP)
+                                }
+                        }
                         errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (TTL=", stickyTtl, "s PreferIPv4:", config.UdpConfig.PreferIpv4, "PreferIPv6:", config.UdpConfig.PreferIpv6, ")")
                 }
         }
