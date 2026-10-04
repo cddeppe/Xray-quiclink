@@ -195,11 +195,15 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         sock.MarkDead()
                         delete(p.sockets, key)
                         ok = false
+                } else {
+                        // v26.10.26-link: only increment refCount if the socket
+                        // is alive. Previously this ran even after MarkDead+delete,
+                        // orphaning the dead socket with refCount > 0.
+                        sock.mu.Lock()
+                        sock.refCount++
+                        sock.lastUsed = time.Now()
+                        sock.mu.Unlock()
                 }
-                sock.mu.Lock()
-                sock.refCount++
-                sock.lastUsed = time.Now()
-                sock.mu.Unlock()
         }
         p.mu.Unlock()
 
@@ -214,11 +218,12 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 }
 
                 sock = &pooledSocket{
-                        conn:     pc,
-                        dest:     dest,
-                        demux:    make(map[dcidKey]chan<- readResult),
-                        closed:   make(chan struct{}),
-                        lastUsed: time.Now(),
+                        conn:          pc,
+                        dest:          dest,
+                        demux:         make(map[dcidKey]chan<- readResult),
+                        closed:        make(chan struct{}),
+                        lastUsed:      time.Now(),
+                        lastReplyTime: time.Now(), // v26.10.26-link: init to now, not zero — prevents stale check from killing brand-new sockets
                 }
 
                 p.mu.Lock()
@@ -268,6 +273,16 @@ func (s *pooledSocket) readLoop() {
                 if err != nil {
                         if s.IsClosed() {
                                 return
+                        }
+                        // v26.10.26-link: don't kill the shared socket on
+                        // transient read errors (ICMP port-unreachable from CDN
+                        // edge rotation, EAGAIN, ENOBUFS, etc). The write path
+                        // already has isTransientWriteError; the read path didn't.
+                        // A single ICMP unreachable would kill all 50+ sessions
+                        // sharing this socket.
+                        if isTransientReadError(err) {
+                                xrayerrors.LogInfo(context.Background(), "udp_pool: transient read error, continuing: ", err)
+                                continue
                         }
                         xrayerrors.LogInfo(context.Background(), "udp_pool: read error, marking socket dead: ", err)
                         s.MarkDead()
@@ -540,6 +555,26 @@ func isTransientWriteError(err error) bool {
                 return false
         }
         // Use errors.As to unwrap net.OpError and similar wrappers
+        var errno syscall.Errno
+        if errors.As(err, &errno) {
+                switch errno {
+                case syscall.EAGAIN,
+                        syscall.ENOMEM, syscall.ENOBUFS,
+                        syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+                        syscall.ECONNREFUSED:
+                        return true
+                }
+        }
+        return false
+}
+
+// isTransientReadError mirrors isTransientWriteError for the read path.
+// v26.10.26-link: without this, a single ICMP port-unreachable from CDN
+// edge rotation would MarkDead the shared socket and kill all 50+ sessions.
+func isTransientReadError(err error) bool {
+        if err == nil {
+                return false
+        }
         var errno syscall.Errno
         if errors.As(err, &errno) {
                 switch errno {
