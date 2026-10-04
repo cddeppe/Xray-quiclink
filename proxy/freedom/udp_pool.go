@@ -5,6 +5,8 @@ import (
         "errors"
         "io"
         stdnet "net"
+        "strconv"
+        "strings"
         "sync"
         "sync/atomic"
         "syscall"
@@ -171,6 +173,28 @@ func (p *UDPSocketPool) evictStale() {
         }
 }
 
+// InvalidateByIP marks all pool sockets to the given IP as stale.
+// Called by the sticky resolver when it refreshes DNS and gets a new
+// IP — the old IP's pool sockets should be evicted so new connections
+// use the fresh IP.
+//
+// v26.10.27-link: closes the gap between sticky resolver TTL (60s)
+// and pool staleness (300s). Previously, when the resolver got a new
+// IP, existing pool sockets to the old IP stayed alive for up to 5
+// minutes, sending QUIC retransmits into a black hole.
+func (p *UDPSocketPool) InvalidateByIP(ip string) {
+        p.mu.Lock()
+        for key, sock := range p.sockets {
+                // key is dest.String() = "ip:port" — check if it starts with the IP
+                if strings.HasPrefix(key, ip+":") || strings.HasPrefix(key, "["+ip+"]:") {
+                        sock.MarkStale()
+                        delete(p.sockets, key)
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: invalidated socket for ", key, " (IP changed)")
+                }
+        }
+        p.mu.Unlock()
+}
+
 func destKey(dest *stdnet.UDPAddr) string {
         return dest.String()
 }
@@ -192,7 +216,9 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 isStale := time.Since(sock.lastReplyTime) > p.stalenessTimeout
                 sock.mu.Unlock()
                 if isStale {
-                        sock.MarkDead()
+                        // v26.10.27-link: use MarkStale (not MarkDead) so
+                        // existing sessions keep their socket alive.
+                        sock.MarkStale()
                         delete(p.sockets, key)
                         ok = false
                 } else {
@@ -320,6 +346,24 @@ func (s *pooledSocket) readLoop() {
                 s.mu.Unlock()
 
                 if !ok {
+                        // v26.10.27-link: broadcast-on-miss. QUIC clients can
+                        // issue NEW_CONNECTION_ID frames advertising new CIDs
+                        // the server may use as DCID in replies. Android YouTube
+                        // uses aggressive CID rotation. When the server uses a
+                        // new DCID, the demux map has no entry. Instead of
+                        // silently dropping, broadcast to ALL sessions on this
+                        // socket. Each session's QUIC stack will discard
+                        // packets with non-matching DCIDs. ~10-50 sessions per
+                        // socket — acceptable overhead vs silently dropping.
+                        s.mu.RLock()
+                        for _, ch := range s.demux {
+                                select {
+                                case ch <- readResult{data: packet, addr: addr}:
+                                default:
+                                        s.droppedReplies.Add(1)
+                                }
+                        }
+                        s.mu.RUnlock()
                         continue
                 }
 
@@ -358,7 +402,8 @@ func (s *pooledSocket) IsDead() bool {
         return s.dead
 }
 
-// MarkDead marks the socket as dead and closes it.
+// MarkDead marks the socket as dead and closes it immediately.
+// Used for persistent errors (EBADF, read failure on closed socket).
 func (s *pooledSocket) MarkDead() {
         s.mu.Lock()
         defer s.mu.Unlock()
@@ -372,12 +417,48 @@ func (s *pooledSocket) MarkDead() {
         })
 }
 
+// MarkStale marks the socket as dead but does NOT close s.conn if
+// there are active sessions (refCount > 0). Used by the staleness
+// check in Acquire — new sessions get a fresh socket, but existing
+// sessions keep their connection alive.
+//
+// v26.10.27-link: previously, staleness called MarkDead which closed
+// s.conn, killing ALL existing sessions sharing the socket. A new
+// Shorts swipe would kill the currently-playing video's QUIC connection.
+func (s *pooledSocket) MarkStale() {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        if s.dead {
+                return
+        }
+        s.dead = true
+        if s.refCount == 0 {
+                // No active sessions — safe to close now.
+                s.closeOnce.Do(func() {
+                        close(s.closed)
+                        _ = s.conn.Close()
+                })
+        }
+        // If refCount > 0, existing sessions keep the socket alive.
+        // The readLoop will exit when s.closed is closed (which happens
+        // when the last session calls release() and refCount hits 0,
+        // or when the reaper evicts it).
+}
+
 func (s *pooledSocket) release() {
         s.mu.Lock()
         if s.refCount > 0 {
                 s.refCount--
         }
         s.lastUsed = time.Now()
+        // v26.10.27-link: if the socket was marked stale (MarkStale) and
+        // this is the last session releasing, close the socket now.
+        if s.refCount == 0 && s.dead {
+                s.closeOnce.Do(func() {
+                        close(s.closed)
+                        _ = s.conn.Close()
+                })
+        }
         s.mu.Unlock()
 }
 
@@ -528,6 +609,7 @@ func parseQUICSCID(b []byte) ([]byte, bool, error) {
 // outside the tunnel. Without SO_MARK, packets don't get the fwmark
 // that wg-quick uses for policy routing.
 func applyPoolSocketOptions(fd int, sockopt *internet.SocketConfig) error {
+        // v26.10.17-link: SO_BINDTODEVICE + SO_MARK for WireGuard.
         if sockopt.Interface != "" {
                 if err := syscall.BindToDevice(fd, sockopt.Interface); err != nil {
                         return xrayerrors.New("failed to set SO_BINDTODEVICE on pool socket: ", err)
@@ -538,15 +620,32 @@ func applyPoolSocketOptions(fd int, sockopt *internet.SocketConfig) error {
                         return xrayerrors.New("failed to set SO_MARK on pool socket: ", err)
                 }
         }
-        // NOTE: UDP_GRO was removed in v26.10.18-link. It caused YouTube to
-        // stall because GRO coalesces multiple UDP packets into a single
-        // ReadFrom call, but the pool's DCID demux assumes one packet per
-        // read. With GRO enabled, ParseDCID only parsed the first packet in
-        // the coalesced blob and the rest were silently dropped.
-        //
-        // To re-enable GRO safely, the readLoop would need to use recvmmsg
-        // with GRO_RETURN_UNKNOWN and handle the per-packet metadata. That's
-        // a bigger change — deferred.
+        // v26.10.27-link: honor customSockopt (SO_RCVBUF, SO_SNDBUF, etc).
+        // Previously the pool path skipped these — only the non-pool TCP/UDP
+        // path applied them. Users who set customSockopt for buffer sizes
+        // were silently ignored on pool sockets.
+        for _, custom := range sockopt.CustomSockopt {
+                if custom.System != "" && custom.System != "linux" {
+                        continue
+                }
+                if !strings.HasPrefix("udp", custom.Network) {
+                        continue
+                }
+                level, _ := strconv.Atoi(custom.Level)
+                if level == 0 {
+                        level = 0x6 // default TCP level
+                }
+                opt, _ := strconv.Atoi(custom.Opt)
+                if opt == 0 {
+                        continue
+                }
+                if custom.Type == "int" {
+                        value, _ := strconv.Atoi(custom.Value)
+                        if err := syscall.SetsockoptInt(fd, level, opt, value); err != nil {
+                                xrayerrors.LogWarning(context.Background(), "udp_pool: failed to set customSockopt: ", err)
+                        }
+                }
+        }
         return nil
 }
 
