@@ -294,6 +294,10 @@ func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
                                 return addr.IP
                         }
                 }
+                // M3 fix: return nil if preferred family not found.
+                // Callers already check ip == nil. Previously returned
+                // addrs[0] (wrong family) causing IPv4/IPv6 flips.
+                return nil
         }
         return addrs[0].IP
 }

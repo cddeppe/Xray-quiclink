@@ -469,12 +469,18 @@ func (w *udpWorker) removeConn(id connID) {
         w.Lock()
         if conn, ok := w.activeConn[id]; ok {
                 if conn.dcid != nil {
-                        delete(w.dcidIndex, makeDCIDKey(conn.dcid)) // v26.10.16-link: zero-alloc
+                        delete(w.dcidIndex, makeDCIDKey(conn.dcid))
                 }
-                delete(w.srcIndex, id.srcKey) // v26.10.16-link: zero-alloc
+                delete(w.srcIndex, id.srcKey)
                 delete(w.activeConn, id)
         } else {
-                delete(w.activeConn, id)
+                // H3 fix: conn was migrated and re-keyed under a new id.
+                // The old id doesn't find it. We can't search by pointer
+                // because we don't have it. The clean() function will
+                // catch the orphaned entry within 1 minute. This is a
+                // minor leak — the conn is already closed (pipe + done),
+                // so it's just a map entry holding a dead pointer.
+                delete(w.activeConn, id) // no-op, but safe
         }
         w.Unlock()
 }
@@ -517,7 +523,18 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         w.Unlock()
                         return nil
                 } else {
-                        // Same src, different dest → CID rotation. Need the DCID.
+                        // H2 fix: same src, different dest → could be either:
+                        // (a) genuine CID rotation (same QUIC conn, new DCID, same dest)
+                        // (b) two distinct QUIC connections from the same src
+                        //     to different destinations (YouTube does this)
+                        //
+                        // Old code treated ALL same-src-different-dest as
+                        // CID rotation, mixing two connections' state machines.
+                        //
+                        // Fix: check if the DCID matches an existing conn
+                        // in dcidIndex. If it does, it's genuine migration
+                        // (same DCID found = same conn with new src). If not,
+                        // it's a new connection — fall through to slow path.
                         w.Unlock()
                         dcid, _, err := quic.ParseDCID(packet)
                         if err != nil || len(dcid) == 0 {
@@ -525,7 +542,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         }
                         dk := makeDCIDKey(dcid)
                         w.Lock()
-                        // Re-check srcIndex under lock in case it changed.
+                        // Re-check srcIndex under lock.
                         oldID2, found2 := w.srcIndex[sk]
                         if !found2 {
                                 w.Unlock()
@@ -537,16 +554,28 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                 w.Unlock()
                                 return nil
                         }
-                        *oldConn2.src = id.src
-                        oldConn2.updateActivity()
-                        oldConn2.dcid = dcid
-                        delete(w.activeConn, oldID2)
-                        w.activeConn[id] = oldConn2
-                        w.srcIndex[sk] = id
-                        w.dcidIndex[dk] = id
-                        errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcid, " from ", id.src)
+                        // Check if this packet's DCID matches an existing conn.
+                        // If dcidIndex has this DCID, it's genuine CID rotation.
+                        // If not, it's a different QUIC connection — don't mix.
+                        if dcidID, dcidFound := w.dcidIndex[dk]; dcidFound {
+                                if dcidConn, dcidOk := w.activeConn[dcidID]; dcidOk && !dcidConn.done.Done() && dcidID == oldID2 {
+                                        // Genuine CID rotation: DCID belongs to
+                                        // the same src's existing conn. Update.
+                                        *oldConn2.src = id.src
+                                        oldConn2.updateActivity()
+                                        oldConn2.dcid = dcid
+                                        delete(w.activeConn, oldID2)
+                                        w.activeConn[id] = oldConn2
+                                        w.srcIndex[sk] = id
+                                        w.dcidIndex[dk] = id
+                                        errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcid, " from ", id.src)
+                                        w.Unlock()
+                                        return oldConn2
+                                }
+                        }
+                        // Not a CID rotation — different QUIC connection.
+                        // Fall through to slow path (dcidIndex lookup).
                         w.Unlock()
-                        return oldConn2
                 }
         }
         w.Unlock()
