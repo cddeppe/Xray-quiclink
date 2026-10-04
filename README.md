@@ -280,6 +280,11 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.14-link` -- **critical fix**: restored `b.Clear()` in cachedReader (v26.10.13 regression broke YouTube QUIC)
 - `v26.10.15-link` -- udp_pool, worker, sticky resolver fixes + perf (65535-byte read buffer for GRO, transient error guard, atomic.Bool IsClosed, skip parseQUICSCID for short headers, src-first fast path, lowercase SNI at extraction, sticky resolver data race + wildcard panic + eviction reaper + refresh coalescing)
 - `v26.10.16-link` -- **zero-alloc struct keys** (srcKey, dcidKey) + RLock demux + router ToLower fast path. Steady-state 1-RTT packet path is now 0 allocations end-to-end.
+- `v26.10.17-link` -- WireGuard fix: pool sockets honor `interface` binding (SO_BINDTODEVICE) + SO_MARK. Previously QUIC through the pool bypassed the WG tunnel. Also added UDP_GRO (later removed — see v26.10.18).
+- `v26.10.18-link` -- **hotfix**: removed UDP_GRO (coalesced packets broke DCID demux — YouTube stalled).
+- `v26.10.19-link` -- **hotfix**: skip SyscallConn/Control path when no interface or mark set (side effect broke pool read path for direct outbound).
+- `v26.10.20-link` -- inbox channel cap 32→256 + blocking send (later reverted — see v26.10.21).
+- `v26.10.21-link` -- **latest**: reverted to non-blocking send with 256-cap channel (blocking starved other sessions sharing the same pool socket). Also documented that `uplinkOnly: 0, downlinkOnly: 0` in policy config is REQUIRED for QUIC streaming (the real cause of YouTube stalls was the 30-second one-directional idle timer killing connections during buffering pauses).
 
 ### Performance (v26.10.16-link)
 
@@ -332,7 +337,74 @@ See the sanitized example config for a complete working example (uses documentat
    - `poolUnusedTimeout`: 300 (5 min) -- pool socket unused eviction
 6. **UDP enabled on port 443 inbounds:** `network: tcp,udp`
 7. **QUIC allowed in routing:** (Do NOT block `protocol: quic`)
-8. **Policy with long idle timeout:** `policy: {levels: {0: {connIdle: 1800}}}`
+8. **Policy with long idle timeout and disabled one-directional timeouts:**
+   ```json
+   "policy": {
+     "levels": {
+       "0": {
+         "connIdle": 1800,
+         "uplinkOnly": 0,
+         "downlinkOnly": 0,
+         "handshake": 4
+       }
+     }
+   }
+   ```
+   **CRITICAL:** `uplinkOnly` and `downlinkOnly` MUST be set to `0` (disabled) for QUIC/HTTP3 streaming (YouTube, Hulu, Disney+). These timers kill the connection after N seconds of no traffic in one direction. During video buffering, the client receives data (downlink active) but sends nothing (uplink silent). After 30 seconds of uplink silence, `uplinkOnly` fires and kills the connection — video stalls until you switch to the next video and back (which creates a new connection). Setting both to `0` disables this behavior; `connIdle: 1800` (30 min of complete silence) is the only timeout that should apply.
+
+### Troubleshooting: YouTube/Hulu/Disney+ video stalls
+
+**Symptom:** Video freezes after 30-60 seconds. Switching to the next video and back fixes it temporarily. The stall happens more frequently when swiping quickly between videos.
+
+**Root cause:** The `uplinkOnly` / `downlinkOnly` policy timers kill QUIC connections during one-directional streaming pauses. YouTube buffers video data (downlink active) but the client has nothing to send (uplink silent). After 30 seconds of one-directional silence, the timer fires and kills the connection.
+
+**Fix:** Set `uplinkOnly: 0` and `downlinkOnly: 0` in the policy config (see item 8 above). This is a config-only fix — no binary change needed.
+
+**Other things to check:**
+- `sessionIdleTimeout: 1800` in `udpConfig` — must be high enough to survive buffering pauses (30 min recommended)
+- `poolStalenessTimeout: 300` — if too low, pool sockets get evicted during buffering pauses
+- UDP pool inbox channel is 256 (v26.10.20+) — absorbs reply bursts without dropping
+- If stalls persist after the config fix, check logs: `journalctl -u xray --since "10 min ago" | grep -iE "dropped|dead|stale|timeout|cancel"`
+
+### WireGuard outbound: use `freedom` with `interface` binding (not `wireguard` protocol)
+
+For streaming through a WireGuard tunnel, use a `freedom` outbound with `sockopt.interface` set to the WG interface name. This uses the kernel's WireGuard module (SIMD-accelerated ChaCha20-Poly1305) instead of userspace `wireguard-go`, and lets the UDP socket pool apply to QUIC traffic through the tunnel.
+
+```json
+{
+  "tag": "wireguard-ak",
+  "protocol": "freedom",
+  "settings": {
+    "domainStrategy": "UseIPv4",
+    "udpConfig": {
+      "enableSocketPool": true,
+      "enableStickyResolver": true,
+      "preferIpv4": true,
+      "sessionIdleTimeout": 1800,
+      "poolStalenessTimeout": 300,
+      "poolIdleTimeout": 600,
+      "poolUnusedTimeout": 300
+    }
+  },
+  "streamSettings": {
+    "sockopt": {
+      "interface": "ak",
+      "tcpCongestion": "bbr",
+      "tcpFastOpen": true,
+      "tcpNoDelay": true,
+      "tcpUserTimeout": 5000,
+      "tcpKeepAlive": 60
+    }
+  }
+}
+```
+
+Key points:
+- **`protocol: "freedom"` (not `"wireguard"`):** Uses the kernel WG interface directly. The kernel handles ChaCha20-Poly1305 with SIMD (NEON on ARM, AVX2 on x86). Userspace `wireguard-go` has no SIMD.
+- **`interface: "ak"`:** Binds all outbound sockets (TCP and UDP pool) to the WG interface via `SO_BINDTODEVICE`. As of v26.10.17+, the UDP pool honors this — QUIC traffic through the pool goes through the WG tunnel.
+- **`tcpCongestion: "bbr"`:** Recommended for streaming through tunnels. BBR probes bandwidth instead of reacting to packet loss, which is better for the added latency of a WG tunnel. Check availability: `sysctl net.ipv4.tcp_available_congestion_control`
+- **No `sendThrough` on WG outbounds:** The `interface` binding handles source IP. `sendThrough` would interfere with the pool.
+- **Same `udpConfig` timeouts as the `direct` outbound:** The pool needs the same timeout settings to survive buffering pauses.
 
 ### See HANDOFF.md for full architecture, design notes, and deployment details.
 
