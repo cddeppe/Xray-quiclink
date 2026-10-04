@@ -155,6 +155,15 @@ func (p *UDPSocketPool) startReaper() {
         }()
 }
 
+// Close stops the reaper goroutine. Safe to call multiple times.
+// v26.10.34-link (M4 fix): without this, every SIGHUP reload leaks one
+// reaper goroutine + one time.Ticker per freedom outbound.
+func (p *UDPSocketPool) Close() {
+        if p.reaper != nil {
+                p.reaper.Stop()
+        }
+}
+
 func (p *UDPSocketPool) evictStale() {
         p.mu.Lock()
         defer p.mu.Unlock()
@@ -166,7 +175,12 @@ func (p *UDPSocketPool) evictStale() {
                 sock.mu.Unlock()
 
                 if isDead || isIdle || isUnused {
-                        sock.MarkDead()
+                        // v26.10.34-link (H1 fix): use MarkStale (not MarkDead) so
+                        // sockets with active sessions (refCount > 0) keep their
+                        // conn alive. MarkDead would close s.conn and kill all
+                        // sessions sharing it — the exact regression v26.10.28
+                        // fixed for the Acquire path but missed in the reaper.
+                        sock.MarkStale()
                         delete(p.sockets, key)
                         xrayerrors.LogInfo(context.Background(), "udp_pool: evicted stale socket for ", key)
                 }
@@ -527,7 +541,15 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 }
         }
 
-        n, err := c.socket.conn.WriteTo(b, c.socket.dest)
+        // v26.10.34-link (M1 fix): honor the caller-provided addr if it's a
+        // *net.UDPAddr; otherwise fall back to the socket's fixed dest. The
+        // pool model assumes one socket per dest, but QUIC connection
+        // migration can send packets to a different server IP.
+        dest := c.socket.dest
+        if udp, ok := addr.(*stdnet.UDPAddr); ok {
+                dest = udp
+        }
+        n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
                 // v26.10.15-link: only mark the socket dead on persistent
                 // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
@@ -570,14 +592,17 @@ func (c *pooledConn) Close() error {
         close(c.done)
 
         c.mu.Lock()
-        // v26.10.16-link: scids now stores dcidKey (struct, zero-alloc)
-        // instead of string. This lets Close() index the demux map directly
-        // without converting back from hex string to dcidKey.
+        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
+        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
+        // delete here — Go's race detector flags it, and production can panic
+        // with "concurrent map read and map write".
+        c.socket.mu.Lock()
         for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
                         delete(c.socket.demux, dk)
                 }
         }
+        c.socket.mu.Unlock()
         c.mu.Unlock()
 
         c.socket.release()

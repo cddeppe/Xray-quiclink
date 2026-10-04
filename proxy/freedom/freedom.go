@@ -3,11 +3,11 @@ package freedom
 import (
         "context"
         "crypto/rand"
-        "io"
         stderrors "errors"
+        "io"
         "strings"
-        "syscall"
         "sync/atomic"
+        "syscall"
         "time"
 
         "github.com/pires/go-proxyproto"
@@ -210,7 +210,27 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 
         // Initialize UDP features from config
         if config.UdpConfig != nil {
-                udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
+                // v26.10.34-link (M4 fix): close old instances before replacing.
+                // Without this, every SIGHUP reload leaks one reaper goroutine +
+                // one time.Ticker per outbound (StickyResolver.reaper,
+                // UDPSocketPool.reaper). Over weeks of daily reloads this
+                // accumulates hundreds of zombie reapers.
+                if h.socketPool != nil {
+                        h.socketPool.Close()
+                        h.socketPool = nil
+                }
+                if h.stickyResolver != nil {
+                        h.stickyResolver.Close()
+                        h.stickyResolver = nil
+                }
+
+                // v26.10.34-link (M8 fix): gate the global udptimeout mutation
+                // behind EnableSocketPool. Without this, multiple freedom
+                // outbounds (e.g. direct + wg) fight over the global — last
+                // Init wins, silently overriding the others.
+                if config.UdpConfig.EnableSocketPool {
+                        udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
+                }
 
                 if config.UdpConfig.EnableSocketPool {
                         staleness := secondsOrDefault(config.UdpConfig.GetPoolStalenessTimeout(), 300)
@@ -436,11 +456,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         if isNetworkUnreachable(err) && destination.Address.Family().IsDomain() {
                                 errors.LogWarning(ctx, "freedom: dial to ", destination, " failed, retrying with IPv4 only")
                                 if ips, e := internet.LookupForIP(destination.Address.Domain(), internet.DomainStrategy_USE_IP4, outGateway); e == nil && len(ips) > 0 {
-                                        v4Dest := destination
-                                        v4Dest.Address = net.IPAddress(ips[0])
-                                        if rawConn2, derr := dialer.Dial(ctx, v4Dest); derr == nil {
-                                                conn = rawConn2
-                                                return nil
+                                        // v26.10.34-link (M7 fix): iterate all IPv4 candidates,
+                                        // not just ips[0]. CDN edge pools often return multiple
+                                        // IPs; trying only the first is a needless availability
+                                        // reduction. Log each failure so operators can see the
+                                        // real second failure (was previously swallowed).
+                                        for i, ip := range ips {
+                                                v4Dest := destination
+                                                v4Dest.Address = net.IPAddress(ip)
+                                                if rawConn2, derr := dialer.Dial(ctx, v4Dest); derr == nil {
+                                                        conn = rawConn2
+                                                        return nil
+                                                } else {
+                                                        errors.LogInfoInner(ctx, derr, "freedom: IPv4 fallback dial failed for ", destination.Address.Domain(), " candidate #", i)
+                                                }
                                         }
                                 }
                         }
@@ -500,6 +529,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 if udpRemote != nil {
                                         pooledConn, err = h.socketPool.Acquire(udpRemote)
                                         if err != nil {
+                                                // v26.10.34-link (C3 fix): release peeked packets
+                                                // before returning. Without this, every Acquire
+                                                // failure leaks one MultiBuffer (up to 8KB+ per
+                                                // failure) — unbounded growth under flapping dest.
+                                                buf.ReleaseMulti(peekedPackets)
+                                                peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
                                         defer pooledConn.Close()
