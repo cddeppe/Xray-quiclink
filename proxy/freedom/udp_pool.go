@@ -114,11 +114,20 @@ func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
         if err != nil {
                 return nil, err
         }
+        // v26.10.19-link: only enter the SyscallConn/Control path when we
+        // actually have something to apply. If the sockopt has no interface
+        // and no mark (e.g., the "direct" outbound for YouTube), skip the
+        // entire Control path and return the bare socket — identical to
+        // v26.10.16 behavior. This avoids a regression where SyscallConn()
+        // + Control() had a side effect that broke the pool's read path.
         if p.sockopt == nil {
                 return pc, nil
         }
-        // pc is *net.UDPConn which implements SyscallConn. Get the raw fd
-        // via Control so we can apply SO_BINDTODEVICE, SO_MARK, UDP_GRO.
+        if p.sockopt.Interface == "" && p.sockopt.Mark == 0 {
+                return pc, nil
+        }
+        // We have an interface or mark to apply. Get the raw fd via
+        // SyscallConn.Control and apply SO_BINDTODEVICE + SO_MARK.
         rawConn, err := pc.SyscallConn()
         if err != nil {
                 return pc, nil
