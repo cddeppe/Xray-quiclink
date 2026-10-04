@@ -185,9 +185,12 @@ func (p *UDPSocketPool) evictStale() {
 func (p *UDPSocketPool) InvalidateByIP(ip string) {
         p.mu.Lock()
         for key, sock := range p.sockets {
-                // key is dest.String() = "ip:port" — check if it starts with the IP
                 if strings.HasPrefix(key, ip+":") || strings.HasPrefix(key, "["+ip+"]:") {
-                        sock.MarkStale()
+                        // v26.10.28-link: mark dead + remove from map, but
+                        // don't close conn if refCount > 0.
+                        sock.mu.Lock()
+                        sock.dead = true
+                        sock.mu.Unlock()
                         delete(p.sockets, key)
                         xrayerrors.LogInfo(context.Background(), "udp_pool: invalidated socket for ", key, " (IP changed)")
                 }
@@ -216,9 +219,15 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 isStale := time.Since(sock.lastReplyTime) > p.stalenessTimeout
                 sock.mu.Unlock()
                 if isStale {
-                        // v26.10.27-link: use MarkStale (not MarkDead) so
-                        // existing sessions keep their socket alive.
-                        sock.MarkStale()
+                        // v26.10.28-link: mark dead + remove from map, but
+                        // DON'T close s.conn if refCount > 0. New connections
+                        // get a fresh socket. Existing sessions keep their
+                        // socket and readLoop running. The socket is closed
+                        // when the last session calls release() and refCount
+                        // hits 0 (release checks s.dead).
+                        sock.mu.Lock()
+                        sock.dead = true
+                        sock.mu.Unlock()
                         delete(p.sockets, key)
                         ok = false
                 } else {
@@ -451,8 +460,10 @@ func (s *pooledSocket) release() {
                 s.refCount--
         }
         s.lastUsed = time.Now()
-        // v26.10.27-link: if the socket was marked stale (MarkStale) and
-        // this is the last session releasing, close the socket now.
+        // v26.10.28-link: if refCount reaches 0 and the socket was
+        // removed from the pool map (staleness or InvalidateByIP),
+        // close it now. The socket is not in the map so no new
+        // sessions will find it — safe to close.
         if s.refCount == 0 && s.dead {
                 s.closeOnce.Do(func() {
                         close(s.closed)
