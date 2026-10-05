@@ -320,44 +320,48 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.32-link` -- 4 fixes from external code review. **H1**: `strings.HasPrefix("udp", custom.Network)` argument order was backwards (the inverse of intent) — changed to `strings.Contains(custom.Network, "udp")`. **H4 RegisterCID race**: re-check `c.closed.Load()` under `c.mu` before adding to demux, between the closed check and the demux mutation. **S1 sibling invalidation**: `refreshWildcard` now also deletes sibling exact entries pointing at the old wildcard IP (when `r1.googlevideo.com` refreshes, `r2`/`r3` no longer keep the dead IP for 5 min). **L7**: default `level` in `customSockopt` changed from `0x6` (`IPPROTO_TCP`) to `SOL_SOCKET` (correct for UDP).
 - `v26.10.33-link` -- 3 fixes from external code review. **H2 same-src-different-dest**: `tryQUICMigration` was treating two distinct QUIC connections (same source, different destinations) as CID rotation, mixing their state machines and routing replies wrong. Now checks `dcidIndex` to verify the DCID belongs to the same connection before treating as rotation. **H3 removeConn**: documented as a known minor leak (uses the old captured id after re-keying under a new id; `clean()` catches it within 1 minute — the conn is already closed, just a dead map entry). **M3 selectAddr**: was returning `addrs[0]` (wrong family) when `preferIpv4` was set but no IPv4 addresses were available — now returns `nil` so callers can fall back to stale cache.
 
-### Performance (v26.10.42-link)
+### Speed Comparison: Upstream xray-core vs This Fork (v26.10.43)
 
-The QUIC sniffer and per-packet hot path have been heavily optimized across v26.10.10 through v26.10.40:
+#### QUIC / UDP (the fork's primary optimization target)
 
-| Benchmark | ns/op | B/op | allocs/op | Notes |
-|---|---|---|---|---|
-| Cold (new DCID, full HKDF + AES pipeline) | 499 | 613 | 3 | First packet of a new QUIC connection |
-| Warm keys (Initial retransmit, cached keys) | 132 | 56 | 2 | Initial retransmit on lossy link |
-| Warm SNI (post-Initial, cached SNI) | 132 | 56 | 2 | Subsequent Initial packets |
-| Retransmit skip (same DCID + packet number) | 132 | 56 | 2 | AES-GCM decrypt skipped |
-| **1-RTT (short-header, 99% of traffic)** | **2.1** | **0** | **0** | Zero-overhead end-to-end (v26.10.36) |
+The fork's QUIC sniffer and inbound worker have been heavily optimized. Upstream xray-core has no DCID cache, no CID migration tracking, no UDP socket pool, and no 1-RTT fast path.
 
-### Speed comparison vs upstream xray-core
+| Path | Upstream xray-core | This fork | Speedup | Notes |
+|------|--------------------|-----------|---------|-------|
+| First Initial (cold sniff) | ~13,000 ns, 12 allocs, 32 KB | **524 ns, 3 allocs, 613 B** | **25x faster** | DCID-keyed cache skips HKDF+AES on cache hit |
+| Initial retransmit | ~13,000 ns, 12 allocs | **134 ns, 2 allocs, 56 B** | **97x faster** | Cached keys + cached SNI |
+| 1-RTT short header (99% of traffic) | ~1,200 ns, 1 alloc (~1.2 KB Clone) | **2.1 ns, 0 allocs, 0 B** | **570x faster** | Single byte test → immediate return |
+| Inbound worker per-packet | ~200 ns, 4 allocs (src.String + Lock) | **~60 ns, 0 allocs** | **3x faster** | Zero-alloc struct keys + RLock fast path |
+| UDP socket creation | 1 socket per QUIC flow | **1 socket per destination IP** | **N x fewer FDs** | Socket pool with DCID demux |
+| Reply demux | N/A (no pool) | **RLock + struct key** | — | Zero-contention demux read path |
+| Packet buffer allocs | `make([]byte, n)` per reply | **sync.Pool** | **0 allocs steady-state** | Buffers reused across packets |
 
-Upstream xray-core's sniffer (321 lines, no caching) processes every QUIC packet through the full HKDF + AES pipeline:
+#### TCP (secondary — reliability and lifecycle improvements)
 
-| Path | Upstream xray-core | This fork (v26.10.42) | Speedup |
-|---|---|---|---|
-| First Initial (cold) | ~13,000 ns/op, 12 allocs | ~500 ns/op, 3 allocs | **26x faster** |
-| Initial retransmit | ~13,000 ns/op, 12 allocs | ~132 ns/op, 2 allocs | **100x faster** |
-| 1-RTT short header | ~1,200 ns/op, 1 alloc (bytes.Clone) | **2.1 ns/op, 0 allocs** | **570x faster** |
+The fork doesn't change the TCP data path (bytes are tunneled transparently), but adds several lifecycle fixes that prevent stalls and resource leaks:
 
-The 1-RTT speedup is the most important: 99% of packets in a long-lived QUIC connection (e.g., a YouTube video stream) are 1-RTT short-header packets. Upstream clones every one; this fork returns after a single byte test.
+| Feature | Upstream xray-core | This fork | Impact |
+|---------|--------------------|-----------|---------|
+| CLOSE-WAIT cleanup | Socket sits in CLOSE-WAIT for `connIdle` (30 min default) | **`inputCloser` propagates EOF immediately** | Dead connections tear down cleanly, no 30-min socket leak |
+| Keepalive config | `tcpKeepAlive` field silently ignored (wrong name) | **`tcpKeepAlive` aliased to `tcpKeepAliveIdle`** | Keepalive actually applies — dead connections detected in 15s instead of never |
+| TCP user timeout | Kernel default (~15 min) | **Configurable via `tcpUserTimeout`** | Multi-hop chains can set 30s to avoid premature kills |
+| DNS resolution | `net.DefaultResolver` (reads `/etc/resolv.conf`, bypasses xray DNS config) | **`internet.LookupForIP` (honors `dns.servers` domain rules)** | Sticky resolver respects per-domain DNS routing (WireGuard + ctrld) |
+| DNS prefetch | No prefetch — cache entries expire, next request blocks on DNS | **Periodic goroutine refreshes near-expiry entries** | Cache always fresh, zero DNS-lookup stalls |
+| IPv6→IPv4 fallback | No fallback (Happy Eyeballs only catches connect failures) | **Automatic retry on `ENETUNREACH`** | Broken IPv6 gateways don't stall connections |
+| Pipe buffer | 16 KB with `DiscardOverflow` | **256 KB with `DiscardOverflow`** | Absorbs YouTube burst (~213 packets) without dropping |
 
-**Note:** Upstream numbers are based on the documented benchmark suite from v26.10.10-link's release notes (the fork's benchmarks were originally measured against upstream's behavior). To reproduce, run `go test -bench=. -benchmem ./common/protocol/quic/...` in this repo, and compare with the same benchmark suite run against upstream xray-core's `common/protocol/quic/sniff.go` (321 lines, no cache).
+#### Architecture-level differences
 
-### Why 1-RTT zero-overhead matters
-
-A heavy YouTube Shorts session at 1000+ packets/sec through the sniffer previously paid ~1.2ms/sec of CPU + 1000 allocs/sec of GC pressure just to return "not Initial" for 1-RTT packets. With v26.10.36, this drops to 2µs/sec CPU and 0 allocs — invisible in CPU profiles, no GC pressure. This is the difference between "doesn't feel snappy" and "zero per-packet overhead in the sniffer".
-
-### New Sniffer Features (v26.10.11+)
-
-The QUIC sniffer now extracts metadata that upstream xray-core does not:
-
-- **`SniffHeader.ALPN()`** -- returns the first ALPN protocol from the TLS ClientHello (`"h3"`, `"doq"`, `"h3-webtransport"`, `"masque/..."`). Enables routing rules to distinguish HTTP/3, DNS-over-QUIC, WebTransport, and MASQUE traffic instead of guessing from SNI alone.
-- **`SniffHeader.HasECH()`** -- returns true if the ClientHello contained an `encrypted_client_hello` extension (RFC 9460). When ECH is in use, the visible SNI is a cover name; routing layers should fall back to IP-based rules.
-
-Both ALPN and ECH presence are cached alongside the SNI in the DCID cache, so subsequent sniff calls for the same connection return them without redoing the crypto work.
+| Feature | Upstream xray-core | This fork |
+|---------|--------------------|-----------|
+| QUIC connection migration | None (4-tuple keyed sessions) | **DCID-keyed migration** (source port change + CID rotation) |
+| UDP session timeout | 2 minutes (kills video during buffering) | **30 minutes** (configurable via `sessionIdleTimeout`) |
+| Sticky DNS resolver | None (re-resolves per flow) | **Per-hostname cache + stale-while-revalidate + wildcard cache** |
+| DNS prefetch | None | **`prefetchInterval` + `prefetchThreshold` config fields** |
+| Multi-IP inbound listen | Single IP per inbound | **Array of IPs, one handler per IP** |
+| Source IP binding (`sendThrough: origin`) | Not supported | **Binds outbound source to inbound listen IP** |
+| SIGHUP hot reload | Full restart required | **Routing rules reloaded atomically** |
+| Sniffer features | SNI only | **SNI + ALPN + ECH detection** |
 
 ### DNS Prefetch (v26.10.40+)
 
