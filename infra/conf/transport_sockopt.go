@@ -51,6 +51,13 @@ type SocketConfig struct {
 	DialerProxy           string                 `json:"dialerProxy"`
 	TCPKeepAliveInterval  int32                  `json:"tcpKeepAliveInterval"`
 	TCPKeepAliveIdle      int32                  `json:"tcpKeepAliveIdle"`
+	// v26.10.37-link: tcpKeepAlive is a backward-compatible alias for
+	// tcpKeepAliveIdle. Many example configs (and the original xray docs)
+	// use "tcpKeepAlive" which silently doesn't match the real field
+	// name "tcpKeepAliveIdle" — so keepalive never gets applied. With this
+	// alias, "tcpKeepAlive": 60 now correctly sets tcpKeepAliveIdle=60.
+	// Prefer tcpKeepAliveIdle in new configs.
+	TCPKeepAliveLegacy    int32                  `json:"tcpKeepAlive"`
 	TCPCongestion         string                 `json:"tcpCongestion"`
 	TCPWindowClamp        int32                  `json:"tcpWindowClamp"`
 	TCPMaxSeg             int32                  `json:"tcpMaxSeg"`
@@ -170,7 +177,10 @@ func (c *SocketConfig) Build() (*internet.SocketConfig, error) {
 		AcceptProxyProtocol:  c.AcceptProxyProtocol,
 		DialerProxy:          c.DialerProxy,
 		TcpKeepAliveInterval: c.TCPKeepAliveInterval,
-		TcpKeepAliveIdle:     c.TCPKeepAliveIdle,
+		// v26.10.37-link: fall back to tcpKeepAlive (legacy alias)
+		// if tcpKeepAliveIdle is unset. Many configs use the wrong
+		// field name and silently get no keepalive at all.
+		TcpKeepAliveIdle:     pickKeepAliveIdle(c.TCPKeepAliveIdle, c.TCPKeepAliveLegacy),
 		TcpCongestion:        c.TCPCongestion,
 		TcpWindowClamp:       c.TCPWindowClamp,
 		TcpMaxSeg:            c.TCPMaxSeg,
@@ -184,4 +194,16 @@ func (c *SocketConfig) Build() (*internet.SocketConfig, error) {
 		HappyEyeballs:        happyEyeballs,
 		TrustedXForwardedFor: c.TrustedXForwardedFor,
 	}, nil
+}
+
+// pickKeepAliveIdle returns the idle keepalive value, falling back to the
+// legacy "tcpKeepAlive" field if the canonical "tcpKeepAliveIdle" field is
+// unset. v26.10.37-link: this fixes the silent no-op config bug where
+// "tcpKeepAlive": 60 in user configs was being ignored because the real
+// field name is "tcpKeepAliveIdle".
+func pickKeepAliveIdle(canonical, legacy int32) int32 {
+	if canonical > 0 {
+		return canonical
+	}
+	return legacy
 }
