@@ -258,6 +258,9 @@ type Config struct {
 	DisableFallback        bool          `protobuf:"varint,10,opt,name=disableFallback,proto3" json:"disableFallback,omitempty"`
 	DisableFallbackIfMatch bool          `protobuf:"varint,11,opt,name=disableFallbackIfMatch,proto3" json:"disableFallbackIfMatch,omitempty"`
 	EnableParallelQuery    bool          `protobuf:"varint,14,opt,name=enableParallelQuery,proto3" json:"enableParallelQuery,omitempty"`
+	// v26.10.40-link: DNS prefetch (see config.proto for docs)
+	PrefetchInterval       uint32        `protobuf:"varint,15,opt,name=prefetchInterval,proto3" json:"prefetchInterval,omitempty"`
+	PrefetchThreshold      uint32        `protobuf:"varint,16,opt,name=prefetchThreshold,proto3" json:"prefetchThreshold,omitempty"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -367,6 +370,21 @@ func (x *Config) GetEnableParallelQuery() bool {
 		return x.EnableParallelQuery
 	}
 	return false
+}
+
+// v26.10.40-link: prefetch getters
+func (x *Config) GetPrefetchInterval() uint32 {
+	if x != nil {
+		return x.PrefetchInterval
+	}
+	return 0
+}
+
+func (x *Config) GetPrefetchThreshold() uint32 {
+	if x != nil {
+		return x.PrefetchThreshold
+	}
+	return 0
 }
 
 type Config_HostMapping struct {

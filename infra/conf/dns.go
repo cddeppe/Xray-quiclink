@@ -169,6 +169,9 @@ type DNSConfig struct {
 	DisableFallback        bool                `json:"disableFallback"`
 	DisableFallbackIfMatch bool                `json:"disableFallbackIfMatch"`
 	EnableParallelQuery    bool                `json:"enableParallelQuery"`
+	// v26.10.40-link: DNS prefetch (see app/dns/config.proto for docs)
+	PrefetchInterval       uint32              `json:"prefetchInterval"`
+	PrefetchThreshold      uint32              `json:"prefetchThreshold"`
 	UseSystemHosts         bool                `json:"useSystemHosts"`
 }
 
@@ -275,6 +278,8 @@ func (c *DNSConfig) Build() (*dns.Config, error) {
 		DisableFallback:        c.DisableFallback,
 		DisableFallbackIfMatch: c.DisableFallbackIfMatch,
 		EnableParallelQuery:    c.EnableParallelQuery,
+		PrefetchInterval:       c.PrefetchInterval,
+		PrefetchThreshold:      c.PrefetchThreshold,
 		QueryStrategy:          resolveQueryStrategy(c.QueryStrategy),
 	}
 
