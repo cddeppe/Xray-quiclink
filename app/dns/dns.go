@@ -139,6 +139,10 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			serveExpiredTTL = *ns.ServeExpiredTTL
 		}
 
+		// v26.10.40-link: prefetch config (global, no per-server override for now)
+		prefetchInterval := config.PrefetchInterval
+		prefetchThreshold := config.PrefetchThreshold
+
 		tag := defaultTag
 		if len(ns.Tag) > 0 {
 			tag = ns.Tag
@@ -149,7 +153,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			return nil, errors.New("no QueryStrategy available for ", ns.Address)
 		}
 
-		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, updateRules)
+		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, prefetchInterval, prefetchThreshold, tag, clientIPOption, updateRules)
 		if err != nil {
 			return nil, errors.New("failed to create client").Base(err)
 		}

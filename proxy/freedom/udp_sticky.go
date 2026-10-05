@@ -9,6 +9,7 @@ import (
 
         "github.com/xtls/xray-core/common/errors"
         "github.com/xtls/xray-core/common/net"
+        "github.com/xtls/xray-core/transport/internet"
 )
 
 // StickyResolver provides per-hostname DNS result stickiness for UDP outbound.
@@ -172,7 +173,20 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
         // (startRefresh blocks on <-ch for follow-up callers).
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
-        addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+        // v26.10.40-link: use xray's DNS client (honors dns.servers domain rules,
+        // finalQuery, timeoutMs) instead of Go's net.DefaultResolver (which
+        // reads /etc/resolv.conf and bypasses all xray DNS config — important
+        // for WireGuard + ctrld setups where xray's DNS config routes specific
+        // domains like *.googlevideo.com to a US-geo resolver).
+        ips, err := internet.LookupForIP(hostname, internet.DomainStrategy_USE_IP46, nil)
+        if err != nil || len(ips) == 0 {
+                errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname, ": ", err)
+                return
+        }
+        addrs := make([]net.IPAddr, len(ips))
+        for i, ip := range ips {
+                addrs[i] = net.IPAddr{IP: ip}
+        }
         if err != nil || len(addrs) == 0 {
                 errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname, ": ", err)
                 return
@@ -236,7 +250,20 @@ func (s *StickyResolver) refreshExact(hostname string) {
         // doesn't stall all subsequent resolves for this hostname.
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
-        addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
+        // v26.10.40-link: use xray's DNS client (honors dns.servers domain rules,
+        // finalQuery, timeoutMs) instead of Go's net.DefaultResolver (which
+        // reads /etc/resolv.conf and bypasses all xray DNS config — important
+        // for WireGuard + ctrld setups where xray's DNS config routes specific
+        // domains like *.googlevideo.com to a US-geo resolver).
+        ips, err := internet.LookupForIP(hostname, internet.DomainStrategy_USE_IP46, nil)
+        if err != nil || len(ips) == 0 {
+                errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname, ": ", err)
+                return
+        }
+        addrs := make([]net.IPAddr, len(ips))
+        for i, ip := range ips {
+                addrs[i] = net.IPAddr{IP: ip}
+        }
         if err != nil || len(addrs) == 0 {
                 errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname)
                 return
@@ -334,8 +361,13 @@ func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
 
 // resolveAndCache does a fresh DNS resolution and caches the result.
 func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (net.Address, error) {
-        addrs, err := net.DefaultResolver.LookupIPAddr(ctx, hostname)
-        if err != nil || len(addrs) == 0 {
+        // v26.10.40-link: use xray's DNS client (honors dns.servers domain rules,
+        // finalQuery, timeoutMs) instead of Go's net.DefaultResolver (which
+        // reads /etc/resolv.conf and bypasses all xray DNS config — important
+        // for WireGuard + ctrld setups where xray's DNS config routes specific
+        // domains like *.googlevideo.com to a US-geo resolver).
+        ips, err := internet.LookupForIP(hostname, internet.DomainStrategy_USE_IP46, nil)
+        if err != nil || len(ips) == 0 {
                 // Stale-serve fallback: look for any cached wildcard entry
                 // whose parent domain matches this hostname.
                 // v26.10.15-link: fixed the panic on entries without a dot
@@ -359,6 +391,10 @@ func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (
                 }
                 s.mu.RUnlock()
                 return nil, errors.New("sticky: failed to resolve and no stale cache for ", hostname)
+        }
+        addrs := make([]net.IPAddr, len(ips))
+        for i, ip := range ips {
+                addrs[i] = net.IPAddr{IP: ip}
         }
 
         selectedAddr := selectAddr(addrs, s.PreferIPv4, s.PreferIPv6)

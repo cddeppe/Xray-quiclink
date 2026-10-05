@@ -44,7 +44,7 @@ type Client struct {
 }
 
 // NewServer creates a name server object according to the network destination url.
-func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, clientIP net.IP) (Server, error) {
+func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, disableCache bool, serveStale bool, serveExpiredTTL uint32, prefetchInterval uint32, prefetchThreshold uint32, clientIP net.IP) (Server, error) {
 	if address := dest.Address; address.Family().IsDomain() {
 		u, err := url.Parse(address.Domain())
 		if err != nil {
@@ -54,17 +54,25 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 		case strings.EqualFold(u.String(), "localhost"):
 			return NewLocalNameServer(), nil
 		case strings.EqualFold(u.Scheme, "https"): // DNS-over-HTTPS Remote mode
-			return NewDoHNameServer(u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return wirePrefetch(NewDoHNameServer(u, dispatcher, false, disableCache, serveStale, serveExpiredTTL, clientIP), prefetchInterval, prefetchThreshold), nil
 		case strings.EqualFold(u.Scheme, "h2c"): // DNS-over-HTTPS h2c Remote mode
-			return NewDoHNameServer(u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return wirePrefetch(NewDoHNameServer(u, dispatcher, true, disableCache, serveStale, serveExpiredTTL, clientIP), prefetchInterval, prefetchThreshold), nil
 		case strings.EqualFold(u.Scheme, "https+local"): // DNS-over-HTTPS Local mode
-			return NewDoHNameServer(u, nil, false, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return wirePrefetch(NewDoHNameServer(u, nil, false, disableCache, serveStale, serveExpiredTTL, clientIP), prefetchInterval, prefetchThreshold), nil
 		case strings.EqualFold(u.Scheme, "h2c+local"): // DNS-over-HTTPS h2c Local mode
-			return NewDoHNameServer(u, nil, true, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+			return wirePrefetch(NewDoHNameServer(u, nil, true, disableCache, serveStale, serveExpiredTTL, clientIP), prefetchInterval, prefetchThreshold), nil
 		case strings.EqualFold(u.Scheme, "quic+local"): // DNS-over-QUIC Local mode
-			return NewQUICNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
+			s, err := NewQUICNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
+			if err != nil {
+				return nil, err
+			}
+			return wirePrefetch(s, prefetchInterval, prefetchThreshold), nil
 		case strings.EqualFold(u.Scheme, "tcp"): // DNS-over-TCP Remote mode
-			return NewTCPNameServer(u, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+			s, err := NewTCPNameServer(u, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+			if err != nil {
+				return nil, err
+			}
+			return wirePrefetch(s, prefetchInterval, prefetchThreshold), nil
 		case strings.EqualFold(u.Scheme, "tcp+local"): // DNS-over-TCP Local mode
 			return NewTCPLocalNameServer(u, disableCache, serveStale, serveExpiredTTL, clientIP)
 		case strings.EqualFold(u.String(), "fakedns"):
@@ -82,9 +90,25 @@ func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dis
 		dest.Network = net.Network_UDP
 	}
 	if dest.Network == net.Network_UDP { // UDP classic DNS mode
-		return NewClassicNameServer(dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP), nil
+		return wirePrefetch(NewClassicNameServer(dest, dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP), prefetchInterval, prefetchThreshold), nil
 	}
 	return nil, errors.New("No available name server could be created from ", dest)
+}
+
+// v26.10.40-link: wirePrefetch configures prefetch on a CachedNameserver
+// after construction. Returns the nameserver unchanged (typed as Server)
+// so callers can use it inline. LocalNameServer and FakeDNSServer don't
+// implement CachedNameserver and are skipped (prefetch not supported on
+// them — they don't have a TTL-based cache).
+func wirePrefetch[T CachedNameserver](ns T, interval, threshold uint32) T {
+	if interval > 0 && threshold > 0 {
+		ns.getCacheController().SetPrefetch(
+			time.Duration(interval)*time.Second,
+			time.Duration(threshold)*time.Second,
+			ns,
+		)
+	}
+	return ns
 }
 
 // NewClient creates a DNS client managing a name server with client IP, domain rules and expected IPs.
@@ -93,6 +117,7 @@ func NewClient(
 	ns *NameServer,
 	clientIP net.IP,
 	disableCache bool, serveStale bool, serveExpiredTTL uint32,
+	prefetchInterval uint32, prefetchThreshold uint32,
 	tag string,
 	ipOption dns.IPOption,
 	updateRules func(bool),
@@ -100,7 +125,7 @@ func NewClient(
 	client := &Client{}
 	err := core.RequireFeatures(ctx, func(dispatcher routing.Dispatcher) error {
 		// Create a new server for each client for now
-		server, err := NewServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, clientIP)
+		server, err := NewServer(ctx, ns.Address.AsDestination(), dispatcher, disableCache, serveStale, serveExpiredTTL, prefetchInterval, prefetchThreshold, clientIP)
 		if err != nil {
 			return errors.New("failed to create nameserver").Base(err)
 		}
