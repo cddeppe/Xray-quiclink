@@ -238,8 +238,11 @@ func (c *InboundDetourConfig) buildOne(listenAddr *Address, idx int) (*core.Inbo
 	}
 
 	// Synthesize a per-IP tag when multiple listen addresses are given.
+	// v26.10.42-link (audit H3 from 2-c): only synthesize for IPs after
+	// the first. The first IP keeps the original tag so routing rules
+	// referencing the bare tag work for the primary listener.
 	tag := c.Tag
-	if c.ListenOn != nil && len(*c.ListenOn) > 1 && listenAddr != nil {
+	if c.ListenOn != nil && len(*c.ListenOn) > 1 && listenAddr != nil && idx > 0 {
 		tag = c.Tag + "#" + listenAddr.String()
 	}
 
