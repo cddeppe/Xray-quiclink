@@ -39,12 +39,17 @@ type TCPSocketPool struct {
 // stabilizes after learnVisits visits, and is then used for pre-warming.
 type wildcardPattern struct {
         mu          sync.Mutex
-        wildcard    string   // e.g., "*.hulu.com"
-        candidate   []string // IPs from the current visit (in order)
-        stable      []string // IPs from the confirmed pattern (in order)
-        visitCount  int      // how many visits have been tracked
-        lastVisit   time.Time // when the last visit started
-        stabilized  bool     // pattern is stable — start pre-warming
+        wildcard    string
+        candidate   []string
+        stable      []string
+        visitCount  int
+        lastVisit   time.Time
+        stabilized  bool
+        // v26.10.47-link: track total domains seen (before dedup by IP)
+        // so the stabilization log shows how many domains map to the
+        // learned unique IPs — confirms the dedup is working.
+        totalDomains  int
+        uniqueIPs     map[string]bool // dedup tracker
 }
 
 type warmConn struct {
@@ -175,8 +180,9 @@ func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
         // frequency problem (analytics IPs fire later, not in the first N).
         if p.patterns["__global__"] == nil {
                 p.patterns["__global__"] = &wildcardPattern{
-                        wildcard:  "__global__",
-                        lastVisit: time.Now(),
+                        wildcard:   "__global__",
+                        lastVisit:  time.Now(),
+                        uniqueIPs:  make(map[string]bool),
                 }
         }
         wp := p.patterns["__global__"]
@@ -196,13 +202,15 @@ func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
                                                 // First stabilization — adopt the candidate
                                                 wp.stable = append([]string{}, wp.candidate...)
                                                 wp.stabilized = true
-                                                errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern stabilized after ", wp.visitCount, " visits, ", len(wp.stable), " critical-path IPs")
+                                                dupCount := wp.totalDomains - len(wp.stable)
+                                                if dupCount < 0 { dupCount = 0 }
+                                                errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern stabilized after ", wp.visitCount, " visits, ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains — ", dupCount, " shared IPs)")
                                         } else if stringSlicesMatch(wp.stable, wp.candidate) {
                                                 // Already stable, still matches — good
                                         } else {
                                                 // Pattern changed — update (CDN migration)
                                                 wp.stable = append([]string{}, wp.candidate...)
-                                                errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern updated (CDN migration?) — ", len(wp.stable), " critical-path IPs")
+                                                errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern updated (CDN migration?) — ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains)")
                                         }
                                 }
                         }
@@ -216,6 +224,13 @@ func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
         if !containsString(wp.candidate, key) && len(wp.candidate) < p.preWarmN {
                 wp.candidate = append(wp.candidate, key)
         }
+        // v26.10.47-link: count total connections (before dedup by IP).
+        // This lets the stabilization log show how many connections
+        // mapped to the learned unique IPs — confirms that shared-IP
+        // dedup is working (e.g., "5 critical-path IPs from 12
+        // connections — 7 shared IPs").
+        wp.totalDomains++
+        wp.uniqueIPs[key] = true
         wp.lastVisit = now
 }
 

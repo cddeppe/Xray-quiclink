@@ -309,6 +309,8 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.43-link` -- remaining audit fixes: P5 (`atomic.Int64` for `lastUsed`/`lastReplyTime` — eliminates mutex per reply packet in readLoop), C3 (TOCTOU race re-check after `getConnection`), H4-2b (`udpConn.remote` updated on migration), H5-2b (configurable `DefaultShortHeaderCIDLen`). Completes the audit — zero remaining fork-introduced findings.
 - `v26.10.44-link` -- **TCP warm-pool**. When a TCP connection's inbound side closes but the outbound is still alive, the outbound is placed in a warm pool for reuse by the next inbound to the same destination. Eliminates TCP+TLS handshake for repeated connections. Opt-in via `enableTcpWarmPool: true` + `tcpWarmPoolTimeout: 5`. Safety: destination NOT modified, DNS NOT bypassed, one outbound per inbound, graceful fallback.
 - `v26.10.45-link` -- **auto TCP pre-warming**. New config field `preWarmCount` (uint32, default 0 = disabled). When >0, the warm pool auto-tracks frequently accessed destinations and pre-establishes TCP connections every 60s. When you switch from Hulu to Disney through WG, Disney's TCP connection is already open — no TCP handshake through the tunnel. Saves 200-300ms on first visit to known sites. Resource cost: N idle TCP connections (negligible).
+- `v26.10.46-link` -- **per-wildcard first-N pre-warming**. Replaces the frequency-based `preWarmCount` with a smarter algorithm that learns the **critical-path IPs** (the first N IPs the browser hits on each visit) instead of the most-frequent IPs (which includes analytics/tracking). After `preWarmLearnVisits` (default 3) visits, the pattern stabilizes and those specific IPs are pre-warmed every 60s. More efficient: 5 per site family instead of 20 globally. More targeted: pre-warms page-load IPs, not tracking IPs. Parallelized pre-warm dials.
+- `v26.10.47-link` -- **shared-IP dedup logging**. The first-N tracker now logs how many total connections mapped to the learned unique IPs — confirms that domains sharing IPs (e.g., `hulu.com` and `asset.hulu.com` resolving to the same IP) are automatically deduplicated. Log: `first-N pattern stabilized after 3 visits, 5 critical-path IPs (from 12 connections — 7 shared IPs)`. Also bumped version to 26.10.47.
 
 - `v26.10.22-link` -- **SIGHUP hot reload for routing rules**. Send `kill -HUP $(pgrep xray)` (or wire `ExecReload=/bin/kill -HUP $MAINPID` + `systemctl reload xray`) to atomically swap routing rules without killing existing TCP/UDP connections. Existing connections keep flowing through their original outbound handler; only new connections use the updated rules. Inbound/outbound handler changes, DNS, and policy still require a full restart. Also includes the docs fix that corrected the `uplinkOnly: 0` / `downlinkOnly: 0` recommendation to `1800` (0 means "kill immediately" in xray's `ActivityTimer`, not "disable the timer").
 - `v26.10.23-link` -- configurable sticky resolver TTL via `udpConfig.stickyResolverTtl` (seconds, default 300). Lower values detect CDN edge rotation faster but do more DNS queries.
@@ -323,7 +325,7 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.32-link` -- 4 fixes from external code review. **H1**: `strings.HasPrefix("udp", custom.Network)` argument order was backwards (the inverse of intent) — changed to `strings.Contains(custom.Network, "udp")`. **H4 RegisterCID race**: re-check `c.closed.Load()` under `c.mu` before adding to demux, between the closed check and the demux mutation. **S1 sibling invalidation**: `refreshWildcard` now also deletes sibling exact entries pointing at the old wildcard IP (when `r1.googlevideo.com` refreshes, `r2`/`r3` no longer keep the dead IP for 5 min). **L7**: default `level` in `customSockopt` changed from `0x6` (`IPPROTO_TCP`) to `SOL_SOCKET` (correct for UDP).
 - `v26.10.33-link` -- 3 fixes from external code review. **H2 same-src-different-dest**: `tryQUICMigration` was treating two distinct QUIC connections (same source, different destinations) as CID rotation, mixing their state machines and routing replies wrong. Now checks `dcidIndex` to verify the DCID belongs to the same connection before treating as rotation. **H3 removeConn**: documented as a known minor leak (uses the old captured id after re-keying under a new id; `clean()` catches it within 1 minute — the conn is already closed, just a dead map entry). **M3 selectAddr**: was returning `addrs[0]` (wrong family) when `preferIpv4` was set but no IPv4 addresses were available — now returns `nil` so callers can fall back to stale cache.
 
-### Speed Comparison: Upstream xray-core vs This Fork (v26.10.45)
+### Speed Comparison: Upstream xray-core vs This Fork (v26.10.47)
 
 #### QUIC / UDP (the fork's primary optimization target)
 
@@ -353,7 +355,7 @@ The fork doesn't change the TCP data path (bytes are tunneled transparently), bu
 | IPv6→IPv4 fallback | No fallback (Happy Eyeballs only catches connect failures) | **Automatic retry on `ENETUNREACH`** | Broken IPv6 gateways don't stall connections |
 | Pipe buffer | 16 KB with `DiscardOverflow` | **256 KB with `DiscardOverflow`** | Absorbs YouTube burst (~213 packets) without dropping |
 | **TCP connection reuse** | 1 outbound per inbound (no reuse) | **Warm pool** — outbound kept alive for `tcpWarmPoolTimeout` (default 5-30s) and reused by next inbound to same dest | Eliminates TCP+TLS handshake for repeated connections |
-| **TCP pre-warming** | None | **Auto pre-warm** — top `preWarmCount` (e.g., 20) frequently accessed destinations get pre-established TCP connections every 60s | First visit to known sites: **2x faster** (no TCP handshake through WG) |
+| **TCP pre-warming** | None | **First-N learning** — learns the critical-path IPs (first N per visit), pre-warms those specific IPs every 60s. Shared-IP dedup: domains resolving to the same IP share warm connections. More efficient than frequency-based: 5 per site family, not 20 globally | First visit to known sites: **2x faster** (no TCP handshake through WG) |
 
 #### Architecture-level differences
 
@@ -367,7 +369,7 @@ The fork doesn't change the TCP data path (bytes are tunneled transparently), bu
 | Source IP binding (`sendThrough: origin`) | Not supported | **Binds outbound source to inbound listen IP** |
 | SIGHUP hot reload | Full restart required | **Routing rules reloaded atomically** |
 | TCP warm-pool | None | **Outbound TCP connections reused after inbound close** | Eliminates handshake for repeated connections |
-| TCP pre-warming | None | **Auto pre-warm top N destinations** | First visit to known sites: zero TCP handshake |
+| TCP pre-warming | None | **First-N learning + shared-IP dedup** | Critical-path IPs only, not analytics/tracking |
 | Sniffer features | SNI only | **SNI + ALPN + ECH detection** |
 
 #### WireGuard integration
@@ -397,7 +399,8 @@ The fork doesn't use xray's `wireguard` protocol outbound (userspace `wireguard-
       "stickyResolverTtl": 60,
       "enableTcpWarmPool": true,
       "tcpWarmPoolTimeout": 30,
-      "preWarmCount": 20
+      "preWarmFirstN": 5,
+      "preWarmLearnVisits": 3
     }
   },
   "streamSettings": {
@@ -508,9 +511,11 @@ When a TCP connection's inbound side closes but the outbound is still alive, the
 
 - `enableTcpWarmPool` (bool, default false): opt-in. Keep outbound TCP connections warm after the inbound closes.
 - `tcpWarmPoolTimeout` (seconds, default 5): how long to keep warm connections. 30 is recommended for switching between sites (Hulu → Disney → back to Hulu within 30s = instant).
-- `preWarmCount` (uint32, default 0): auto pre-warming. When >0, the pool tracks which destinations are frequently accessed and pre-establishes TCP connections for the top N every 60s. When you switch to a frequently-used site, the TCP connection is already open — zero handshake latency. No manual domain list needed.
+- `preWarmFirstN` (uint32, default 0): first-N learning. When >0, the pool learns the critical-path IPs — the first N IPs the browser hits on each visit. After `preWarmLearnVisits` (default 3) visits, the pattern stabilizes and those specific IPs are pre-warmed every 60s. Domains that share an IP (e.g., `hulu.com` and `asset.hulu.com` resolving to the same CDN IP) are automatically deduplicated — one warm connection serves all of them. More efficient than `preWarmCount`: targets page-load IPs, not analytics/tracking. Recommended: `5`.
+- `preWarmLearnVisits` (uint32, default 3): how many visits before the first-N pattern stabilizes and pre-warming starts. Lower = faster to start pre-warming, but less stable pattern. Higher = more stable, but slower to learn.
+- `preWarmCount` (uint32, default 0): legacy frequency-based pre-warming. Superseded by `preWarmFirstN`. When >0, pre-warms the top N most-frequently accessed destinations. Less efficient than `preWarmFirstN` because it includes analytics/tracking IPs (which have high frequency but aren't on the critical path).
 
-Safety: destination is NOT modified, DNS is NOT bypassed, one outbound per inbound at a time, graceful fallback if the warm connection is dead.
+Safety: destination is NOT modified, DNS is NOT bypassed, one outbound per inbound at a time, graceful fallback if the warm connection is dead. Domains sharing an IP share a warm connection automatically.
 
 ### `tcpUserTimeout` (recommended: 30000)
 
