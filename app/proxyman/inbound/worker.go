@@ -418,6 +418,25 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         conn, existing := w.getConnection(id)
 
+        // v26.10.43-link (audit C3 from 2-b): re-check under lock that no
+        // other goroutine created a conn with the same id between
+        // tryQUICMigration returning nil and getConnection returning. If
+        // a race occurred (two Initials arriving simultaneously), the
+        // second goroutine would create a duplicate conn. Re-check catches
+        // this: if a conn now exists, discard the duplicate and use the
+        // existing one.
+        if !existing {
+                w.Lock()
+                if existingConn, found := w.activeConn[id]; found && !existingConn.done.Done() {
+                        // Another goroutine won the race. Use their conn.
+                        w.Unlock()
+                        conn = existingConn
+                        existing = true
+                } else {
+                        w.Unlock()
+                }
+        }
+
         // Record DCID and src for new QUIC connections
         if !existing {
                 w.recordDCID(b.Bytes(), id, conn)
@@ -697,6 +716,12 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                 oldSK := oldID.srcKey
                 *oldConn.src = id.src
                 oldConn.updateActivity()
+                // v26.10.43-link (audit H4 from 2-b): update remote
+                // so RemoteAddr() returns the post-migration source.
+                oldConn.remote = &net.UDPAddr{
+                        IP:   id.src.Address.IP(),
+                        Port: int(id.src.Port),
+                }
                 delete(w.activeConn, oldID)
                 w.activeConn[id] = oldConn
                 w.dcidIndex[dk] = id
