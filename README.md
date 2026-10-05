@@ -306,6 +306,9 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.40-link` -- **DNS prefetch + sticky resolver uses xray DNS client**. Two DNS-layer improvements. (1) New config fields `dns.prefetchInterval` (seconds) and `dns.prefetchThreshold` (seconds): a periodic goroutine scans the cache every `prefetchInterval` and refreshes entries whose A or AAAA record expires within `prefetchThreshold`. Combined with `serveStale: true`, the cache is always fresh and the dialer gets consistent IPs per hostname — sticky-IP behavior at the DNS layer without modifying the request path (which broke YouTube in v26.10.37). (2) Replaced 3 `net.DefaultResolver.LookupIPAddr` calls in `udp_sticky.go` with `internet.LookupForIP`. The sticky resolver now honors xray's `dns.servers` config (per-domain routing, `finalQuery`, `timeoutMs`) instead of reading `/etc/resolv.conf` directly. Important for WireGuard + ctrld setups.
 - `v26.10.41-link` -- **cosmetic file-mode fix**. v26.10.18's hotfix commit accidentally changed 1110 file modes from `100644` (regular) to `100755` (executable). Propagated to all subsequent commits and made the GitHub file view confusing. Restored via `git update-index --chmod=-x`. No content change, no binary release. Just a cleaner repo view.
 - `v26.10.42-link` -- **comprehensive audit fixes**. One commit addressing all fork-introduced findings from the deep bug hunt audit. Critical: C1 (UDP pool FD+goroutine leak — `MarkStale()` instead of `dead=true` in `Acquire`/`InvalidateByIP`), C2 (`PooledPacketReader` 8KB truncation — `buf.NewWithSize(65535)` instead of `buf.New()`). High: H1-2b (CID rotation now deletes old `dcidIndex` entries), H2-2b (`clean()`/`removeConn()` scan ALL `dcidIndex` entries), H6-2b (1-RTT fast path records `NEW_CONNECTION_ID`-issued DCIDs — restores CID rotation tracking without re-introducing per-packet overhead), H1-2a (wildcard cache iteratively strips labels for >2-level subdomains), H2-2a (`refreshExact` updates wildcard entry on IP change), H3-2c (multi-IP listen — first IP keeps original tag). Performance: P3 (`sync.Pool` for UDP packet buffers — eliminates ~10-30 MB/s of garbage at 25 kpps). 5 files, 116 insertions, 26 deletions.
+- `v26.10.43-link` -- remaining audit fixes: P5 (`atomic.Int64` for `lastUsed`/`lastReplyTime` — eliminates mutex per reply packet in readLoop), C3 (TOCTOU race re-check after `getConnection`), H4-2b (`udpConn.remote` updated on migration), H5-2b (configurable `DefaultShortHeaderCIDLen`). Completes the audit — zero remaining fork-introduced findings.
+- `v26.10.44-link` -- **TCP warm-pool**. When a TCP connection's inbound side closes but the outbound is still alive, the outbound is placed in a warm pool for reuse by the next inbound to the same destination. Eliminates TCP+TLS handshake for repeated connections. Opt-in via `enableTcpWarmPool: true` + `tcpWarmPoolTimeout: 5`. Safety: destination NOT modified, DNS NOT bypassed, one outbound per inbound, graceful fallback.
+- `v26.10.45-link` -- **auto TCP pre-warming**. New config field `preWarmCount` (uint32, default 0 = disabled). When >0, the warm pool auto-tracks frequently accessed destinations and pre-establishes TCP connections every 60s. When you switch from Hulu to Disney through WG, Disney's TCP connection is already open — no TCP handshake through the tunnel. Saves 200-300ms on first visit to known sites. Resource cost: N idle TCP connections (negligible).
 
 - `v26.10.22-link` -- **SIGHUP hot reload for routing rules**. Send `kill -HUP $(pgrep xray)` (or wire `ExecReload=/bin/kill -HUP $MAINPID` + `systemctl reload xray`) to atomically swap routing rules without killing existing TCP/UDP connections. Existing connections keep flowing through their original outbound handler; only new connections use the updated rules. Inbound/outbound handler changes, DNS, and policy still require a full restart. Also includes the docs fix that corrected the `uplinkOnly: 0` / `downlinkOnly: 0` recommendation to `1800` (0 means "kill immediately" in xray's `ActivityTimer`, not "disable the timer").
 - `v26.10.23-link` -- configurable sticky resolver TTL via `udpConfig.stickyResolverTtl` (seconds, default 300). Lower values detect CDN edge rotation faster but do more DNS queries.
@@ -320,7 +323,7 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.32-link` -- 4 fixes from external code review. **H1**: `strings.HasPrefix("udp", custom.Network)` argument order was backwards (the inverse of intent) — changed to `strings.Contains(custom.Network, "udp")`. **H4 RegisterCID race**: re-check `c.closed.Load()` under `c.mu` before adding to demux, between the closed check and the demux mutation. **S1 sibling invalidation**: `refreshWildcard` now also deletes sibling exact entries pointing at the old wildcard IP (when `r1.googlevideo.com` refreshes, `r2`/`r3` no longer keep the dead IP for 5 min). **L7**: default `level` in `customSockopt` changed from `0x6` (`IPPROTO_TCP`) to `SOL_SOCKET` (correct for UDP).
 - `v26.10.33-link` -- 3 fixes from external code review. **H2 same-src-different-dest**: `tryQUICMigration` was treating two distinct QUIC connections (same source, different destinations) as CID rotation, mixing their state machines and routing replies wrong. Now checks `dcidIndex` to verify the DCID belongs to the same connection before treating as rotation. **H3 removeConn**: documented as a known minor leak (uses the old captured id after re-keying under a new id; `clean()` catches it within 1 minute — the conn is already closed, just a dead map entry). **M3 selectAddr**: was returning `addrs[0]` (wrong family) when `preferIpv4` was set but no IPv4 addresses were available — now returns `nil` so callers can fall back to stale cache.
 
-### Speed Comparison: Upstream xray-core vs This Fork (v26.10.43)
+### Speed Comparison: Upstream xray-core vs This Fork (v26.10.45)
 
 #### QUIC / UDP (the fork's primary optimization target)
 
@@ -349,6 +352,8 @@ The fork doesn't change the TCP data path (bytes are tunneled transparently), bu
 | DNS prefetch | No prefetch — cache entries expire, next request blocks on DNS | **Periodic goroutine refreshes near-expiry entries** | Cache always fresh, zero DNS-lookup stalls |
 | IPv6→IPv4 fallback | No fallback (Happy Eyeballs only catches connect failures) | **Automatic retry on `ENETUNREACH`** | Broken IPv6 gateways don't stall connections |
 | Pipe buffer | 16 KB with `DiscardOverflow` | **256 KB with `DiscardOverflow`** | Absorbs YouTube burst (~213 packets) without dropping |
+| **TCP connection reuse** | 1 outbound per inbound (no reuse) | **Warm pool** — outbound kept alive for `tcpWarmPoolTimeout` (default 5-30s) and reused by next inbound to same dest | Eliminates TCP+TLS handshake for repeated connections |
+| **TCP pre-warming** | None | **Auto pre-warm** — top `preWarmCount` (e.g., 20) frequently accessed destinations get pre-established TCP connections every 60s | First visit to known sites: **2x faster** (no TCP handshake through WG) |
 
 #### Architecture-level differences
 
@@ -361,6 +366,8 @@ The fork doesn't change the TCP data path (bytes are tunneled transparently), bu
 | Multi-IP inbound listen | Single IP per inbound | **Array of IPs, one handler per IP** |
 | Source IP binding (`sendThrough: origin`) | Not supported | **Binds outbound source to inbound listen IP** |
 | SIGHUP hot reload | Full restart required | **Routing rules reloaded atomically** |
+| TCP warm-pool | None | **Outbound TCP connections reused after inbound close** | Eliminates handshake for repeated connections |
+| TCP pre-warming | None | **Auto pre-warm top N destinations** | First visit to known sites: zero TCP handshake |
 | Sniffer features | SNI only | **SNI + ALPN + ECH detection** |
 
 #### WireGuard integration
@@ -387,7 +394,10 @@ The fork doesn't use xray's `wireguard` protocol outbound (userspace `wireguard-
       "enableSocketPool": true,
       "enableStickyResolver": true,
       "preferIpv4": true,
-      "stickyResolverTtl": 60
+      "stickyResolverTtl": 60,
+      "enableTcpWarmPool": true,
+      "tcpWarmPoolTimeout": 30,
+      "preWarmCount": 20
     }
   },
   "streamSettings": {
@@ -483,6 +493,24 @@ Or use the legacy alias (works as of v26.10.37):
   "tcpKeepAlive": 15
 }
 ```
+
+### TCP warm-pool (v26.10.44+) and pre-warming (v26.10.45+)
+
+When a TCP connection's inbound side closes but the outbound is still alive, the outbound is placed in a warm pool for reuse by the next inbound to the same destination. This eliminates the TCP handshake for repeated connections — especially valuable through WireGuard tunnels where each handshake costs 200-600ms.
+
+```json
+"udpConfig": {
+  "enableTcpWarmPool": true,
+  "tcpWarmPoolTimeout": 30,
+  "preWarmCount": 20
+}
+```
+
+- `enableTcpWarmPool` (bool, default false): opt-in. Keep outbound TCP connections warm after the inbound closes.
+- `tcpWarmPoolTimeout` (seconds, default 5): how long to keep warm connections. 30 is recommended for switching between sites (Hulu → Disney → back to Hulu within 30s = instant).
+- `preWarmCount` (uint32, default 0): auto pre-warming. When >0, the pool tracks which destinations are frequently accessed and pre-establishes TCP connections for the top N every 60s. When you switch to a frequently-used site, the TCP connection is already open — zero handshake latency. No manual domain list needed.
+
+Safety: destination is NOT modified, DNS is NOT bypassed, one outbound per inbound at a time, graceful fallback if the warm connection is dead.
 
 ### `tcpUserTimeout` (recommended: 30000)
 
