@@ -67,6 +67,20 @@ message Config {
   bool serveStale = 12;
   uint32 serveExpiredTTL = 13;
 
+  // v26.10.40-link: DNS prefetch. Periodically refresh cache entries
+  // before they expire, so the cached IP is always fresh. Combined with
+  // serveStale, this provides "sticky IP" behavior at the DNS layer
+  // without modifying the freedom outbound's request path (which broke
+  // YouTube in v26.10.37's sticky-TCP experiment).
+  //
+  // prefetchInterval (seconds): how often to scan for near-expiry
+  // entries. Default 60s. 0 disables prefetch.
+  // prefetchThreshold (seconds): how many seconds before expiry to
+  // trigger a refresh. Default 30s. e.g. an entry with TTL=60s will be
+  // refreshed at T+30s.
+  uint32 prefetchInterval = 15;
+  uint32 prefetchThreshold = 16;
+
   QueryStrategy query_strategy = 9;
 
   bool disableFallback = 10;
