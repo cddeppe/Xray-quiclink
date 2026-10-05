@@ -363,6 +363,52 @@ The fork doesn't change the TCP data path (bytes are tunneled transparently), bu
 | SIGHUP hot reload | Full restart required | **Routing rules reloaded atomically** |
 | Sniffer features | SNI only | **SNI + ALPN + ECH detection** |
 
+#### WireGuard integration
+
+The fork doesn't use xray's `wireguard` protocol outbound (userspace `wireguard-go`). Instead, it uses `freedom` outbound with `sockopt.interface` to bind to a kernel-space WireGuard interface. This gives you kernel-accelerated ChaCha20-Poly1305 (SIMD on ARM NEON / x86 AVX2) instead of userspace crypto, plus the UDP socket pool applies to QUIC traffic through the tunnel.
+
+| Feature | Upstream xray-core | This fork | Impact |
+|---------|--------------------|-----------|---------|
+| Regular TCP through WG | ✅ `interface` + `SO_MARK` | ✅ Same | No change — upstream already handles this |
+| Per-session UDP through WG | ✅ `interface` + `SO_MARK` | ✅ Same | No change |
+| **Pooled QUIC through WG** | ❌ No pool = N/A | ✅ Pool sockets honor `SO_BINDTODEVICE` + `SO_MARK` (v26.10.17) | Without this, QUIC through the pool bypassed the WG tunnel entirely |
+| **DNS routing for WG geo-domains** | `net.DefaultResolver` (reads `/etc/resolv.conf`, bypasses xray DNS config) | ✅ `internet.LookupForIP` (honors `dns.servers` domain rules — v26.10.40) | Sticky resolver routes `geosite:amazon` etc. through the correct DNS (e.g. ctrld at `127.0.0.10`) instead of system resolver |
+| **DNS prefetch for WG-routed domains** | None | ✅ `prefetchInterval` + `prefetchThreshold` (v26.10.40) | WG-routed domains stay cached, no DNS-lookup stalls |
+| `customSockopt` on pool sockets | N/A (no pool) | ✅ `SO_RCVBUF`/`SO_SNDBUF` honored (v26.10.27) | Users who tune socket buffers for WG get them on pool sockets too |
+
+**Config pattern for WireGuard + this fork:**
+
+```json
+{
+  "tag": "wireguard-usa",
+  "protocol": "freedom",
+  "settings": {
+    "udpConfig": {
+      "enableSocketPool": true,
+      "enableStickyResolver": true,
+      "preferIpv4": true,
+      "stickyResolverTtl": 60
+    }
+  },
+  "streamSettings": {
+    "sockopt": {
+      "interface": "usa",
+      "domainStrategy": "UseIPv4",
+      "tcpFastOpen": true,
+      "tcpNoDelay": true,
+      "tcpUserTimeout": 30000,
+      "tcpKeepAlive": 15
+    }
+  }
+}
+```
+
+Key points:
+- **`protocol: "freedom"` (not `"wireguard"`):** Uses the kernel WG interface directly (kernel ChaCha20 with SIMD). Userspace `wireguard-go` has no SIMD.
+- **`interface: "usa"`:** Binds all outbound sockets (TCP and UDP pool) to the WG interface via `SO_BINDTODEVICE`. Pool sockets honor this as of v26.10.17.
+- **No `sendThrough` on WG outbounds:** The `interface` binding handles source IP. `sendThrough` would interfere with the pool.
+- **Same `udpConfig` timeouts as the `direct` outbound:** The pool needs the same timeout settings to survive buffering pauses.
+
 ### DNS Prefetch (v26.10.40+)
 
 New config fields on the `dns` block keep the DNS cache always fresh in the background:
