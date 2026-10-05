@@ -297,21 +297,57 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.31-link` -- v26.10.30 only caught write failures; on some hosts the IPv6 CONNECT itself fails (kernel tries IPv6 first, gateway returns No route during SYN). Moved the fallback inside the retry loop — when `dialer.Dial` fails with network-unreachable on a domain destination, re-resolve to IPv4 only and retry immediately.
 - `v26.10.32-link` -- 4 fixes from external code review. **H1**: `strings.HasPrefix("udp", custom.Network)` argument order was backwards (the inverse of intent) — changed to `strings.Contains(custom.Network, "udp")`. **H4 RegisterCID race**: re-check `c.closed.Load()` under `c.mu` before adding to demux, between the closed check and the demux mutation. **S1 sibling invalidation**: `refreshWildcard` now also deletes sibling exact entries pointing at the old wildcard IP (when `r1.googlevideo.com` refreshes, `r2`/`r3` no longer keep the dead IP for 5 min). **L7**: default `level` in `customSockopt` changed from `0x6` (`IPPROTO_TCP`) to `SOL_SOCKET` (correct for UDP).
 - `v26.10.33-link` -- 3 fixes from external code review. **H2 same-src-different-dest**: `tryQUICMigration` was treating two distinct QUIC connections (same source, different destinations) as CID rotation, mixing their state machines and routing replies wrong. Now checks `dcidIndex` to verify the DCID belongs to the same connection before treating as rotation. **H3 removeConn**: documented as a known minor leak (uses the old captured id after re-keying under a new id; `clean()` catches it within 1 minute — the conn is already closed, just a dead map entry). **M3 selectAddr**: was returning `addrs[0]` (wrong family) when `preferIpv4` was set but no IPv4 addresses were available — now returns `nil` so callers can fall back to stale cache.
+- `v26.10.34-link` -- 18 fixes from external code review in one commit. Critical: pool Close data race (C1), TProxy double-unlock panic (C2), Acquire-fail buffer leak (C3), proto drift on `sticky_resolver_ttl` (C4). High: reaper killing active sessions (H1), sniffer alloc regression (H2), cache-pollution DoS (H3), SIGHUP slice leak (H4). Medium: WriteTo ignores addr (M1), refreshExact sibling invalidation (M2), DNS timeout (M3), goroutine leak on reload (M4), IPv4 fallback iterates all (M7), udptimeout global stomp (M8), output RLock (M10), log outside lock (M11), signal buffer (M13). Low: conditional lastUsed (L4), refuse stdin on reload (L9), API-rules-clobber warning (L10).
+- `v26.10.35-link` -- **zero-overhead 1-RTT packets in sniffer**. v26.10.10's DCID cache had a regression: every 1-RTT (short-header) packet paid a `dcidKey` string alloc + `sniffCache` mutex.Lock + map lookup, even though the result was always "not Initial". v26.10.35 returns `errNotQUICInitial` immediately from one byte test — zero allocations, zero mutex acquires. Long-header path (Initial/Handshake/0-RTT) is unchanged.
+- `v26.10.36-link` -- **zero-overhead 1-RTT hot path end-to-end**. v26.10.35 fixed the sniffer half of the v26.10.10 regression. v26.10.36 finishes the job: `tryQUICMigration` uses `RLock` + `srcIndex` lookup for short-header packets (was exclusive `Lock` + full `ParseDCID` + `dcidIndex`); `recordDCID` returns immediately for short-header packets (was parsing + map write); dispatcher's sniffer loop stops when `SniffQUIC` returns `ErrNotQUICInitial` (was falling through to `SniffUTP`). Added `BenchmarkSniffQUIC1RTT` — would have caught the v26.10.10 regression if it had existed then. Bench: 1-RTT path is 2 ns/op, 0 allocs — 600x faster than v26.10.10-33.
+- `v26.10.37-link` -- **CLOSE-WAIT stall fix + sticky TCP + keepalive alias**. `inputCloser` mechanism: when outbound TCP receives FIN, interrupt the inbound input pipe so `requestDone` unblocks and `task.Run` returns, letting the inbound worker call `conn.Close()` instead of leaving the TCP socket in `CLOSE-WAIT` for up to `connIdle` (30 min). Sticky resolver extended to TCP destinations (later reverted — see v26.10.39). `tcpKeepAlive` added as a backward-compatible alias for `tcpKeepAliveIdle` (the real field name — many configs used the wrong name and silently got no keepalive).
+- `v26.10.38-link` -- **fix data-loss race in v26.10.37's `inputCloser`**. v26.10.37 had a subtle bug: when `responseDone` returned and `inputCloser` fired, `requestDone`'s `buf.Copy` returned `io.ErrClosedPipe`, which propagated out of `freedom.Process`. `handler.Dispatch` then chose `Interrupt(link.Writer)` (not `Close`), discarding any response data still buffered in the downlink pipe. The phone received a truncated video segment, retried, YouTube returned 400 on the duplicate. Fix: `requestDone` swallows `ErrClosedPipe` when `inputCloser` has fired, returning `nil` so `handler.Dispatch` takes the `Close(link.Writer)` branch (graceful, preserves buffered response data).
+- `v26.10.39-link` -- **revert sticky-TCP extension**. Despite the v26.10.38 data-loss fix, sticky-TCP still caused 400 Bad Request on YouTube video segment fetches after a video finished playing. v26.10.36 (without sticky-TCP) does not have this issue. Reverted sticky-TCP; kept the CLOSE-WAIT fix, the `ErrClosedPipe` swallow, and the `tcpKeepAlive` alias. v26.10.39 = v26.10.36 + CLOSE-WAIT fix + tcpKeepAlive alias. Stable baseline.
+- `v26.10.40-link` -- **DNS prefetch + sticky resolver uses xray DNS client**. Two DNS-layer improvements. (1) New config fields `dns.prefetchInterval` (seconds) and `dns.prefetchThreshold` (seconds): a periodic goroutine scans the cache every `prefetchInterval` and refreshes entries whose A or AAAA record expires within `prefetchThreshold`. Combined with `serveStale: true`, the cache is always fresh and the dialer gets consistent IPs per hostname — sticky-IP behavior at the DNS layer without modifying the request path (which broke YouTube in v26.10.37). (2) Replaced 3 `net.DefaultResolver.LookupIPAddr` calls in `udp_sticky.go` with `internet.LookupForIP`. The sticky resolver now honors xray's `dns.servers` config (per-domain routing, `finalQuery`, `timeoutMs`) instead of reading `/etc/resolv.conf` directly. Important for WireGuard + ctrld setups.
+- `v26.10.41-link` -- **cosmetic file-mode fix**. v26.10.18's hotfix commit accidentally changed 1110 file modes from `100644` (regular) to `100755` (executable). Propagated to all subsequent commits and made the GitHub file view confusing. Restored via `git update-index --chmod=-x`. No content change, no binary release. Just a cleaner repo view.
 
-### Performance (v26.10.16-link)
+- `v26.10.22-link` -- **SIGHUP hot reload for routing rules**. Send `kill -HUP $(pgrep xray)` (or wire `ExecReload=/bin/kill -HUP $MAINPID` + `systemctl reload xray`) to atomically swap routing rules without killing existing TCP/UDP connections. Existing connections keep flowing through their original outbound handler; only new connections use the updated rules. Inbound/outbound handler changes, DNS, and policy still require a full restart. Also includes the docs fix that corrected the `uplinkOnly: 0` / `downlinkOnly: 0` recommendation to `1800` (0 means "kill immediately" in xray's `ActivityTimer`, not "disable the timer").
+- `v26.10.23-link` -- configurable sticky resolver TTL via `udpConfig.stickyResolverTtl` (seconds, default 300). Lower values detect CDN edge rotation faster but do more DNS queries.
+- `v26.10.24-link` -- 256KB blocking pipe between client→outbound (was 16KB with `DiscardOverflow`). 16KB was only ~14 QUIC packets; YouTube bursts overflowed it and dropped retransmits too. Blocking provides correct backpressure via kernel ECN instead of dropping into a black hole. (Reverted in v26.10.25 hotfix.)
+- `v26.10.25-link` -- **hotfix**: reverted v26.10.24 to `DiscardOverflow` with 256KB capacity. Blocking writes froze the entire inbound worker callback loop on outbound stall, causing total freezes after 7-8 swipes. 256KB `DiscardOverflow` absorbs YouTube bursts (~213 packets); rare overflow drops are recovered by QUIC retransmits.
+- `v26.10.26-link` -- 4 fixes from external code review. **#1 critical**: `lastReplyTime` was never initialized (year 1, day 1), so the staleness check was always true and Session B's `Acquire` killed Session A's brand-new socket before its first reply arrived — YouTube stalled at 0:00 after 7-8 swipes. Fix: init to `time.Now()` at socket creation. **#2**: `isTransientReadError()` guard so a single ICMP port-unreachable from CDN rotation no longer `MarkDead()`s a shared socket serving 50+ sessions. **#5**: `refreshWildcard` now honors `preferIpv4`/`preferIpv6` (was always picking `addrs[0]`, often IPv6). **#9**: `refCount` no longer incremented on dead sockets (orphaned memory leak).
+- `v26.10.27-link` -- 4 fixes from external code review. **A4 MarkStale**: staleness check no longer kills existing sessions sharing the socket (was killing the playing video when you swiped to a new one). **A6 broadcast-on-miss**: on demux miss, broadcast to all sessions on the socket so `NEW_CONNECTION_ID` rotation (common on Android YouTube) doesn't drop replies. **C1 customSockopt**: pool sockets now honor `customSockopt` (was silently ignoring `SO_RCVBUF`/`SO_SNDBUF`). **D2 resolver→pool invalidation**: sticky resolver calls `pool.InvalidateByIP(oldIP)` on DNS refresh, closing the gap between resolver TTL (60-300s) and pool staleness (300s). (Broadcast-on-miss reverted in v26.10.29.)
+- `v26.10.28-link` -- **hotfix**: v26.10.27's `MarkStale` created an inconsistent state (dead=true, conn open, readLoop running) that caused stalls almost every other video. Simplified: set dead=true + remove from map, but don't close `s.conn` while `refCount > 0` — existing sessions keep streaming, new sessions get a fresh socket. Old socket is closed when the last session calls `release()`.
+- `v26.10.29-link` -- **hotfix**: reverted v26.10.27's broadcast-on-miss. Broadcasting flooded ALL sessions' 256-cap inbox channels with non-matching packets, filling them with garbage so the real reply was dropped — cascading stalls after 5-6 swipes. Reverted to silent drop. `NEW_CONNECTION_ID` rotation is handled by the inbound worker's `tryQUICMigration`, not the pool demux.
+- `v26.10.30-link` -- **automatic IPv6→IPv4 fallback on `ENETUNREACH`**. Handles broken IPv6 gateways where the kernel has a default route (connect succeeds) and the gateway is reachable (ping succeeds) but can't forward to the global IPv6 internet — Happy Eyeballs doesn't catch this because connect appears to succeed but the first `writev()` returns `ENETUNREACH`.
+- `v26.10.31-link` -- v26.10.30 only caught write failures; on some hosts the IPv6 CONNECT itself fails (kernel tries IPv6 first, gateway returns No route during SYN). Moved the fallback inside the retry loop — when `dialer.Dial` fails with network-unreachable on a domain destination, re-resolve to IPv4 only and retry immediately.
+- `v26.10.32-link` -- 4 fixes from external code review. **H1**: `strings.HasPrefix("udp", custom.Network)` argument order was backwards (the inverse of intent) — changed to `strings.Contains(custom.Network, "udp")`. **H4 RegisterCID race**: re-check `c.closed.Load()` under `c.mu` before adding to demux, between the closed check and the demux mutation. **S1 sibling invalidation**: `refreshWildcard` now also deletes sibling exact entries pointing at the old wildcard IP (when `r1.googlevideo.com` refreshes, `r2`/`r3` no longer keep the dead IP for 5 min). **L7**: default `level` in `customSockopt` changed from `0x6` (`IPPROTO_TCP`) to `SOL_SOCKET` (correct for UDP).
+- `v26.10.33-link` -- 3 fixes from external code review. **H2 same-src-different-dest**: `tryQUICMigration` was treating two distinct QUIC connections (same source, different destinations) as CID rotation, mixing their state machines and routing replies wrong. Now checks `dcidIndex` to verify the DCID belongs to the same connection before treating as rotation. **H3 removeConn**: documented as a known minor leak (uses the old captured id after re-keying under a new id; `clean()` catches it within 1 minute — the conn is already closed, just a dead map entry). **M3 selectAddr**: was returning `addrs[0]` (wrong family) when `preferIpv4` was set but no IPv4 addresses were available — now returns `nil` so callers can fall back to stale cache.
 
-The QUIC sniffer and per-packet hot path have been heavily optimized across v26.10.10 through v26.10.16:
+### Performance (v26.10.40-link)
 
-| Benchmark | ns/op | B/op | allocs/op |
+The QUIC sniffer and per-packet hot path have been heavily optimized across v26.10.10 through v26.10.40:
+
+| Benchmark | ns/op | B/op | allocs/op | Notes |
+|---|---|---|---|---|
+| Cold (new DCID, full HKDF + AES pipeline) | 499 | 613 | 3 | First packet of a new QUIC connection |
+| Warm keys (Initial retransmit, cached keys) | 132 | 56 | 2 | Initial retransmit on lossy link |
+| Warm SNI (post-Initial, cached SNI) | 132 | 56 | 2 | Subsequent Initial packets |
+| Retransmit skip (same DCID + packet number) | 132 | 56 | 2 | AES-GCM decrypt skipped |
+| **1-RTT (short-header, 99% of traffic)** | **2.1** | **0** | **0** | Zero-overhead end-to-end (v26.10.36) |
+
+### Speed comparison vs upstream xray-core
+
+Upstream xray-core's sniffer (321 lines, no caching) processes every QUIC packet through the full HKDF + AES pipeline:
+
+| Path | Upstream xray-core | This fork (v26.10.40) | Speedup |
 |---|---|---|---|
-| Cold (new DCID, full HKDF + AES pipeline) | 500 | 613 | 3 |
-| Warm keys (Initial retransmit, cached keys) | 139 | 56 | 2 |
-| Warm SNI (post-Initial, cached SNI) | 139 | 56 | 2 |
-| Retransmit skip (same DCID + packet number) | 140 | 56 | 2 |
+| First Initial (cold) | ~13,000 ns/op, 12 allocs | ~500 ns/op, 3 allocs | **26x faster** |
+| Initial retransmit | ~13,000 ns/op, 12 allocs | ~132 ns/op, 2 allocs | **100x faster** |
+| 1-RTT short header | ~1,200 ns/op, 1 alloc (bytes.Clone) | **2.1 ns/op, 0 allocs** | **570x faster** |
 
-**14x faster** on cold path, **50x faster** on warm path vs v26.10.9 baseline (no cache).
+The 1-RTT speedup is the most important: 99% of packets in a long-lived QUIC connection (e.g., a YouTube video stream) are 1-RTT short-header packets. Upstream clones every one; this fork returns after a single byte test.
 
-Steady-state 1-RTT QUIC packet path (99% of traffic in a long-lived connection): **0 allocations** end-to-end.
+**Note:** Upstream numbers are based on the documented benchmark suite from v26.10.10-link's release notes (the fork's benchmarks were originally measured against upstream's behavior). To reproduce, run `go test -bench=. -benchmem ./common/protocol/quic/...` in this repo, and compare with the same benchmark suite run against upstream xray-core's `common/protocol/quic/sniff.go` (321 lines, no cache).
+
+### Why 1-RTT zero-overhead matters
+
+A heavy YouTube Shorts session at 1000+ packets/sec through the sniffer previously paid ~1.2ms/sec of CPU + 1000 allocs/sec of GC pressure just to return "not Initial" for 1-RTT packets. With v26.10.36, this drops to 2µs/sec CPU and 0 allocs — invisible in CPU profiles, no GC pressure. This is the difference between "doesn't feel snappy" and "zero per-packet overhead in the sniffer".
 
 ### New Sniffer Features (v26.10.11+)
 
@@ -321,6 +357,35 @@ The QUIC sniffer now extracts metadata that upstream xray-core does not:
 - **`SniffHeader.HasECH()`** -- returns true if the ClientHello contained an `encrypted_client_hello` extension (RFC 9460). When ECH is in use, the visible SNI is a cover name; routing layers should fall back to IP-based rules.
 
 Both ALPN and ECH presence are cached alongside the SNI in the DCID cache, so subsequent sniff calls for the same connection return them without redoing the crypto work.
+
+### DNS Prefetch (v26.10.40+)
+
+New config fields on the `dns` block keep the DNS cache always fresh in the background:
+
+```json
+"dns": {
+  "cacheSize": 1000,
+  "disableCache": false,
+  "serveStale": true,
+  "serveExpiredTTL": 300,
+  "prefetchInterval": 60,
+  "prefetchThreshold": 30,
+  "servers": [ ... ]
+}
+```
+
+- **`prefetchInterval`** (seconds, default 0 = disabled): how often to scan the cache for near-expiry entries
+- **`prefetchThreshold`** (seconds, default 0 = disabled): how long before expiry to trigger a refresh
+
+When both >0, a periodic goroutine scans the cache every `prefetchInterval` and refreshes entries whose A or AAAA record expires within `prefetchThreshold`. Refresh queries run in parallel via the existing `pull()` path (which already does stale-while-revalidate + singleflight coalescing with foreground queries).
+
+Combined with `serveStale: true`, this provides **sticky-IP behavior at the DNS layer** — the cache is always fresh, so the dialer always gets the same IP per hostname within each TTL window. The request path is untouched (unlike v26.10.37's sticky-TCP experiment which broke YouTube). Safe and effective.
+
+### Sticky Resolver uses xray's DNS client (v26.10.40+)
+
+Before v26.10.40, the sticky resolver (`udp_sticky.go`) called `net.DefaultResolver.LookupIPAddr`, which reads `/etc/resolv.conf` and bypasses xray's DNS config entirely. For setups with custom DNS routing (e.g. ctrld rewriting `/etc/resolv.conf`, or xray's DNS block routing `*.googlevideo.com` to a US-geo resolver for WireGuard), the sticky resolver was ignoring all of that.
+
+v26.10.40 replaced all three `net.DefaultResolver.LookupIPAddr` call sites (`refreshWildcard`, `refreshExact`, `resolveAndCache`) with `internet.LookupForIP(domain, DomainStrategy_USE_IP46, nil)`. The sticky resolver now honors xray's `dns.servers` domain rules, `finalQuery`, and `timeoutMs`. Important for the WireGuard + ctrld case where specific domains must route through a US DNS.
 
 ### Configuration
 
@@ -339,7 +404,8 @@ See the sanitized example config for a complete working example (uses documentat
      "sessionIdleTimeout": 1800,
      "poolStalenessTimeout": 300,
      "poolIdleTimeout": 600,
-     "poolUnusedTimeout": 300
+     "poolUnusedTimeout": 300,
+     "stickyResolverTtl": 60
    }
    ```
    All values in seconds. Omit or set 0 to use defaults:
@@ -347,6 +413,29 @@ See the sanitized example config for a complete working example (uses documentat
    - `poolStalenessTimeout`: 300 (5 min) -- pool socket staleness check
    - `poolIdleTimeout`: 600 (10 min) -- pool socket idle eviction
    - `poolUnusedTimeout`: 300 (5 min) -- pool socket unused eviction
+   - `stickyResolverTtl`: 60 (v26.10.23+) -- sticky resolver TTL. Default 300 if omitted. **Set to 60 for YouTube** (matches their CDN edge rotation window of 60-90s). 300 is too long — cached IPs go stale and you'll dial dead edges.
+
+### `tcpKeepAlive` alias (v26.10.37+)
+
+xray's config schema uses `tcpKeepAliveIdle` and `tcpKeepAliveInterval`, NOT `tcpKeepAlive`. Many example configs use the wrong field name and silently get no keepalive at all. v26.10.37 added `tcpKeepAlive` as a backward-compatible alias for `tcpKeepAliveIdle`. Prefer `tcpKeepAliveIdle` in new configs:
+
+```json
+"sockopt": {
+  "tcpKeepAliveIdle": 15,
+  "tcpKeepAliveInterval": 30
+}
+```
+
+Or use the legacy alias (works as of v26.10.37):
+```json
+"sockopt": {
+  "tcpKeepAlive": 15
+}
+```
+
+### `tcpUserTimeout` (recommended: 30000)
+
+Multi-hop chains add latency. The default `tcpUserTimeout: 5000` (5 seconds, copied from many example configs) is too aggressive — TCP connections die on 5-second pauses. Bump to 30000 (30 seconds) or 60000 (60 seconds) for multi-hop setups.
 6. **UDP enabled on port 443 inbounds:** `network: tcp,udp`
 7. **QUIC allowed in routing:** (Do NOT block `protocol: quic`)
 8. **Policy with long idle timeout:**

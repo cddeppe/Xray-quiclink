@@ -7,6 +7,10 @@
   "dns": {
     "cacheSize": 1000,
     "disableCache": false,
+    "serveStale": true,
+    "serveExpiredTTL": 300,
+    "prefetchInterval": 60,
+    "prefetchThreshold": 30,
     "servers": ["127.0.0.1", "[::1]"]
   },
   "inbounds": [
@@ -24,8 +28,8 @@
         "sockopt": {
           "tcpFastOpen": true,
           "tcpNoDelay": true,
-          "tcpUserTimeout": 5000,
-          "tcpKeepAlive": 60
+          "tcpUserTimeout": 30000,
+          "tcpKeepAlive": 15
         }
       }
     },
@@ -50,8 +54,9 @@
       "streamSettings": {
         "sockopt": {
           "tcpFastOpen": true,
-          "tcpUserTimeout": 5000,
-          "tcpKeepAlive": 60
+          "tcpNoDelay": true,
+          "tcpUserTimeout": 30000,
+          "tcpKeepAlive": 15
         }
       }
     }
@@ -66,15 +71,20 @@
           "domainStrategy": "useip",
           "tcpFastOpen": true,
           "tcpNoDelay": true,
-          "tcpUserTimeout": 5000,
-          "tcpKeepAlive": 60
+          "tcpUserTimeout": 30000,
+          "tcpKeepAlive": 15
         }
       },
       "settings": {
         "udpConfig": {
           "enableSocketPool": true,
           "enableStickyResolver": true,
-          "preferIpv4": true
+          "preferIpv4": true,
+          "sessionIdleTimeout": 1800,
+          "poolStalenessTimeout": 300,
+          "poolIdleTimeout": 600,
+          "poolUnusedTimeout": 300,
+          "stickyResolverTtl": 60
         }
       }
     },
@@ -91,8 +101,8 @@
     "levels": {
       "0": {
         "connIdle": 1800,
-        "uplinkOnly": 30,
-        "downlinkOnly": 30,
+        "uplinkOnly": 1800,
+        "downlinkOnly": 1800,
         "handshake": 4
       }
     }
