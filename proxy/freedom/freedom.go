@@ -269,8 +269,13 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 // v26.10.44-link: TCP warm-pool initialization
                 if config.UdpConfig.GetEnableTcpWarmPool() {
                         warmTimeout := secondsOrDefault(config.UdpConfig.GetTcpWarmPoolTimeout(), 5)
-                        h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout) * time.Second)
-                        errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s)")
+                        preWarmN := int(config.UdpConfig.GetPreWarmCount())
+                        h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, preWarmN)
+                        if preWarmN > 0 {
+                                errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s preWarm=", preWarmN, ")")
+                        } else {
+                                errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s)")
+                        }
                 }
         }
 
@@ -446,10 +451,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // the sticky resolver (if enabled), so the warm pool key matches the
         // actual IP:port the dialer would have used.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
+                // v26.10.45-link: provide the dialer to the warm pool for
+                // pre-warming. Set once — the dialer is the same for all
+                // Process calls on this handler.
+                h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+                        return dialer.Dial(ctx, dest)
+                })
                 if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
-                        // Verify the warm conn is still alive by checking the
-                        // remote address matches. If it's been closed by the
-                        // server, RemoteAddr may return nil or an error.
                         if warmConn.RemoteAddr() != nil {
                                 conn = warmConn
                                 warmAcquired = true

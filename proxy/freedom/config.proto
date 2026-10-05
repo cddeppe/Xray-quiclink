@@ -73,6 +73,11 @@ message UDPConfig {
   // to the same destination (e.g. YouTube segment fetches through WG).
   bool enable_tcp_warm_pool = 10;
   uint32 tcp_warm_pool_timeout = 11;
+  // v26.10.45-link: auto pre-warming. The pool tracks which destinations
+  // are frequently accessed and pre-establishes TCP connections for the
+  // top N, so the first visit to a frequently-used site has zero TCP
+  // handshake latency. 0 disables pre-warming.
+  uint32 pre_warm_count = 12;
 }
 
 message Config {
