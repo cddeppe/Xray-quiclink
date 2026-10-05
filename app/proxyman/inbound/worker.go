@@ -474,9 +474,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
 func (w *udpWorker) removeConn(id connID) {
         w.Lock()
-        if conn, ok := w.activeConn[id]; ok {
-                if conn.dcid != nil {
-                        delete(w.dcidIndex, makeDCIDKey(conn.dcid))
+        if _, ok := w.activeConn[id]; ok {
+                // v26.10.42-link (audit H2 from 2-b): delete ALL dcidIndex
+                // entries pointing to this conn, not just the latest DCID.
+                for dk, dcidConnID := range w.dcidIndex {
+                        if dcidConnID == id {
+                                delete(w.dcidIndex, dk)
+                        }
                 }
                 delete(w.srcIndex, id.srcKey)
                 delete(w.activeConn, id)
@@ -562,6 +566,24 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         // Fall through to slow path (will re-lock).
                 } else if oldID == id {
                         // Same src, same dest → same connection, no migration.
+                        // v26.10.42-link (audit H6 from 2-b): check if the
+                        // packet's DCID differs from conn.dcid. If it does,
+                        // this is a NEW_CONNECTION_ID-issued DCID arriving
+                        // in a 1-RTT short-header packet. Record it so
+                        // future migrations to this DCID are tracked. Without
+                        // this, CID-rotated connections silently lose tracking
+                        // (the new DCID was never in dcidIndex).
+                        if len(packet) > 0 && packet[0]&0x80 == 0 {
+                                // Short header — parse DCID (8-byte default)
+                                if newDcid, _, err := quic.ParseDCID(packet); err == nil && len(newDcid) > 0 {
+                                        newDk := makeDCIDKey(newDcid)
+                                        if _, exists := w.dcidIndex[newDk]; !exists {
+                                                w.dcidIndex[newDk] = oldID
+                                                // Don't overwrite conn.dcid —
+                                                // keep the original for cleanup.
+                                        }
+                                }
+                        }
                         w.Unlock()
                         return nil
                 } else {
@@ -605,6 +627,13 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         // the same src's existing conn. Update.
                                         *oldConn2.src = id.src
                                         oldConn2.updateActivity()
+                                        // v26.10.42-link (audit H1 from 2-b): delete the OLD dcidIndex
+                                        // entry to prevent orphan accumulation. The old DCID is no
+                                        // longer valid for this conn after CID rotation.
+                                        if oldConn2.dcid != nil {
+                                                oldDk := makeDCIDKey(oldConn2.dcid)
+                                                delete(w.dcidIndex, oldDk)
+                                        }
                                         oldConn2.dcid = dcid
                                         delete(w.activeConn, oldID2)
                                         w.activeConn[id] = oldConn2
@@ -749,8 +778,17 @@ func (w *udpWorker) clean() error {
                 if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > udptimeout.SessionIdleSeconds() {
                         if !conn.inactive {
                                 conn.setInactive()
-                                if conn.dcid != nil {
-                                        delete(w.dcidIndex, makeDCIDKey(conn.dcid))
+                                // v26.10.42-link (audit H2 from 2-b): delete ALL
+                                // dcidIndex entries pointing to this conn, not just
+                                // the latest DCID. CID rotation may have created
+                                // multiple dcidIndex entries for the same conn.
+                                // The old code only deleted conn.dcid (the latest),
+                                // leaving orphaned entries for rotated-away DCIDs.
+                                connID := addr
+                                for dk, dcidConnID := range w.dcidIndex {
+                                        if dcidConnID == connID {
+                                                delete(w.dcidIndex, dk)
+                                        }
                                 }
                                 delete(w.srcIndex, addr.srcKey)
                                 delete(w.activeConn, addr)

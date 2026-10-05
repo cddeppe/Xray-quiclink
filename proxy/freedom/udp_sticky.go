@@ -123,7 +123,18 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
         }
 
         // Check wildcard match (e.g., *.googlevideo.com)
-        if parent, ok := parentDomain(hostname); ok {
+        // v26.10.42-link (audit H1 from 2-a): iteratively strip labels and
+        // check for a wildcard at each level. The old code only stripped the
+        // first label, so "x.y.googlevideo.com" would look for
+        // "*.y.googlevideo.com" (which doesn't exist) instead of
+        // "*.googlevideo.com". Now we strip until we find a match or run
+        // out of labels.
+        remaining := hostname
+        for {
+                parent, ok := parentDomain(remaining)
+                if !ok {
+                        break
+                }
                 wildcardKey := "*." + parent
                 if entry, ok := s.entries[wildcardKey]; ok {
                         if entry.age() < s.wildcardTTL {
@@ -137,6 +148,7 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
                         errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
                         return staleIP, nil
                 }
+                remaining = parent
         }
         s.mu.RUnlock()
 
@@ -291,6 +303,18 @@ func (s *StickyResolver) refreshExact(hostname string) {
                 for host, entry := range s.entries {
                         if host != hostname && !strings.HasPrefix(host, "*.") && entry.ip.String() == oldIP {
                                 delete(s.entries, host)
+                        }
+                }
+                // v26.10.42-link (audit H2 from 2-a): also update the wildcard
+                // entry if it exists for this hostname's parent domain and still
+                // points at the old IP. Without this, siblings that use the
+                // wildcard cache keep getting the old IP until the wildcard TTL
+                // expires.
+                if parent, ok := parentDomain(hostname); ok {
+                        wildcardKey := "*." + parent
+                        if wcEntry, ok := s.entries[wildcardKey]; ok && wcEntry.ip.String() == oldIP {
+                                wcEntry.ip = ip
+                                wcEntry.lastUsed.Store(time.Now().UnixNano())
                         }
                 }
         }
