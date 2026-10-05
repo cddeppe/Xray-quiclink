@@ -124,9 +124,17 @@ func (c *CacheController) Prefetch() error {
 }
 
 // collectPrefetchCandidates returns the FQDNs of cache entries whose A or
-// AAAA record expires within prefetchThreshold. The caller (Prefetch) does
-// not hold the lock; we take it briefly, snapshot the candidates, then
-// release. Refresh queries run outside the lock.
+// AAAA record expires within prefetchThreshold, OR whose A/AAAA records
+// have been cleaned (set to nil by CacheCleanup) but the entry still
+// exists in the map. This ensures the prefetch goroutine refreshes
+// expired entries before they're fully deleted, keeping the cache warm
+// even during idle periods.
+//
+// v26.10.49-link: previously, entries whose A/AAAA had been set to nil
+// by CacheCleanup were skipped (rec.A != nil check failed). This meant
+// that after sitting idle for >serveExpiredTTL seconds, all *.googlevideo.com
+// entries were cleaned and the wildcard fallback (v26.10.48) had nothing
+// to return. Now the prefetch also refreshes these "zombie" entries.
 func (c *CacheController) collectPrefetchCandidates() []string {
         c.RLock()
         defer c.RUnlock()
@@ -137,6 +145,13 @@ func (c *CacheController) collectPrefetchCandidates() []string {
         out := make([]string, 0, 16)
         for domain, rec := range c.ips {
                 if rec == nil {
+                        continue
+                }
+                // v26.10.49-link: also collect entries whose A/AAAA was
+                // cleaned by CacheCleanup (set to nil) but the entry still
+                // exists. These need refresh before they're fully deleted.
+                if rec.A == nil && rec.AAAA == nil {
+                        out = append(out, domain)
                         continue
                 }
                 if rec.A != nil && rec.A.Expire.Before(threshold) {
