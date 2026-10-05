@@ -78,6 +78,15 @@ message UDPConfig {
   // top N, so the first visit to a frequently-used site has zero TCP
   // handshake latency. 0 disables pre-warming.
   uint32 pre_warm_count = 12;
+  // v26.10.46-link: per-wildcard first-N learning. Smarter than
+  // preWarmCount: learns the critical-path IPs (the first N IPs
+  // the browser hits on each visit) instead of the most-frequent
+  // IPs (which includes analytics/tracking that fire after page load).
+  // After learnVisits visits, the pattern stabilizes and those
+  // specific IPs are pre-warmed every 60s. More efficient: 5 per
+  // site family instead of 20 globally.
+  uint32 pre_warm_first_n = 13;
+  uint32 pre_warm_learn_visits = 14;
 }
 
 message Config {
