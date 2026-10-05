@@ -1,173 +1,209 @@
 package dns
 
 import (
-	"context"
-	go_errors "errors"
-	"time"
+        "context"
+        go_errors "errors"
+        "strings"
+        "time"
 
-	"github.com/xtls/xray-core/common/errors"
-	"github.com/xtls/xray-core/common/log"
-	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/signal/pubsub"
-	"github.com/xtls/xray-core/features/dns"
+        "github.com/xtls/xray-core/common/errors"
+        "github.com/xtls/xray-core/common/log"
+        "github.com/xtls/xray-core/common/net"
+        "github.com/xtls/xray-core/common/signal/pubsub"
+        "github.com/xtls/xray-core/features/dns"
 )
 
 type CachedNameserver interface {
-	getCacheController() *CacheController
+        getCacheController() *CacheController
 
-	sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns.IPOption)
+        sendQuery(ctx context.Context, noResponseErrCh chan<- error, fqdn string, option dns.IPOption)
 }
 
 // queryIP is called from dns.Server->queryIPTimeout
 func queryIP(ctx context.Context, s CachedNameserver, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
-	fqdn := Fqdn(domain)
+        fqdn := Fqdn(domain)
 
-	cache := s.getCacheController()
-	if !cache.disableCache {
-		if rec := cache.findRecords(fqdn); rec != nil {
-			ips, ttl, err := merge(option, rec.A, rec.AAAA)
-			if !go_errors.Is(err, errRecordNotFound) {
-				if ttl > 0 {
-					errors.LogDebugInner(ctx, err, cache.name, " cache HIT ", fqdn, " -> ", ips)
-					log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheHit, Elapsed: 0, Error: err})
-					return ips, uint32(ttl), err
-				}
-				if cache.serveStale && (cache.serveExpiredTTL == 0 || cache.serveExpiredTTL < ttl) {
-					errors.LogDebugInner(ctx, err, cache.name, " cache OPTIMISTE ", fqdn, " -> ", ips)
-					log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheOptimiste, Elapsed: 0, Error: err})
-					go pull(ctx, s, fqdn, option)
-					return ips, 1, err
-				}
-			}
-		}
-	} else {
-		errors.LogDebug(ctx, "DNS cache is disabled. Querying IP for ", fqdn, " at ", cache.name)
-	}
+        cache := s.getCacheController()
+        if !cache.disableCache {
+                if rec := cache.findRecords(fqdn); rec != nil {
+                        ips, ttl, err := merge(option, rec.A, rec.AAAA)
+                        if !go_errors.Is(err, errRecordNotFound) {
+                                if ttl > 0 {
+                                        errors.LogDebugInner(ctx, err, cache.name, " cache HIT ", fqdn, " -> ", ips)
+                                        log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheHit, Elapsed: 0, Error: err})
+                                        return ips, uint32(ttl), err
+                                }
+                                if cache.serveStale && (cache.serveExpiredTTL == 0 || cache.serveExpiredTTL < ttl) {
+                                        errors.LogDebugInner(ctx, err, cache.name, " cache OPTIMISTE ", fqdn, " -> ", ips)
+                                        log.Record(&log.DNSLog{Server: cache.name, Domain: fqdn, Result: ips, Status: log.DNSCacheOptimiste, Elapsed: 0, Error: err})
+                                        go pull(ctx, s, fqdn, option)
+                                        return ips, 1, err
+                                }
+                        }
+                }
+        } else {
+                errors.LogDebug(ctx, "DNS cache is disabled. Querying IP for ", fqdn, " at ", cache.name)
+        }
 
-	return fetch(ctx, s, fqdn, option)
+        ips, ttl, err := fetch(ctx, s, fqdn, option)
+
+        // v26.10.48-link: DNS wildcard fallback. When DNS resolution
+        // fails (SERVFAIL, NXDOMAIN, timeout, etc.), check if any
+        // sibling hostname (same parent domain) has a cached IP.
+        // If so, return that IP so the video can play immediately
+        // instead of buffering for 30-45 seconds until DNS recovers.
+        //
+        // This is safe: the IP comes from the same CDN (same parent
+        // domain), so it serves the same content. The dialer dials
+        // the returned IP normally. The TLS SNI flows through from
+        // the browser. No destination modification.
+        //
+        // Only trigger for SERVFAIL (rcode 2) and timeouts — not
+        // NXDOMAIN (rcode 3). NXDOMAIN means the domain genuinely
+        // doesn't exist; a sibling IP would be wrong. SERVFAIL means
+        // the DNS server couldn't resolve it (transient failure, new
+        // hostname, upstream unreachable) — a sibling IP from the
+        // same CDN is a valid fallback.
+        if err != nil && !cache.disableCache {
+                errStr := err.Error()
+                shouldFallback := strings.Contains(errStr, "rcode: 2") || // SERVFAIL
+                        strings.Contains(errStr, "record not found") || // cache miss + DNS fail
+                        strings.Contains(errStr, "timeout") ||
+                        strings.Contains(errStr, "context deadline exceeded") ||
+                        strings.Contains(errStr, "no response")
+                if shouldFallback {
+                        if fallbackIPs := cache.findWildcardFallback(fqdn); len(fallbackIPs) > 0 {
+                                errors.LogInfo(ctx, "dns: wildcard fallback for ", fqdn, " -> ", fallbackIPs, " (DNS failed: ", err, ")")
+                                // Return with a short TTL so the next request retries DNS
+                                return fallbackIPs, 30, nil
+                        }
+                }
+        }
+
+        return ips, ttl, err
 }
 
 func pull(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) {
-	nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
-	defer cancel()
+        nctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+        defer cancel()
 
-	fetch(nctx, s, fqdn, option)
+        fetch(nctx, s, fqdn, option)
 }
 
 func fetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) ([]net.IP, uint32, error) {
-	key := fqdn
-	switch {
-	case option.IPv4Enable && option.IPv6Enable:
-		key = key + "46"
-	case option.IPv4Enable:
-		key = key + "4"
-	case option.IPv6Enable:
-		key = key + "6"
-	}
+        key := fqdn
+        switch {
+        case option.IPv4Enable && option.IPv6Enable:
+                key = key + "46"
+        case option.IPv4Enable:
+                key = key + "4"
+        case option.IPv6Enable:
+                key = key + "6"
+        }
 
-	v, _, _ := s.getCacheController().requestGroup.Do(key, func() (any, error) {
-		return doFetch(ctx, s, fqdn, option), nil
-	})
-	ret := v.(result)
+        v, _, _ := s.getCacheController().requestGroup.Do(key, func() (any, error) {
+                return doFetch(ctx, s, fqdn, option), nil
+        })
+        ret := v.(result)
 
-	return ret.ips, ret.ttl, ret.error
+        return ret.ips, ret.ttl, ret.error
 }
 
 type result struct {
-	ips []net.IP
-	ttl uint32
-	error
+        ips []net.IP
+        ttl uint32
+        error
 }
 
 func doFetch(ctx context.Context, s CachedNameserver, fqdn string, option dns.IPOption) result {
-	sub4, sub6 := s.getCacheController().registerSubscribers(fqdn, option)
-	defer closeSubscribers(sub4, sub6)
+        sub4, sub6 := s.getCacheController().registerSubscribers(fqdn, option)
+        defer closeSubscribers(sub4, sub6)
 
-	noResponseErrCh := make(chan error, 2)
-	onEvent := func(sub *pubsub.Subscriber) (*IPRecord, error) {
-		if sub == nil {
-			return nil, nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case err := <-noResponseErrCh:
-			return nil, err
-		case msg := <-sub.Wait():
-			sub.Close()
-			return msg.(*IPRecord), nil // should panic
-		}
-	}
+        noResponseErrCh := make(chan error, 2)
+        onEvent := func(sub *pubsub.Subscriber) (*IPRecord, error) {
+                if sub == nil {
+                        return nil, nil
+                }
+                select {
+                case <-ctx.Done():
+                        return nil, ctx.Err()
+                case err := <-noResponseErrCh:
+                        return nil, err
+                case msg := <-sub.Wait():
+                        sub.Close()
+                        return msg.(*IPRecord), nil // should panic
+                }
+        }
 
-	start := time.Now()
-	s.sendQuery(ctx, noResponseErrCh, fqdn, option)
+        start := time.Now()
+        s.sendQuery(ctx, noResponseErrCh, fqdn, option)
 
-	rec4, err4 := onEvent(sub4)
-	rec6, err6 := onEvent(sub6)
+        rec4, err4 := onEvent(sub4)
+        rec6, err6 := onEvent(sub6)
 
-	var errs []error
-	if err4 != nil {
-		errs = append(errs, err4)
-	}
-	if err6 != nil {
-		errs = append(errs, err6)
-	}
+        var errs []error
+        if err4 != nil {
+                errs = append(errs, err4)
+        }
+        if err6 != nil {
+                errs = append(errs, err6)
+        }
 
-	ips, ttl, err := merge(option, rec4, rec6, errs...)
-	var rTTL uint32
-	if ttl > 0 {
-		rTTL = uint32(ttl)
-	} else if ttl == 0 && go_errors.Is(err, errRecordNotFound) {
-		rTTL = 0
-	} else { // edge case: where a fast rep's ttl expires during the rtt of a slower, parallel query
-		rTTL = 1
-	}
+        ips, ttl, err := merge(option, rec4, rec6, errs...)
+        var rTTL uint32
+        if ttl > 0 {
+                rTTL = uint32(ttl)
+        } else if ttl == 0 && go_errors.Is(err, errRecordNotFound) {
+                rTTL = 0
+        } else { // edge case: where a fast rep's ttl expires during the rtt of a slower, parallel query
+                rTTL = 1
+        }
 
-	log.Record(&log.DNSLog{Server: s.getCacheController().name, Domain: fqdn, Result: ips, Status: log.DNSQueried, Elapsed: time.Since(start), Error: err})
-	return result{ips, rTTL, err}
+        log.Record(&log.DNSLog{Server: s.getCacheController().name, Domain: fqdn, Result: ips, Status: log.DNSQueried, Elapsed: time.Since(start), Error: err})
+        return result{ips, rTTL, err}
 }
 
 func merge(option dns.IPOption, rec4 *IPRecord, rec6 *IPRecord, errs ...error) ([]net.IP, int32, error) {
-	var allIPs []net.IP
-	var rTTL int32 = dns.DefaultTTL
+        var allIPs []net.IP
+        var rTTL int32 = dns.DefaultTTL
 
-	mergeReq := option.IPv4Enable && option.IPv6Enable
+        mergeReq := option.IPv4Enable && option.IPv6Enable
 
-	if option.IPv4Enable {
-		ips, ttl, err := rec4.getIPs() // it's safe
-		if !mergeReq || go_errors.Is(err, errRecordNotFound) {
-			return ips, ttl, err
-		}
-		if ttl < rTTL {
-			rTTL = ttl
-		}
-		if len(ips) > 0 {
-			allIPs = append(allIPs, ips...)
-		} else {
-			errs = append(errs, err)
-		}
-	}
+        if option.IPv4Enable {
+                ips, ttl, err := rec4.getIPs() // it's safe
+                if !mergeReq || go_errors.Is(err, errRecordNotFound) {
+                        return ips, ttl, err
+                }
+                if ttl < rTTL {
+                        rTTL = ttl
+                }
+                if len(ips) > 0 {
+                        allIPs = append(allIPs, ips...)
+                } else {
+                        errs = append(errs, err)
+                }
+        }
 
-	if option.IPv6Enable {
-		ips, ttl, err := rec6.getIPs() // it's safe
-		if !mergeReq || go_errors.Is(err, errRecordNotFound) {
-			return ips, ttl, err
-		}
-		if ttl < rTTL {
-			rTTL = ttl
-		}
-		if len(ips) > 0 {
-			allIPs = append(allIPs, ips...)
-		} else {
-			errs = append(errs, err)
-		}
-	}
+        if option.IPv6Enable {
+                ips, ttl, err := rec6.getIPs() // it's safe
+                if !mergeReq || go_errors.Is(err, errRecordNotFound) {
+                        return ips, ttl, err
+                }
+                if ttl < rTTL {
+                        rTTL = ttl
+                }
+                if len(ips) > 0 {
+                        allIPs = append(allIPs, ips...)
+                } else {
+                        errs = append(errs, err)
+                }
+        }
 
-	if len(allIPs) > 0 {
-		return allIPs, rTTL, nil
-	}
-	if len(errs) == 2 && go_errors.Is(errs[0], errs[1]) {
-		return nil, rTTL, errs[0]
-	}
-	return nil, rTTL, errors.Combine(errs...)
+        if len(allIPs) > 0 {
+                return allIPs, rTTL, nil
+        }
+        if len(errs) == 2 && go_errors.Is(errs[0], errs[1]) {
+                return nil, rTTL, errs[0]
+        }
+        return nil, rTTL, errors.Combine(errs...)
 }
