@@ -383,16 +383,44 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         input := link.Reader
         output := link.Writer
 
-        // Sticky UDP DNS: if enabled and destination is a domain, pre-resolve to
-        // a consistent IP for this hostname. This prevents IPv4/IPv6 flipping
-        // across flows to the same hostname, which can cause destination servers
-        // (e.g., YouTube CDN) to reject requests due to source IP mismatch in
-        // their validated URLs.
-        if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() && h.stickyResolver != nil {
+        // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
+        // When the remote peer (e.g. YouTube) closes the outbound TCP, we
+        // must close the inbound input pipe too — otherwise requestDone's
+        // buf.Copy(input, writer) waits forever for an EOF that never comes,
+        // the inbound TCP socket sits in CLOSE-WAIT for up to connIdle (30 min),
+        // and the phone's HTTP/2 pool keeps trying to use the dead connection,
+        // causing "every 20th swipe" stalls on YouTube Shorts.
+        //
+        // OnSuccess(responseDone, task.Close(output)) already closes the
+        // inbound pipe's writer (so the phone eventually gets EOF on its
+        // response side), but the reader side (input) is what requestDone
+        // blocks on. We close input here so requestDone also unblocks and
+        // task.Run returns, which then lets the inbound worker call
+        // conn.Close() and tear down the TCP socket cleanly.
+        inputCloser := make(chan struct{})
+        go func() {
+                <-inputCloser
+                common.Interrupt(input)
+        }()
+
+        // Sticky DNS pre-resolution: if enabled and destination is a domain,
+        // pre-resolve to a consistent IP for this hostname. This prevents
+        // IPv4/IPv6 flipping across flows to the same hostname, which can
+        // cause destination servers (e.g., YouTube CDN) to reject requests
+        // due to source IP mismatch in their validated URLs.
+        //
+        // v26.10.37-link: extended to TCP (was UDP-only). YouTube on phone
+        // is 99% TCP — keeping the same IP across TCP connections to the
+        // same *.googlevideo.com hostname avoids dead-edge re-dials during
+        // CDN rotation. For UDP, also pre-resolves UDPOverride.
+        if destination.Address.Family().IsDomain() && h.stickyResolver != nil {
                 if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil {
                         destination.Address = stickyIP
-                        if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
-                                UDPOverride.Address = stickyIP
+                        if destination.Network != net.Network_TCP {
+                                // UDP-only: keep UDPOverride in sync.
+                                if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
+                                        UDPOverride.Address = stickyIP
+                                }
                         }
                 } else {
                         errors.LogInfoInner(ctx, err, "sticky: pre-resolve failed, falling back to normal resolution")
@@ -614,6 +642,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+                // v26.10.37-link: signal the inputCloser goroutine to interrupt
+                // the inbound input pipe when responseDone returns — whether
+                // the outbound closed cleanly (EOF) or with an error. This
+                // unblocks requestDone (which is reading from input) so
+                // task.Run returns and the inbound worker can call conn.Close(),
+                // preventing the CLOSE-WAIT accumulation that causes the
+                // "every 20th swipe" YouTube Shorts stall.
+                defer close(inputCloser)
                 if destination.Network == net.Network_TCP && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
                         var writeConn net.Conn
                         var inTimer *signal.ActivityTimer
