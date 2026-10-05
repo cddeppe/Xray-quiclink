@@ -64,6 +64,19 @@ type dcidKey struct {
         len int
 }
 
+// v26.10.42-link (audit P3): pool packet buffers to avoid make([]byte, n) +
+// copy per QUIC reply packet. At 25 kpps this eliminates ~10-30 MB/s of
+// garbage on the UDP demux hot path.
+var packetPool = sync.Pool{
+        New: func() any {
+                b := make([]byte, 65535)
+                return &b
+        },
+}
+
+func getPacket() []byte  { return *packetPool.Get().(*[]byte) }
+func putPacket(b []byte) { packetPool.Put(&b) }
+
 func makeDCIDKey(dcid []byte) dcidKey {
         var k dcidKey
         k.len = len(dcid)
@@ -200,11 +213,10 @@ func (p *UDPSocketPool) InvalidateByIP(ip string) {
         p.mu.Lock()
         for key, sock := range p.sockets {
                 if strings.HasPrefix(key, ip+":") || strings.HasPrefix(key, "["+ip+"]:") {
-                        // v26.10.28-link: mark dead + remove from map, but
-                        // don't close conn if refCount > 0.
-                        sock.mu.Lock()
-                        sock.dead = true
-                        sock.mu.Unlock()
+                        // v26.10.42-link (audit C1): use MarkStale instead of
+                        // manually setting dead=true. Prevents the FD+goroutine
+                        // leak when refCount reaches 0 after invalidation.
+                        sock.MarkStale()
                         delete(p.sockets, key)
                         xrayerrors.LogInfo(context.Background(), "udp_pool: invalidated socket for ", key, " (IP changed)")
                 }
@@ -233,15 +245,13 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 isStale := time.Since(sock.lastReplyTime) > p.stalenessTimeout
                 sock.mu.Unlock()
                 if isStale {
-                        // v26.10.28-link: mark dead + remove from map, but
-                        // DON'T close s.conn if refCount > 0. New connections
-                        // get a fresh socket. Existing sessions keep their
-                        // socket and readLoop running. The socket is closed
-                        // when the last session calls release() and refCount
-                        // hits 0 (release checks s.dead).
-                        sock.mu.Lock()
-                        sock.dead = true
-                        sock.mu.Unlock()
+                        // v26.10.42-link (audit C1): use MarkStale instead of
+                        // manually setting dead=true. MarkStale closes s.conn
+                        // when refCount==0, preventing the FD+goroutine leak
+                        // that occurred when refCount hit 0 after this point
+                        // (release() checks s.dead but the conn was never
+                        // closed because we bypassed MarkStale's close logic).
+                        sock.MarkStale()
                         delete(p.sockets, key)
                         ok = false
                 } else {
@@ -338,11 +348,14 @@ func (s *pooledSocket) readLoop() {
                         return
                 }
 
-                packet := make([]byte, n)
+                // v26.10.42-link (audit P3): use pooled buffer instead of
+                // make+copy per packet.
+                packet := getPacket()
                 copy(packet, b[:n])
 
-                dcid, _, err := quic.ParseDCID(packet)
+                dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
+                        putPacket(packet)
                         continue
                 }
                 // v26.10.16-link: zero-alloc dcidKey struct instead of
@@ -385,6 +398,7 @@ func (s *pooledSocket) readLoop() {
                         // NEW_CONNECTION_ID reply (rare) or a stray packet
                         // from a different connection sharing the CDN edge.
                         // Dropping is safer than broadcasting.
+                        putPacket(packet)
                         continue
                 }
 
@@ -404,6 +418,9 @@ func (s *pooledSocket) readLoop() {
                 case ch <- readResult{data: packet, addr: addr}:
                 default:
                         s.droppedReplies.Add(1)
+                        // v26.10.42-link (audit P3): return the pooled buffer
+                        // when the inbox is full and we drop the packet.
+                        putPacket(packet)
                 }
         }
 }
@@ -572,6 +589,9 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
                         return 0, nil, io.EOF
                 }
                 n := copy(p, rr.data)
+                // v26.10.42-link (audit P3): return the pooled buffer
+                // after copying the data out.
+                putPacket(rr.data)
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
@@ -744,8 +764,13 @@ func NewPooledPacketReader(conn *pooledConn) *PooledPacketReader {
 }
 
 func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-        b := buf.New()
-        b.Resize(0, buf.Size)
+        // v26.10.42-link (audit C2): use a 64KB buffer to match the readLoop's
+        // 64KB read buffer. The previous buf.New() (8KB cap) silently truncated
+        // GRO-coalesced QUIC packets and coalesced Initial+Handshake+0-RTT
+        // bundles that exceed 8KB, causing the QUIC parser to see malformed
+        // packets and demux replies to sessions that couldn't read them.
+        b := buf.NewWithSize(65535)
+        b.Resize(0, 65535)
 
         n, addr, err := r.conn.ReadFrom(b.Bytes())
         if err != nil {
