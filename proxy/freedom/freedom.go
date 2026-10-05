@@ -634,7 +634,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
 
                 if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-                        return errors.New("failed to process request").Base(err)
+                        // v26.10.38-link: swallow ErrClosedPipe when inputCloser has
+                        // fired (responseDone returned, so YouTube closed the outbound).
+                        // Without this guard, the ErrClosedPipe propagates out of
+                        // freedom.Process, and handler.Dispatch (handler.go:254-258)
+                        // takes the Interrupt(link.Writer) branch instead of
+                        // Close(link.Writer) — Interrupt discards any response data
+                        // still buffered in the downlink pipe (pipe.impl.go:194-200
+                        // does buf.ReleaseMulti(p.data)). The phone then receives a
+                        // truncated video segment, YouTube's player retries the
+                        // request, and YouTube returns 400 on the duplicate. This
+                        // was the actual cause of v26.10.37's YouTube 400s — not
+                        // sticky-TCP.
+                        select {
+                        case <-inputCloser:
+                                return nil // graceful — let Dispatch Close(link.Writer)
+                        default:
+                                return errors.New("failed to process request").Base(err)
+                        }
                 }
 
                 return nil
