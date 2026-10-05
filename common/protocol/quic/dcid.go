@@ -15,6 +15,14 @@ var (
 // MaxCIDLen is the maximum connection ID length per RFC 9000 §17.2.
 const MaxCIDLen = 20
 
+// DefaultShortHeaderCIDLen is the assumed DCID length for short-header
+// (1-RTT) packets. The length is negotiated during the QUIC handshake
+// via transport parameters and is constant for a connection. All major
+// QUIC implementations (Chrome, Firefox, Safari) use 8. If you're using
+// a server with a non-standard CID length, you can override this.
+// v26.10.43-link (audit H5 from 2-b): was hardcoded to 8.
+var DefaultShortHeaderCIDLen = 8
+
 // VersionNegotiation is the reserved version value (0) used by QUIC Version
 // Negotiation packets (RFC 9000 §17.2.1). Those packets have a different
 // header layout (the DCID/SCID are followed by a list of supported versions
@@ -62,7 +70,11 @@ func ParseDCID(packet []byte) ([]byte, bool, error) {
 
 	// Short header: bit 7 = 0, bit 6 = 1 (fixed bit).
 	if firstByte&0x40 != 0 {
-		return parseShortHeaderDCID(packet, 8)
+		// v26.10.43-link (audit H5 from 2-b): use configurable
+		// default CID length. All major QUIC implementations
+		// (Chrome, Firefox, Safari) use 8, but some load
+		// balancers and custom servers use other lengths.
+		return parseShortHeaderDCID(packet, DefaultShortHeaderCIDLen)
 	}
 
 	return nil, false, ErrNotQUIC

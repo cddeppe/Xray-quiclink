@@ -42,8 +42,10 @@ type pooledSocket struct {
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        lastUsed      time.Time
-        lastReplyTime time.Time
+        // v26.10.43-link (audit P5): atomic timestamps to avoid
+        // mutex contention on the readLoop hot path.
+        lastUsed      atomic.Int64 // UnixNano
+        lastReplyTime atomic.Int64  // UnixNano
         demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
         closed        chan struct{}
         closeOnce     sync.Once
@@ -183,8 +185,9 @@ func (p *UDPSocketPool) evictStale() {
         for key, sock := range p.sockets {
                 sock.mu.Lock()
                 isDead := sock.dead
-                isIdle := time.Since(sock.lastReplyTime) > p.idleTimeout && sock.refCount > 0
-                isUnused := time.Since(sock.lastUsed) > p.unusedTimeout && sock.refCount == 0
+                // v26.10.43-link (audit P5): atomic reads for timestamps
+                isIdle := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.idleTimeout && sock.refCount > 0
+                isUnused := time.Since(time.Unix(0, sock.lastUsed.Load())) > p.unusedTimeout && sock.refCount == 0
                 sock.mu.Unlock()
 
                 if isDead || isIdle || isUnused {
@@ -242,7 +245,8 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 // assume the CDN edge rotated and is silently dropping packets.
                 // Mark it dead and force the creation of a fresh socket for this request.
                 sock.mu.Lock()
-                isStale := time.Since(sock.lastReplyTime) > p.stalenessTimeout
+                // v26.10.43-link (audit P5): atomic read
+                isStale := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.stalenessTimeout
                 sock.mu.Unlock()
                 if isStale {
                         // v26.10.42-link (audit C1): use MarkStale instead of
@@ -258,9 +262,13 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         // v26.10.26-link: only increment refCount if the socket
                         // is alive. Previously this ran even after MarkDead+delete,
                         // orphaning the dead socket with refCount > 0.
+                        // v26.10.43-link (audit P5): init atomic timestamps
+                        nowNano := time.Now().UnixNano()
+                        sock.lastUsed.Store(nowNano)
+                        sock.lastReplyTime.Store(nowNano) // v26.10.26: init to now, not zero
                         sock.mu.Lock()
                         sock.refCount++
-                        sock.lastUsed = time.Now()
+                        sock.lastUsed.Store(nowNano)
                         sock.mu.Unlock()
                 }
         }
@@ -281,19 +289,27 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         dest:          dest,
                         demux:         make(map[dcidKey]chan<- readResult),
                         closed:        make(chan struct{}),
-                        lastUsed:      time.Now(),
-                        lastReplyTime: time.Now(), // v26.10.26-link: init to now, not zero — prevents stale check from killing brand-new sockets
+                        lastUsed:      atomic.Int64{},
+                        lastReplyTime: atomic.Int64{},
                 }
 
                 p.mu.Lock()
                 if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
                         pc.Close()
                         sock = existing
+                        // v26.10.43-link (audit P5): init atomic timestamps
+                        nowNano := time.Now().UnixNano()
+                        sock.lastUsed.Store(nowNano)
+                        sock.lastReplyTime.Store(nowNano) // v26.10.26: init to now, not zero
                         sock.mu.Lock()
                         sock.refCount++
                         sock.mu.Unlock()
                 } else {
                         p.sockets[key] = sock
+                        // v26.10.43-link (audit P5): init atomic timestamps
+                        nowNano := time.Now().UnixNano()
+                        sock.lastUsed.Store(nowNano)
+                        sock.lastReplyTime.Store(nowNano) // v26.10.26: init to now, not zero
                         sock.mu.Lock()
                         sock.refCount++
                         sock.mu.Unlock()
@@ -376,10 +392,10 @@ func (s *pooledSocket) readLoop() {
                 // optimization could make these atomic.Int64 fields, but
                 // that requires updating evictStale to read them atomically
                 // too — defer to avoid risk.
-                s.mu.Lock()
-                s.lastUsed = time.Now()
-                s.lastReplyTime = time.Now()
-                s.mu.Unlock()
+                // v26.10.43-link (audit P5): atomic stores, no mutex needed
+                nowNano := time.Now().UnixNano()
+                s.lastUsed.Store(nowNano)
+                s.lastReplyTime.Store(nowNano)
 
                 if !ok {
                         // v26.10.29-link: silent drop on demux miss.
@@ -488,7 +504,7 @@ func (s *pooledSocket) release() {
         if s.refCount > 0 {
                 s.refCount--
         }
-        s.lastUsed = time.Now()
+        s.lastUsed.Store(time.Now().UnixNano())
         // v26.10.28-link: if refCount reaches 0 and the socket was
         // removed from the pool map (staleness or InvalidateByIP),
         // close it now. The socket is not in the map so no new
