@@ -205,6 +205,7 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
                         StickyResolverTtl:    c.UDPConfig.StickyResolverTtl,
                         EnableTcpWarmPool:    c.UDPConfig.EnableTcpWarmPool,
                         TcpWarmPoolTimeout:   c.UDPConfig.TcpWarmPoolTimeout,
+                        PreWarmCount:         c.UDPConfig.PreWarmCount,
                 }
         }
 return config, nil
@@ -317,4 +318,6 @@ type UDPConfig struct {
         // v26.10.44-link: TCP warm-pool
         EnableTcpWarmPool    bool   `json:"enableTcpWarmPool"`
         TcpWarmPoolTimeout   uint32 `json:"tcpWarmPoolTimeout"`
+        // v26.10.45-link: auto pre-warming (top N frequently accessed destinations)
+        PreWarmCount         uint32 `json:"preWarmCount"`
 }
