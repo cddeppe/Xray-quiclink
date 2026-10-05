@@ -403,24 +403,25 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 common.Interrupt(input)
         }()
 
-        // Sticky DNS pre-resolution: if enabled and destination is a domain,
-        // pre-resolve to a consistent IP for this hostname. This prevents
-        // IPv4/IPv6 flipping across flows to the same hostname, which can
-        // cause destination servers (e.g., YouTube CDN) to reject requests
-        // due to source IP mismatch in their validated URLs.
+        // Sticky UDP DNS: if enabled and destination is a domain, pre-resolve to
+        // a consistent IP for this hostname. This prevents IPv4/IPv6 flipping
+        // across flows to the same hostname, which can cause destination servers
+        // (e.g., YouTube CDN) to reject requests due to source IP mismatch in
+        // their validated URLs.
         //
-        // v26.10.37-link: extended to TCP (was UDP-only). YouTube on phone
-        // is 99% TCP — keeping the same IP across TCP connections to the
-        // same *.googlevideo.com hostname avoids dead-edge re-dials during
-        // CDN rotation. For UDP, also pre-resolves UDPOverride.
-        if destination.Address.Family().IsDomain() && h.stickyResolver != nil {
+        // v26.10.39-link: reverted the v26.10.37 extension to TCP. Empirically,
+        // sticky-TCP caused YouTube 400 Bad Request on video segment fetches
+        // after a video finished playing. The v26.10.38 ErrClosedPipe swallow
+        // (which fixed the data-loss race) was not sufficient — there is
+        // another failure path that we could not pinpoint. Reverting to
+        // UDP-only sticky restores v26.10.36's working behavior. The CLOSE-WAIT
+        // fix (inputCloser) and tcpKeepAlive alias are kept; both are
+        // independent of the sticky-TCP change.
+        if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() && h.stickyResolver != nil {
                 if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil {
                         destination.Address = stickyIP
-                        if destination.Network != net.Network_TCP {
-                                // UDP-only: keep UDPOverride in sync.
-                                if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
-                                        UDPOverride.Address = stickyIP
-                                }
+                        if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
+                                UDPOverride.Address = stickyIP
                         }
                 } else {
                         errors.LogInfoInner(ctx, err, "sticky: pre-resolve failed, falling back to normal resolution")
