@@ -111,9 +111,9 @@ type Handler struct {
         usesDialerProxy bool
         socketPool      *UDPSocketPool
         stickyResolver  *StickyResolver
+        // v26.10.44-link: TCP warm-pool for connection reuse.
+        tcpWarmPool     *TCPSocketPool
         // v26.10.17-link: sockopt config from freedom outbound's streamSettings.
-        // Passed to the UDP pool so pool sockets honor SO_BINDTODEVICE + SO_MARK
-        // for WireGuard.
         socketConfig *internet.SocketConfig
 }
 
@@ -223,6 +223,10 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                         h.stickyResolver.Close()
                         h.stickyResolver = nil
                 }
+                if h.tcpWarmPool != nil {
+                        h.tcpWarmPool.Close()
+                        h.tcpWarmPool = nil
+                }
 
                 // v26.10.34-link (M8 fix): gate the global udptimeout mutation
                 // behind EnableSocketPool. Without this, multiple freedom
@@ -260,6 +264,13 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                                 }
                         }
                         errors.LogWarning(context.Background(), "freedom: UDP sticky resolver enabled (TTL=", stickyTtl, "s PreferIPv4:", config.UdpConfig.PreferIpv4, "PreferIPv6:", config.UdpConfig.PreferIpv6, ")")
+                }
+
+                // v26.10.44-link: TCP warm-pool initialization
+                if config.UdpConfig.GetEnableTcpWarmPool() {
+                        warmTimeout := secondsOrDefault(config.UdpConfig.GetTcpWarmPoolTimeout(), 5)
+                        h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout) * time.Second)
+                        errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s)")
                 }
         }
 
@@ -429,6 +440,25 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         var conn stat.Connection
+        var warmAcquired bool // v26.10.44-link: track if conn came from warm pool
+        // v26.10.44-link: try the TCP warm pool before dialing. Only for TCP
+        // destinations. The destination address has already been resolved by
+        // the sticky resolver (if enabled), so the warm pool key matches the
+        // actual IP:port the dialer would have used.
+        if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
+                if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
+                        // Verify the warm conn is still alive by checking the
+                        // remote address matches. If it's been closed by the
+                        // server, RemoteAddr may return nil or an error.
+                        if warmConn.RemoteAddr() != nil {
+                                conn = warmConn
+                                warmAcquired = true
+                                errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        } else {
+                                warmConn.Close()
+                        }
+                }
+        }
         var blockedDest *net.Destination
         var blockedRule *FinalRule
         err := retry.ExponentialBackoff(5, 100).On(func() error {
@@ -478,6 +508,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
 
                 rawConn, err := dialer.Dial(ctx, destination)
+                // v26.10.44-link: if we already have a warm conn, skip the dial.
+                if warmAcquired {
+                        return nil // conn is already set from the warm pool
+                }
                 if err != nil {
                         // v26.10.31-link: if the dial fails with network
                         // unreachable (broken IPv6 — connect or write fails
@@ -505,7 +539,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return err
                 }
 
-                conn = rawConn
+                // v26.10.44-link: only set conn from rawConn if we actually dialed
+                if !warmAcquired {
+                        conn = rawConn
+                }
                 return nil
         })
         if err != nil {
@@ -533,7 +570,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return errors.New("failed to set PROXY protocol v", version).Base(err)
                 }
         }
-        defer conn.Close()
+        // v26.10.44-link: for TCP connections with warm pool enabled, release
+        // to the warm pool instead of closing. The warm pool will close the
+        // conn when it expires (default 5s) or when a new inbound reuses it.
+        // For non-warm-pool paths, close normally.
+        if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
+                defer h.tcpWarmPool.Release(conn, destination)
+        } else {
+                defer conn.Close()
+        }
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
