@@ -42,9 +42,9 @@ For servers with multiple public IPs, the kernel might pick a different source I
 
 2. **`transport/internet/dialer.go`** -- `LookupForIP` now queries both A and AAAA records regardless of `localAddr` family. Previously, when a source IP was set, only the matching family was queried -- so IPv6 source + IPv4-only destination returned empty DNS response and the dial failed. Now the DNS query returns whatever the domain has, and the family-mismatch guard in `resolveSrcAddr` handles the source-binding decision.
 
-3. **`app/proxyman/outbound/handler.go`** -- `isLoopbackDestination` guard prevents `SetOutboundGateway` from being called when the destination is loopback (127.0.0.0/8, ::1, localhost). This prevents EADDRNOTAVAIL when the dokodemo default destination is 127.0.0.1:443 (when SNI sniffing fails and no explicit `address` is set in the inbound).
+3. **`transport/internet/system_dialer.go`** -- `resolveSrcAddr` includes a loopback guard: if the destination is loopback (127.0.0.0/8, ::1), source-IP binding is skipped (returns nil) so the kernel picks a valid source. This prevents `EADDRNOTAVAIL` when the dokodemo default destination is `127.0.0.1:443` (when SNI sniffing fails and no explicit `address` is set in the inbound). Note: this guard currently only covers IP-form destinations, not the `localhost` domain.
 
-4. **`proxy/freedom/freedom.go`** -- **TCP/UDP separation** (v26.10.2). `SetOutboundGateway` is only called for TCP, or for UDP when the socket pool is NOT enabled. When the UDP pool is enabled, `outGateway` stays nil so the pool's wildcard-bound sockets are used for DCID demuxing. This is critical because:
+4. **`proxy/freedom/freedom.go`** -- **TCP/UDP sendThrough separation** (v26.10.2). `SetOutboundGateway` is called unconditionally for both TCP and UDP. For the QUIC pool path (UDP + `enableSocketPool: true`), `outGateway` is cleared to nil after the pool acquires the connection, so the pool's wildcard-bound sockets are used for DCID demuxing. For TCP and non-pooled UDP, `outGateway` is honored (source-IP binding via `sendThrough: origin` applies).
 
    - **TCP**: Each connection is a dedicated stream. Source IP can be bound per-connection via `dialer.LocalAddr`. `sendThrough: origin` works cleanly.
    - **UDP/QUIC**: Multiple QUIC sessions share the same outbound socket in the pool, demuxed by DCID. The pool socket is wildcard-bound -- it can't bind a specific source IP. If `sendThrough` were applied to UDP, the pool would be bypassed, and QUIC packets would fall back to per-session sockets without DCID demuxing. When SNI sniffing fails (200ms timeout), the destination stays at 127.0.0.1:443 (dokodemo default), creating a dial-self loop that freezes YouTube.
@@ -189,7 +189,7 @@ The `listen` field on `InboundDetourConfig` now accepts either a single string (
 }
 ```
 
-Produces two handlers: `in-443#192.0.2.10` and `in-443#2001:db8::10`. Routing rules can target each individually, or use the original tag for the first IP.
+Produces two handlers: `in-443` (the first IP keeps the original tag as of v26.10.42) and `in-443#2001:db8::10` (subsequent IPs get `<tag>#<ip>`). Routing rules can target each individually, or use the original bare tag for the first IP.
 
 #### Deterministic Outbound Source IP (`sendThrough: "origin"`)
 
@@ -305,6 +305,7 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.39-link` -- **revert sticky-TCP extension**. Despite the v26.10.38 data-loss fix, sticky-TCP still caused 400 Bad Request on YouTube video segment fetches after a video finished playing. v26.10.36 (without sticky-TCP) does not have this issue. Reverted sticky-TCP; kept the CLOSE-WAIT fix, the `ErrClosedPipe` swallow, and the `tcpKeepAlive` alias. v26.10.39 = v26.10.36 + CLOSE-WAIT fix + tcpKeepAlive alias. Stable baseline.
 - `v26.10.40-link` -- **DNS prefetch + sticky resolver uses xray DNS client**. Two DNS-layer improvements. (1) New config fields `dns.prefetchInterval` (seconds) and `dns.prefetchThreshold` (seconds): a periodic goroutine scans the cache every `prefetchInterval` and refreshes entries whose A or AAAA record expires within `prefetchThreshold`. Combined with `serveStale: true`, the cache is always fresh and the dialer gets consistent IPs per hostname — sticky-IP behavior at the DNS layer without modifying the request path (which broke YouTube in v26.10.37). (2) Replaced 3 `net.DefaultResolver.LookupIPAddr` calls in `udp_sticky.go` with `internet.LookupForIP`. The sticky resolver now honors xray's `dns.servers` config (per-domain routing, `finalQuery`, `timeoutMs`) instead of reading `/etc/resolv.conf` directly. Important for WireGuard + ctrld setups.
 - `v26.10.41-link` -- **cosmetic file-mode fix**. v26.10.18's hotfix commit accidentally changed 1110 file modes from `100644` (regular) to `100755` (executable). Propagated to all subsequent commits and made the GitHub file view confusing. Restored via `git update-index --chmod=-x`. No content change, no binary release. Just a cleaner repo view.
+- `v26.10.42-link` -- **comprehensive audit fixes**. One commit addressing all fork-introduced findings from the deep bug hunt audit. Critical: C1 (UDP pool FD+goroutine leak — `MarkStale()` instead of `dead=true` in `Acquire`/`InvalidateByIP`), C2 (`PooledPacketReader` 8KB truncation — `buf.NewWithSize(65535)` instead of `buf.New()`). High: H1-2b (CID rotation now deletes old `dcidIndex` entries), H2-2b (`clean()`/`removeConn()` scan ALL `dcidIndex` entries), H6-2b (1-RTT fast path records `NEW_CONNECTION_ID`-issued DCIDs — restores CID rotation tracking without re-introducing per-packet overhead), H1-2a (wildcard cache iteratively strips labels for >2-level subdomains), H2-2a (`refreshExact` updates wildcard entry on IP change), H3-2c (multi-IP listen — first IP keeps original tag). Performance: P3 (`sync.Pool` for UDP packet buffers — eliminates ~10-30 MB/s of garbage at 25 kpps). 5 files, 116 insertions, 26 deletions.
 
 - `v26.10.22-link` -- **SIGHUP hot reload for routing rules**. Send `kill -HUP $(pgrep xray)` (or wire `ExecReload=/bin/kill -HUP $MAINPID` + `systemctl reload xray`) to atomically swap routing rules without killing existing TCP/UDP connections. Existing connections keep flowing through their original outbound handler; only new connections use the updated rules. Inbound/outbound handler changes, DNS, and policy still require a full restart. Also includes the docs fix that corrected the `uplinkOnly: 0` / `downlinkOnly: 0` recommendation to `1800` (0 means "kill immediately" in xray's `ActivityTimer`, not "disable the timer").
 - `v26.10.23-link` -- configurable sticky resolver TTL via `udpConfig.stickyResolverTtl` (seconds, default 300). Lower values detect CDN edge rotation faster but do more DNS queries.
@@ -319,7 +320,7 @@ sudo cp xray /usr/local/bin/xray
 - `v26.10.32-link` -- 4 fixes from external code review. **H1**: `strings.HasPrefix("udp", custom.Network)` argument order was backwards (the inverse of intent) — changed to `strings.Contains(custom.Network, "udp")`. **H4 RegisterCID race**: re-check `c.closed.Load()` under `c.mu` before adding to demux, between the closed check and the demux mutation. **S1 sibling invalidation**: `refreshWildcard` now also deletes sibling exact entries pointing at the old wildcard IP (when `r1.googlevideo.com` refreshes, `r2`/`r3` no longer keep the dead IP for 5 min). **L7**: default `level` in `customSockopt` changed from `0x6` (`IPPROTO_TCP`) to `SOL_SOCKET` (correct for UDP).
 - `v26.10.33-link` -- 3 fixes from external code review. **H2 same-src-different-dest**: `tryQUICMigration` was treating two distinct QUIC connections (same source, different destinations) as CID rotation, mixing their state machines and routing replies wrong. Now checks `dcidIndex` to verify the DCID belongs to the same connection before treating as rotation. **H3 removeConn**: documented as a known minor leak (uses the old captured id after re-keying under a new id; `clean()` catches it within 1 minute — the conn is already closed, just a dead map entry). **M3 selectAddr**: was returning `addrs[0]` (wrong family) when `preferIpv4` was set but no IPv4 addresses were available — now returns `nil` so callers can fall back to stale cache.
 
-### Performance (v26.10.40-link)
+### Performance (v26.10.42-link)
 
 The QUIC sniffer and per-packet hot path have been heavily optimized across v26.10.10 through v26.10.40:
 
@@ -335,7 +336,7 @@ The QUIC sniffer and per-packet hot path have been heavily optimized across v26.
 
 Upstream xray-core's sniffer (321 lines, no caching) processes every QUIC packet through the full HKDF + AES pipeline:
 
-| Path | Upstream xray-core | This fork (v26.10.40) | Speedup |
+| Path | Upstream xray-core | This fork (v26.10.42) | Speedup |
 |---|---|---|---|
 | First Initial (cold) | ~13,000 ns/op, 12 allocs | ~500 ns/op, 3 allocs | **26x faster** |
 | Initial retransmit | ~13,000 ns/op, 12 allocs | ~132 ns/op, 2 allocs | **100x faster** |
