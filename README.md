@@ -469,15 +469,23 @@ See the sanitized example config for a complete working example (uses documentat
      "poolStalenessTimeout": 300,
      "poolIdleTimeout": 600,
      "poolUnusedTimeout": 300,
-     "stickyResolverTtl": 60
+     "stickyResolverTtl": 60,
+     "enableTcpWarmPool": true,
+     "tcpWarmPoolTimeout": 30,
+     "preWarmFirstN": 5,
+     "preWarmLearnVisits": 3
    }
    ```
-   All values in seconds. Omit or set 0 to use defaults:
+   All values in seconds (except booleans and counts). Omit or set 0 to use defaults:
    - `sessionIdleTimeout`: 1800 (30 min) -- UDP session idle timeout
    - `poolStalenessTimeout`: 300 (5 min) -- pool socket staleness check
    - `poolIdleTimeout`: 600 (10 min) -- pool socket idle eviction
    - `poolUnusedTimeout`: 300 (5 min) -- pool socket unused eviction
    - `stickyResolverTtl`: 60 (v26.10.23+) -- sticky resolver TTL. Default 300 if omitted. **Set to 60 for YouTube** (matches their CDN edge rotation window of 60-90s). 300 is too long — cached IPs go stale and you'll dial dead edges.
+   - `enableTcpWarmPool`: true (v26.10.44+) -- TCP warm pool. Keep outbound TCP connections warm after inbound closes.
+   - `tcpWarmPoolTimeout`: 30 (v26.10.44+) -- warm pool timeout in seconds. 30 recommended for switching between sites.
+   - `preWarmFirstN`: 5 (v26.10.46+) -- auto pre-warming. Learns the first N critical-path IPs per site family and pre-establishes TCP connections every 60s. Domains sharing an IP are automatically deduplicated.
+   - `preWarmLearnVisits`: 3 (v26.10.46+) -- how many visits to stabilize the first-N pattern before pre-warming starts.
 
 ### `tcpKeepAlive` alias (v26.10.37+)
 
@@ -505,7 +513,8 @@ When a TCP connection's inbound side closes but the outbound is still alive, the
 "udpConfig": {
   "enableTcpWarmPool": true,
   "tcpWarmPoolTimeout": 30,
-  "preWarmCount": 20
+  "preWarmFirstN": 5,
+  "preWarmLearnVisits": 3
 }
 ```
 
