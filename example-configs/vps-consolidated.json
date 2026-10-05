@@ -87,7 +87,8 @@
           "stickyResolverTtl": 60,
           "enableTcpWarmPool": true,
           "tcpWarmPoolTimeout": 30,
-          "preWarmCount": 20
+          "preWarmFirstN": 5,
+          "preWarmLearnVisits": 3
         }
       }
     },
