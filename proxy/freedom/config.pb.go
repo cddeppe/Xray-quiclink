@@ -438,6 +438,8 @@ type UDPConfig struct {
         PoolIdleTimeout      uint32                 `protobuf:"varint,7,opt,name=pool_idle_timeout,json=poolIdleTimeout,proto3" json:"pool_idle_timeout,omitempty"`
         PoolUnusedTimeout    uint32                 `protobuf:"varint,8,opt,name=pool_unused_timeout,json=poolUnusedTimeout,proto3" json:"pool_unused_timeout,omitempty"`
         StickyResolverTtl    uint32                 `protobuf:"varint,9,opt,name=sticky_resolver_ttl,json=stickyResolverTtl,proto3" json:"sticky_resolver_ttl,omitempty"`
+        EnableTcpWarmPool    bool                   `protobuf:"varint,10,opt,name=enable_tcp_warm_pool,json=enableTcpWarmPool,proto3" json:"enableTcpWarmPool,omitempty"`
+        TcpWarmPoolTimeout   uint32                 `protobuf:"varint,11,opt,name=tcp_warm_pool_timeout,json=tcpWarmPoolTimeout,proto3" json:"tcpWarmPoolTimeout,omitempty"`
         unknownFields        protoimpl.UnknownFields
         sizeCache            protoimpl.SizeCache
 }
@@ -531,6 +533,21 @@ func (x *UDPConfig) GetPoolUnusedTimeout() uint32 {
 func (x *UDPConfig) GetStickyResolverTtl() uint32 {
         if x != nil {
                 return x.StickyResolverTtl
+        }
+        return 0
+}
+
+// v26.10.44-link: TCP warm-pool getters
+func (x *UDPConfig) GetEnableTcpWarmPool() bool {
+        if x != nil {
+                return x.EnableTcpWarmPool
+        }
+        return false
+}
+
+func (x *UDPConfig) GetTcpWarmPoolTimeout() uint32 {
+        if x != nil {
+                return x.TcpWarmPoolTimeout
         }
         return 0
 }

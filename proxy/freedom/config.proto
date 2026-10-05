@@ -65,9 +65,14 @@ message UDPConfig {
   uint32 pool_idle_timeout = 7;
   uint32 pool_unused_timeout = 8;
   // v26.10.34-link (C4 fix): proto binding for stickyResolverTtl JSON field.
-  // Without this, the next protoc regeneration silently drops the field
-  // and users cannot configure the TTL the code reads.
   uint32 sticky_resolver_ttl = 9;
+  // v26.10.44-link: TCP warm-pool. When a TCP connection's inbound
+  // side closes but the outbound is still alive, the outbound is
+  // placed in a warm pool for reuse by the next inbound to the same
+  // destination. Eliminates TCP+TLS handshake for repeated connections
+  // to the same destination (e.g. YouTube segment fetches through WG).
+  bool enable_tcp_warm_pool = 10;
+  uint32 tcp_warm_pool_timeout = 11;
 }
 
 message Config {
