@@ -441,6 +441,8 @@ type UDPConfig struct {
         EnableTcpWarmPool    bool                   `protobuf:"varint,10,opt,name=enable_tcp_warm_pool,json=enableTcpWarmPool,proto3" json:"enableTcpWarmPool,omitempty"`
         TcpWarmPoolTimeout   uint32                 `protobuf:"varint,11,opt,name=tcp_warm_pool_timeout,json=tcpWarmPoolTimeout,proto3" json:"tcpWarmPoolTimeout,omitempty"`
         PreWarmCount         uint32                 `protobuf:"varint,12,opt,name=pre_warm_count,json=preWarmCount,proto3" json:"preWarmCount,omitempty"`
+        PreWarmFirstN        uint32                 `protobuf:"varint,13,opt,name=pre_warm_first_n,json=preWarmFirstN,proto3" json:"preWarmFirstN,omitempty"`
+        PreWarmLearnVisits   uint32                 `protobuf:"varint,14,opt,name=pre_warm_learn_visits,json=preWarmLearnVisits,proto3" json:"preWarmLearnVisits,omitempty"`
         unknownFields        protoimpl.UnknownFields
         sizeCache            protoimpl.SizeCache
 }
@@ -557,6 +559,21 @@ func (x *UDPConfig) GetTcpWarmPoolTimeout() uint32 {
 func (x *UDPConfig) GetPreWarmCount() uint32 {
         if x != nil {
                 return x.PreWarmCount
+        }
+        return 0
+}
+
+// v26.10.46-link: first-N learning getters
+func (x *UDPConfig) GetPreWarmFirstN() uint32 {
+        if x != nil {
+                return x.PreWarmFirstN
+        }
+        return 0
+}
+
+func (x *UDPConfig) GetPreWarmLearnVisits() uint32 {
+        if x != nil {
+                return x.PreWarmLearnVisits
         }
         return 0
 }

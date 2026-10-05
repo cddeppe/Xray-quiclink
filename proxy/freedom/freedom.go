@@ -270,8 +270,15 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 if config.UdpConfig.GetEnableTcpWarmPool() {
                         warmTimeout := secondsOrDefault(config.UdpConfig.GetTcpWarmPoolTimeout(), 5)
                         preWarmN := int(config.UdpConfig.GetPreWarmCount())
-                        h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, preWarmN)
-                        if preWarmN > 0 {
+                        preWarmFirstN := int(config.UdpConfig.GetPreWarmFirstN())
+                        learnVisits := int(config.UdpConfig.GetPreWarmLearnVisits())
+                        if learnVisits == 0 {
+                                learnVisits = 3 // default: 3 visits to stabilize
+                        }
+                        h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, preWarmN, preWarmFirstN, learnVisits)
+                        if preWarmFirstN > 0 {
+                                errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s firstN=", preWarmFirstN, " learnVisits=", learnVisits, ")")
+                        } else if preWarmN > 0 {
                                 errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s preWarm=", preWarmN, ")")
                         } else {
                                 errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s)")
