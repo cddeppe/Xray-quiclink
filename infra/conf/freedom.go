@@ -203,6 +203,8 @@ func (c *FreedomConfig) Build() (proto.Message, error) {
                         PoolIdleTimeout:      c.UDPConfig.PoolIdleTimeout,
                         PoolUnusedTimeout:    c.UDPConfig.PoolUnusedTimeout,
                         StickyResolverTtl:    c.UDPConfig.StickyResolverTtl,
+                        EnableTcpWarmPool:    c.UDPConfig.EnableTcpWarmPool,
+                        TcpWarmPoolTimeout:   c.UDPConfig.TcpWarmPoolTimeout,
                 }
         }
 return config, nil
@@ -312,4 +314,7 @@ type UDPConfig struct {
         PoolIdleTimeout      uint32 `json:"poolIdleTimeout"`
         PoolUnusedTimeout    uint32 `json:"poolUnusedTimeout"`
         StickyResolverTtl    uint32 `json:"stickyResolverTtl"`
+        // v26.10.44-link: TCP warm-pool
+        EnableTcpWarmPool    bool   `json:"enableTcpWarmPool"`
+        TcpWarmPoolTimeout   uint32 `json:"tcpWarmPoolTimeout"`
 }
