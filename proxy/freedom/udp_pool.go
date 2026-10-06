@@ -942,15 +942,18 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 				break
 			}
 			packetEnd = afterToken + pktLenBytes + int(pktLen)
-		} else if packetType == 2 {
-			// Handshake: packet length (varint) after SCID
+		} else if packetType == 1 || packetType == 2 {
+			// 0-RTT (type 1) and Handshake (type 2): packet length (varint) after SCID
+			// v26.11.14-link: 0-RTT has the same format as Handshake.
+			// Previous code only handled type 2, breaking on type 1.
+			// The unparsed 0-RTT data was sent as one huge chunk.
 			pktLen, pktLenBytes, ok := readQUICVarint(remaining[afterScid:])
 			if !ok {
 				break
 			}
 			packetEnd = afterScid + pktLenBytes + int(pktLen)
 		} else {
-			// 0-RTT, Retry, or unknown — can't parse, stop
+			// Retry (type 3) or unknown — can't parse, stop
 			break
 		}
 
