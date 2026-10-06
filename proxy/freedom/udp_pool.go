@@ -406,24 +406,26 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.10.29-link: silent drop on demux miss.
-                        //
-                        // v26.10.27 tried broadcast-on-miss (sending to ALL
-                        // sessions on the socket) but this caused cascading
-                        // stalls — flooding wrong sessions' inbox channels
-                        // with non-matching packets, filling the 256-cap
-                        // channels with garbage so the real reply was dropped.
-                        //
-                        // The silent drop is correct: NEW_CONNECTION_ID
-                        // rotation is handled by the inbound worker's
-                        // tryQUICMigration (source IP:port → connection mapping).
-                        // The pool's demux is only for the reply path. If a
-                        // reply arrives with an unknown DCID, it's either a
-                        // NEW_CONNECTION_ID reply (rare) or a stray packet
-                        // from a different connection sharing the CDN edge.
-                        // Dropping is safer than broadcasting.
-                        putPacket(packet)
-                        continue
+                        // FIX: SCID-based fallback for 0-length SCID clients
+                        // (Chrome/Edge). The server's reply DCID = client's SCID
+                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
+                        // 0-length). But per RFC 9000 §7.3, the server's reply
+                        // SCID = client's Initial DCID, which WAS registered in
+                        // WriteTo. Parse the SCID and try demux[scid] as a
+                        // fallback before dropping.
+                        if n > 0 && packet[0]&0x80 != 0 {
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidKey := makeDCIDKey(scid)
+                                        s.mu.RLock()
+                                        ch, ok = s.demux[scidKey]
+                                        src = s.demuxSource[scidKey]
+                                        s.mu.RUnlock()
+                                }
+                        }
+                        if !ok {
+                                putPacket(packet)
+                                continue
+                        }
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
@@ -594,6 +596,17 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
+                }
+                // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
+                // the server's reply SCID = client's Initial DCID. For
+                // 0-length SCID clients (Chrome/Edge), RegisterCID(scid)
+                // is skipped (len==0), so demux has no entry for the
+                // connection and the server's reply (DCID=∅) is silently
+                // dropped. By registering the DCID, the readLoop's
+                // SCID-based fallback can route the reply by looking up
+                // demux[serverSCID] = demux[clientDCID].
+                if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
+                        c.RegisterCID(dcid)
                 }
         }
 
