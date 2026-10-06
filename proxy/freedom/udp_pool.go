@@ -435,6 +435,12 @@ func (s *pooledSocket) readLoop() {
 			// NEW_CONNECTION_ID reply (rare) or a stray packet
 			// from a different connection sharing the CDN edge.
 			// Dropping is safer than broadcasting.
+			//
+			// v26.11.5-diag: log demux misses at warning level
+			// so we can see when the response is being dropped.
+			// If this fires for every QUIC handshake, the DCID
+			// registration is broken.
+			xrayerrors.LogWarning(context.Background(), "udp_pool: demux miss, dropping reply. dcid_len=", len(dcid), " from=", addr.String())
 			putPacket(packet)
 			continue
 		}
