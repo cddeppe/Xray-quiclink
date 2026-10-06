@@ -2,15 +2,108 @@
 
 A fork of [Xray-core](https://github.com/XTLS/Xray-core) focused on **multi-hop transparent proxying with deterministic source-IP handling**. Originally built to solve QUIC/HTTP3 proxying through a multi-hop chain (Home -> vps1 -> vps2 -> YouTube), now also supports multi-IP inbound listen and outbound source-IP binding.
 
+## Headline feature: QUIC/HTTP3 end-to-end through multi-hop transparent proxy chains
+
+**As of v26.11.0, this fork is the first xray-core fork where QUIC/HTTP3 truly works end-to-end through a multi-hop transparent proxy chain.** Upstream xray-core has a structural bug in `EndpointOverrideWriter` that silently drops every UDP/QUIC response — meaning the QUIC handshake never completes and clients fall back to TCP/HTTP2. This fork fixes that bug (and several others) so QUIC works end-to-end.
+
+### Why upstream xray-core cannot proxy QUIC end-to-end
+
+Upstream xray-core has a **structural type-system bug** in `common/buf/override.go` that makes UDP/QUIC destination override fundamentally broken. The bug has been present since the EndpointOverrideWriter was introduced and has never been fixed upstream.
+
+#### The bug: `EndpointOverrideWriter` compares an IP to a Domain (always false in Go's type system)
+
+When xray sniffs a QUIC packet's SNI (e.g. `youtube.com`) and overrides the destination, the dispatcher sets `ob.Target.Address` to a `domainAddress("youtube.com")`. The handler then creates an `EndpointOverrideWriter` with `w.Dest = ob.Target.Address` (the domain).
+
+When YouTube's server replies, the reply packet's source address is an `ipv4Address` or `ipv6Address` (the server's IP). The `EndpointOverrideWriter.WriteMultiBuffer` is supposed to rewrite this source address back to the original IP the client expected (`w.OriginalDest`):
+
+```go
+// common/buf/override.go (upstream)
+func (w *EndpointOverrideWriter) WriteMultiBuffer(mb MultiBuffer) error {
+    for _, b := range mb {
+        if b.UDP != nil && b.UDP.Address == w.Dest {  // <-- THE BUG
+            b.UDP.Address = w.OriginalDest
+        }
+    }
+    return w.Writer.WriteMultiBuffer(mb)
+}
+```
+
+The comparison `b.UDP.Address == w.Dest` compares an `ipv4Address` (from the server reply) to a `domainAddress` (from SNI sniffing). In Go, interface `==` requires **both the same concrete type AND value**. `ipv4Address` and `domainAddress` are different concrete types, so this comparison is **always false**. The rewrite never fires.
+
+#### Why the handler's pre-resolution doesn't save it
+
+The handler (`app/proxyman/outbound/handler.go:182`) has code that pre-resolves the domain to an IP before creating the EndpointOverrideWriter — which would make `w.Dest` an IP and the comparison would work. But this code is gated by `HasStrategy()`, which returns false for freedom outbounds because `infra/conf/xray.go:411` migrates `TargetStrategy` to `AS_IS` for all freedom outbounds. So the pre-resolution never runs for freedom, and `w.Dest` stays as a domain.
+
+#### The consequence: kernel silently drops QUIC responses
+
+Because the rewrite never fires, the response packet keeps the server's real IP as its source address. In TPROXY mode, the dokodemo inbound's `PacketWriter` creates a `FakeUDP` socket bound to that real IP (using `IP_TRANSPARENT` + `bind`). The response goes back to the client from the server's IP, not from the IP the client originally sent to. The client's QUIC socket was `connect()`ed to the original IP, so the kernel's UDP source-IP mismatch security check silently drops the response.
+
+The QUIC handshake never completes. The client (browser, YouTube app, Cronet) times out QUIC and falls back to TCP/HTTP2. **This is why upstream xray-core cannot proxy QUIC end-to-end through a transparent chain — every QUIC connection silently fails and falls back to TCP.**
+
+#### Why this only affects UDP/QUIC, not TCP
+
+For TCP, the response goes through the TCP stream. The client's TCP connection is to xray (or to the VPS via TPROXY), not to the real server. The client never checks the source IP of TCP packets — TCP is a stream, and the kernel handles source address matching at the connection level (which was already established during the handshake).
+
+For UDP in TPROXY mode, each packet is individually addressed. The kernel checks the source IP of each UDP packet against the `connect()`ed peer. If the source IP doesn't match, the packet is silently dropped. This is a kernel-level security feature that prevents UDP spoofing.
+
+### How this fork fixes it
+
+This fork fixes the bug in three layers (v26.10.74, v26.10.79, v26.11.1, v26.11.2):
+
+#### Fix 1: Unconditional rewrite in `EndpointOverrideWriter` (v26.10.74)
+
+```go
+// common/buf/override.go (this fork)
+func (w *EndpointOverrideWriter) WriteMultiBuffer(mb MultiBuffer) error {
+    for _, b := range mb {
+        if b.UDP != nil {  // <-- unconditional, no broken comparison
+            b.UDP.Address = w.OriginalDest
+        }
+    }
+    return w.Writer.WriteMultiBuffer(mb)
+}
+```
+
+The writer only exists when override happened (the handler only creates it when `ob.OriginalTarget.Address != ob.Target.Address`), so all response packets need their source rewritten to `OriginalDest`. The unconditional rewrite also handles QUIC connection migration, where the server may reply from a different IP than the one freedom originally dialed.
+
+#### Fix 2: `PooledPacketWriter` uses `socket.dest` (v26.10.74)
+
+The QUIC pool's `PooledPacketWriter` was calling `b.UDP.Address.IP()` to build the destination address. After the dispatcher's SNI override and the handler's `EndpointOverrideReader` rewrite, `b.UDP.Address` is the sniffed SNI domain (a `domainAddress`). Calling `IP()` on a `domainAddress` panics (`panic("Calling IP() on a DomainAddress.")`), killing the goroutine without `recover()` and causing Chrome to fall back to HTTP/2.
+
+Fix: always use `socket.dest` — the pool's fixed destination IP that freedom already resolved and dialed. Safer (no panic) and more correct: the pool's DCID-demux model assumes one destination per socket.
+
+#### Fix 3: QUIC DCID as connID dest when `originalDest` is invalid (v26.10.79)
+
+When the inbound's sockopt doesn't have `receiveOriginalDestAddress` (the default for non-TPROXY dokodemo-door), the UDP hub doesn't populate `payload.Target`. The worker callback sees `originalDest.IsValid() == false`, doesn't set `b.UDP` or `id.dest`. The `connID` becomes just `{src, dest=zero}`. **All UDP packets from the same source port map to the same connID**, regardless of which QUIC connection they belong to.
+
+The first QUIC Initial creates a conn for `video1.googlevideo.com`. The second QUIC Initial (different DCID, different video) from the same source port hits the SAME conn — which is already connected to video1. Video2's QUIC handshake fails. The phone falls back to TCP.
+
+Fix: when `originalDest` is invalid AND the packet is a QUIC long header (Initial), parse the DCID and use its first 4 bytes as a synthetic IPv4 address for `id.dest`. Different DCIDs produce different connIDs, so each QUIC connection gets its own conn + goroutine + sniffer + freedom dial.
+
+#### Fix 4: Proactive DNS refresh on stale socket (v26.11.1 + v26.11.2)
+
+When a CDN edge rotates, the old QUIC/TCP connection dies. The sticky resolver still has the OLD IP cached (TTL=60s). The phone retries into a black hole for up to 60 seconds until the TTL expires. The video stalls for ~42 seconds.
+
+Fix: when the pool detects a stale socket (no replies in 30s), it calls `resolver.RefreshByIP(staleIP)` which immediately triggers background DNS refresh for all hostnames pointing at that stale IP. The next request gets the fresh IP immediately. Same fix applied to both UDP (v26.11.1) and TCP (v26.11.2) paths.
+
+### Verification: QUIC is now 100% of video byte traffic
+
+After deploying this fork on a multi-hop chain (phone → vps-3959 → front-hop → AL → YouTube), tcpdump on the final hop shows:
+
+```
+UDP bytes:  98327  (100.0%)
+TCP bytes:  0  (0.0%)
+```
+
+**100% of the actual video byte traffic flows over QUIC.** The TCP connections in the log are only for non-video traffic (page loads, account auth, manifests). Before this fork, 100% of video traffic was TCP because every QUIC connection silently failed.
+
 ## Fork Features
 
-### 1. Transparent QUIC Proxying (since v26.9.9)
+### 1. Transparent QUIC Proxying (since v26.9.9, fully working as of v26.11.0)
 
 Solves how to transparently proxy QUIC/HTTP3 traffic (like YouTube) through a multi-hop chain without client-side certificates, TUN adapters, or DNS-to-VPS forwarding.
 
-Standard xray fails in this scenario because it is a Layer-4 proxy, but QUIC is a Layer-7 protocol with strict connection validation. This fork bridges that gap.
-
-**Four architectural limitations solved:**
+Standard xray fails in this scenario because of the structural `EndpointOverrideWriter` bug described above, plus four architectural limitations:
 
 1. **2-Minute Session Timeout:** xray kills UDP sessions after 2 minutes of inactivity. Video buffering pauses kill the session. **Fix:** Extended to 30 minutes.
 2. **IPv4/IPv6 Flipping:** xray re-resolves DNS per flow, randomly picking IPv4 or IPv6. YouTube validates the source IP and rejects mismatches (400 errors). **Fix:** Sticky resolver with IPv4/IPv6 preference.
