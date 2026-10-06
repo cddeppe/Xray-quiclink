@@ -218,21 +218,6 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-	// v26.11.10-link: truncate coalesced QUIC datagrams to 1250 bytes.
-	// QUIC servers coalesce Initial + Handshake + 0-RTT into one UDP
-	// datagram up to 65535 bytes. The kernel rejects packets larger
-	// than the path MTU (1500) with "sendto: message too long".
-	// Truncating to 1250 bytes sends only the first QUIC packet (the
-	// server's Initial). The browser processes the Initial and
-	// retransmits to get the Handshake. The retransmitted Handshake
-	// arrives as a separate (non-coalesced) UDP datagram.
-	//
-	// This is a hack — the browser loses the coalesced Handshake and
-	// 0-RTT packets. But QUIC's retransmission mechanism recovers them,
-	// and the handshake completes with one extra RTT.
-	if len(buf) > 1250 {
-		buf = buf[:1250]
-	}
 	n, err := c.output(buf)
 	if c.downlink != nil {
 		c.downlink.Add(int64(n))
