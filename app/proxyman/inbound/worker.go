@@ -3,7 +3,6 @@ package inbound
 import (
         "context"
         "encoding/hex"
-        "fmt"
         stdnet "net"
         "sync"
 
@@ -454,21 +453,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
         }
-        // DIAG: log every UDP packet arrival
-        pktBytes := b.Bytes()
-        firstByte := byte(0)
-        if len(pktBytes) > 0 {
-                firstByte = pktBytes[0]
-        }
-        errors.LogWarning(context.Background(), "DIAG 01 callback ENTER: src=", source, " origDestValid=", originalDest.IsValid(), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", firstByte&0x80 != 0, " cone=", w.cone)
         if originalDest.IsValid() {
                 if !w.cone {
                         id.dest = originalDest
                 }
                 b.UDP = &originalDest
-                errors.LogWarning(context.Background(), "DIAG 02 origDest valid, id.dest=", id.dest)
         } else {
-                errors.LogWarning(context.Background(), "DIAG 03 origDest INVALID, synthetic dest block")
                 // v26.10.78-link: when originalDest is invalid (no TPROXY /
                 // receiveOriginalDestAddress in the inbound sockopt), all UDP
                 // packets from the same source port map to the same connID
@@ -498,15 +488,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 // streaming) collapse into one conn and the handshake fails.
                 packetBytes := b.Bytes()
                 if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 {
-                        errors.LogWarning(context.Background(), "DIAG 04 long header, parsing DCID")
                         if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
                                 id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
-                                errors.LogWarning(context.Background(), "DIAG 05 synthetic dest SET dcid=", fmt.Sprintf("%x", dcid[:4]), " dest=", id.dest)
                         } else {
-                                errors.LogWarning(context.Background(), "DIAG 06 DCID parse fail err=", err, " len=", len(dcid))
                         }
                 } else {
-                        errors.LogWarning(context.Background(), "DIAG 07 short header, no synthetic dest")
                 }
         }
         // v26.11.52-link: Solution A — for short headers with no id.dest,
@@ -521,21 +507,16 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // is routed to 127.0.0.1:443 — a packet loop that kills the QUIC
         // connection and forces TCP fallback.
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                errors.LogWarning(context.Background(), "DIAG 08 Solution A short header no dest, srcIndex lookup port=", id.srcKey.port)
                 w.RLock()
                 if existingID, found := w.srcIndex[id.srcKey]; found {
-                        errors.LogWarning(context.Background(), "DIAG 09 srcIndex HIT")
                         if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
                                 w.RUnlock()
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
-                                errors.LogWarning(context.Background(), "DIAG 10 Solution A routed to existing conn RETURN")
                                 return
                         } else {
-                                errors.LogWarning(context.Background(), "DIAG 11 conn not found or done")
                         }
                 } else {
-                        errors.LogWarning(context.Background(), "DIAG 12 srcIndex MISS")
                 }
                 w.RUnlock()
         }
@@ -543,48 +524,35 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         if migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                 migratedConn.updateActivity()
-                errors.LogWarning(context.Background(), "DIAG 13 tryQUICMigration HIT RETURN")
                 return
         }
-        errors.LogWarning(context.Background(), "DIAG 14 tryQUICMigration nil, calling getConnection")
 
         conn, existing := w.getConnection(id)
-        errors.LogWarning(context.Background(), "DIAG 15 getConnection existing=", existing, " dest=", id.dest, " connNil=", conn == nil)
 
-        // v26.10.43-link (audit C3 from 2-b): re-check under lock that no
-        // other goroutine created a conn with the same id between
-        // tryQUICMigration returning nil and getConnection returning. If
-        // a race occurred (two Initials arriving simultaneously), the
-        // second goroutine would create a duplicate conn. Re-check catches
-        // this: if a conn now exists, discard the duplicate and use the
-        // existing one.
-        if !existing {
-                errors.LogWarning(context.Background(), "DIAG 16 !existing re-check under lock")
-                w.Lock()
-                if existingConn, found := w.activeConn[id]; found && !existingConn.done.Done() {
-                        errors.LogWarning(context.Background(), "DIAG 17 race lost using existing")
-                        w.Unlock()
-                        conn = existingConn
-                        existing = true
-                } else {
-                        errors.LogWarning(context.Background(), "DIAG 18 no race proceeding new")
-                        w.Unlock()
-                }
-        } else {
-                errors.LogWarning(context.Background(), "DIAG 19 existing=true write to pipe only")
-        }
+        // v26.11.57-link: REMOVED the C3 race re-check. It was re-added by
+        // v26.11.54's history rewrite but it was already known to be broken
+        // (see v26.10.53-link REVERT). The re-check ALWAYS finds the conn that
+        // getConnection just created (because getConnection stores the new conn
+        // in w.activeConn[id] under the same lock before returning), so it
+        // sets existing=true and SKIPS the goroutine that processes the
+        // connection. The packet sits in the pipe forever — the sniffer never
+        // runs, freedom.Process never runs, the QUIC handshake never completes,
+        // and the browser falls back to TCP. This is the root cause of
+        // "YouTube goes straight to TCP" in v26.11.55/56.
+        //
+        // getConnection already holds w.Lock() during creation, so two
+        // goroutines cannot create duplicate conns — the race is already
+        // prevented. The re-check is unnecessary AND broken.
 
+        // Record DCID and src for new QUIC connections
         if !existing {
-                errors.LogWarning(context.Background(), "DIAG 20 recordDCID + recordSrc")
                 w.recordDCID(b.Bytes(), id, conn)
                 w.recordSrc(id, conn)
         }
 
-        errors.LogWarning(context.Background(), "DIAG 21 WriteMultiBuffer existing=", existing)
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
         if !existing {
-                errors.LogWarning(context.Background(), "DIAG 22 checker.Start + goroutine")
                 common.Must(w.checker.Start())
 
                 go func() {
@@ -616,11 +584,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
-                        errors.LogWarning(ctx, "DIAG 23 goroutine STARTED proxy.Process dest=", id.dest)
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogWarning(ctx, "DIAG 24 goroutine proxy.Process ERROR ", err)
                         } else {
-                                errors.LogWarning(ctx, "DIAG 25 goroutine proxy.Process nil")
                         }
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better

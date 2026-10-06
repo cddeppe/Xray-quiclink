@@ -287,7 +287,6 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
         if !destination.IsValid() {
                 panic("Dispatcher: Invalid destination.")
         }
-        errors.LogWarning(ctx, "DIAG D01 Dispatch ENTER dest=", destination, " network=", destination.Network)
         outbounds := session.OutboundsFromContext(ctx)
         if len(outbounds) == 0 {
                 outbounds = []*session.Outbound{{}}
@@ -305,25 +304,20 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
         sniffingRequest := content.SniffingRequest
         inbound, outbound := d.getLink(ctx)
         if !sniffingRequest.Enabled {
-                errors.LogWarning(ctx, "DIAG D02 sniffing NOT enabled, routedDispatch direct")
                 go d.routedDispatch(ctx, outbound, destination)
         } else {
                 go func() {
-                        errors.LogWarning(ctx, "DIAG D03 sniffing enabled, starting sniffer")
                         cReader := &cachedReader{
                                 reader: outbound.Reader.(*pipe.Reader),
                                 cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange (Initial + a few retransmits)
                         }
                         outbound.Reader = cReader
                         result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-                        errors.LogWarning(ctx, "DIAG D04 sniffer returned err=", err, " hasResult=", result != nil)
                         if err == nil && result != nil {
-                                errors.LogWarning(ctx, "DIAG D05 sniff result protocol=", result.Protocol(), " domain=", result.Domain())
                         }
                         if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
                                 domain := result.Domain()
                                 errors.LogInfo(ctx, "sniffed domain: ", domain)
-                                errors.LogWarning(ctx, "DIAG D06 shouldOverride=true, domain=", domain)
                                 destination.Address = net.ParseAddress(domain)
                                 protocol := result.Protocol()
                                 if resComp, ok := result.(SnifferResultComposite); ok {
@@ -339,9 +333,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
                                         ob.Target = destination
                                 }
                         } else {
-                                errors.LogWarning(ctx, "DIAG D07 shouldOverride=false or err, using original dest=", destination)
                         }
-                        errors.LogWarning(ctx, "DIAG D08 calling routedDispatch dest=", destination)
                         d.routedDispatch(ctx, outbound, destination)
                 }()
         }
@@ -353,7 +345,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !destination.IsValid() {
                 return errors.New("Dispatcher: Invalid destination.")
         }
-        errors.LogWarning(ctx, "DIAG L01 DispatchLink ENTER dest=", destination, " network=", destination.Network)
         outbounds := session.OutboundsFromContext(ctx)
         if len(outbounds) == 0 {
                 outbounds = []*session.Outbound{{}}
@@ -370,10 +361,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         outbound = WrapLink(ctx, d.policy, d.stats, outbound)
         sniffingRequest := content.SniffingRequest
         if !sniffingRequest.Enabled {
-                errors.LogWarning(ctx, "DIAG L02 sniffing NOT enabled, routedDispatch direct")
                 d.routedDispatch(ctx, outbound, destination)
         } else {
-                errors.LogWarning(ctx, "DIAG L03 sniffing enabled, creating cachedReader + calling sniffer SYNCHRONOUSLY")
                 cReader := &cachedReader{
                         reader: outbound.Reader.(buf.TimeoutReader),
                         cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange
@@ -401,9 +390,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 ob.Target = destination
                         }
                 } else {
-                        errors.LogWarning(ctx, "DIAG L04 shouldOverride=false or err, using original dest=", destination)
                 }
-                errors.LogWarning(ctx, "DIAG L05 calling routedDispatch dest=", destination)
                 d.routedDispatch(ctx, outbound, destination)
         }
 
@@ -411,14 +398,12 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
-        errors.LogWarning(ctx, "DIAG S01 sniffer ENTER network=", network, " metadataOnly=", metadataOnly)
         payload := buf.NewWithSize(32767)
         defer payload.Release()
 
         sniffer := NewSniffer(ctx)
 
         metaresult, metadataErr := sniffer.SniffMetadata(ctx)
-        errors.LogWarning(ctx, "DIAG S02 SniffMetadata done metadataErr=", metadataErr)
 
         if metadataOnly {
                 return metaresult, metadataErr
@@ -430,23 +415,18 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                 for {
                         select {
                         case <-ctx.Done():
-                                errors.LogWarning(ctx, "DIAG S03 ctx.Done() in sniffer loop")
                                 return nil, ctx.Err()
                         default:
-                                errors.LogWarning(ctx, "DIAG S04 cReader.Cache call, cacheDeadline=", cacheDeadline, " totalAttempt=", totalAttempt)
                                 cachingStartingTimeStamp := time.Now()
                                 err := cReader.Cache(payload, cacheDeadline)
                                 if err != nil {
-                                        errors.LogWarning(ctx, "DIAG S05 cReader.Cache err=", err)
                                         return nil, err
                                 }
                                 cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
                                 cacheDeadline -= cachingTimeElapsed
 
                                 if !payload.IsEmpty() {
-                                        errors.LogWarning(ctx, "DIAG S06 payload not empty len=", payload.Len(), " calling Sniff")
                                         result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
-                                        errors.LogWarning(ctx, "DIAG S07 Sniff returned err=", err, " hasResult=", result != nil)
                                         switch err {
                                         case common.ErrNoClue:
                                                 totalAttempt++
@@ -455,17 +435,14 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                                                 return result, err
                                         }
                                 } else {
-                                        errors.LogWarning(ctx, "DIAG S08 payload empty, totalAttempt++")
                                         totalAttempt++
                                 }
                                 if totalAttempt >= 2 || cacheDeadline <= 0 {
-                                        errors.LogWarning(ctx, "DIAG S09 sniffing timeout totalAttempt=", totalAttempt, " cacheDeadline=", cacheDeadline)
                                         return nil, errSniffingTimeout
                                 }
                         }
                 }
         }()
-        errors.LogWarning(ctx, "DIAG S10 sniffer func done contentErr=", contentErr)
         if contentErr != nil && metadataErr == nil {
                 return metaresult, nil
         }
@@ -476,7 +453,6 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
-        errors.LogWarning(ctx, "DIAG R01 routedDispatch ENTER dest=", destination, " network=", destination.Network)
         outbounds := session.OutboundsFromContext(ctx)
         ob := outbounds[len(outbounds)-1]
 
@@ -522,7 +498,6 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
         if handler == nil {
                 handler = d.ohm.GetDefaultHandler()
         }
-        errors.LogWarning(ctx, "DIAG R02 handler=", handler != nil, " tag=", func() string { if handler != nil { return handler.Tag() }; return "" }())
 
         if handler == nil {
                 errors.LogInfo(ctx, "default outbound handler not exist")

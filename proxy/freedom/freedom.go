@@ -4,7 +4,6 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
-        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -371,10 +370,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         outbounds := session.OutboundsFromContext(ctx)
         ob := outbounds[len(outbounds)-1]
         if !ob.Target.IsValid() {
-                errors.LogWarning(ctx, "DIAG freedom.Process: target NOT valid, returning error")
                 return errors.New("target not specified.")
         }
-        errors.LogWarning(ctx, "DIAG F01 freedom.Process ENTER dest=", ob.Target, " network=", ob.Target.Network, " socketPool=", h.socketPool != nil)
         ob.Name = "freedom"
         ob.CanSpliceCopy = 1
         inbound := session.InboundFromContext(ctx)
@@ -607,7 +604,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         var pooledConn *pooledConn
         var peekedPackets buf.MultiBuffer
         if destination.Network != net.Network_TCP && h.socketPool != nil {
-                errors.LogWarning(ctx, "DIAG F02 UDP+pool, peeking")
                 mb, peekErr := input.ReadMultiBuffer()
                 if peekErr == nil && len(mb) > 0 {
                         peekedPackets = mb
@@ -616,7 +612,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 firstByte = mb[0].Bytes()[0]
                         }
                         isLong := firstByte&0x80 != 0 && firstByte&0x40 != 0
-                        errors.LogWarning(ctx, "DIAG F03 peek OK firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong, " len=", len(mb[0].Bytes()))
                         if isLong {
                                 remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
@@ -640,18 +635,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                         defer pooledConn.Close()
                                         outGateway = nil
-                                        errors.LogWarning(ctx, "DIAG F04 UDP path=pooled QUIC dest=", destination)
                                 }
                         } else {
-                                errors.LogWarning(ctx, "DIAG F05 UDP path=per-session non-QUIC dest=", destination)
                         }
                 } else {
-                        errors.LogWarning(ctx, "DIAG F06 UDP peek empty err=", peekErr)
                 }
         } else if destination.Network != net.Network_TCP {
-                errors.LogWarning(ctx, "DIAG F07 UDP no pool dest=", destination)
         } else {
-                errors.LogWarning(ctx, "DIAG F08 TCP path dest=", destination)
         }
 
         var newCtx context.Context

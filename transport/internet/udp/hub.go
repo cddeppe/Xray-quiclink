@@ -92,7 +92,6 @@ func (h *Hub) start() {
         c := h.cache
         defer close(c)
 
-        errors.LogInfo(context.Background(), "DIAG udp_hub: start() listening on ", h.conn.LocalAddr().String(), " udpConn=", h.udpConn != nil, " recvOrigDest=", h.recvOrigDest)
 
         oobBytes := make([]byte, 256)
 
