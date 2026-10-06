@@ -604,8 +604,14 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 	// during the handshake. This skips the parse + hex encode +
 	// mutex acquire for 99% of packets in a long-lived QUIC
 	// connection (which are 1-RTT).
+	//
+	// v26.11.7-link: register 0-length SCIDs too. Chrome/Edge send
+	// a 0-length SCID. The server's Initial response uses the
+	// client's SCID as its DCID — also 0-length. If we skip
+	// len(scid) > 0, the 0-length SCID is never registered, and
+	// the server's 0-length DCID response can't be demuxed.
 	if len(b) > 0 && b[0]&0x80 != 0 {
-		if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
+		if scid, _, err := parseQUICSCID(b); err == nil {
 			c.RegisterCID(scid)
 		}
 		// Also register the DCID. The client's Initial has DCID =
@@ -617,7 +623,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 		// Retry packets are silently dropped by readLoop's demux
 		// lookup, and the QUIC handshake never completes — the
 		// browser times out QUIC and falls back to H2/TCP.
-		if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
+		// v26.11.7-link: also register 0-length DCIDs (same fix as SCID)
+		if dcid, _, err := quic.ParseDCID(b); err == nil {
 			c.RegisterCID(dcid)
 		}
 	}
