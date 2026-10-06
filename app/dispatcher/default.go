@@ -345,6 +345,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !destination.IsValid() {
                 return errors.New("Dispatcher: Invalid destination.")
         }
+        // v26.10.75-link: diagnostic — log the destination network type at
+        // dispatcher entry. If this shows "udp:" the inbound correctly
+        // passed UDP. If it shows "tcp:" the inbound converted to TCP.
+        errors.LogWarning(ctx, "dispatcher: DispatchLink entry dest=", destination.String(), " network=", destination.Network)
         outbounds := session.OutboundsFromContext(ctx)
         if len(outbounds) == 0 {
                 outbounds = []*session.Outbound{{}}
