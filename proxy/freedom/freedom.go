@@ -683,7 +683,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        // v26.11.35-link: pass the browser source IP:port to Acquire
+                                        // so the pool can use the source -> SCID cache for the demux fix.
+                                        var sourceUDP *net.UDPAddr
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                            sourceUDP = &net.UDPAddr{IP: inbound.Source.Address.IP(), Port: int(inbound.Source.Port)}
+                                        }
+                                        pooledConn, err = h.socketPool.Acquire(udpRemote, sourceUDP)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
