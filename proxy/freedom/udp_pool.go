@@ -551,12 +551,12 @@ func (s *pooledSocket) readLoop() {
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
                 sentOk := false
-                inboxClosed := false
+                
                 func() {
                         defer func() {
                                 if r := recover(); r != nil {
                                         // Inbox is closed — mark for cleanup.
-                                        inboxClosed = true
+                                        
                                         _ = r
                                 }
                         }()
@@ -578,13 +578,7 @@ func (s *pooledSocket) readLoop() {
                         // freeze all video playback.
                         // Deleting the entry lets the next Initial from the
                         // browser re-register the DCID on a new live inbox.
-                        if inboxClosed {
-                                s.mu.Lock()
-                                if existing, ok := s.demux[dk]; ok && existing == ch {
-                                        delete(s.demux, dk)
-                                }
-                                s.mu.Unlock()
-                        }
+
                 }
         }
 }
@@ -847,50 +841,15 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        // v26.11.34-link: DO NOT remove the DCID from the demux map on Close.
-        //
-        // The previous code (v26.10.15 through v26.11.33) removed the
-        // DCID entries from socket.demux when the pooledConn closed:
-        //
-        //   for dk := range c.scidsDCID {
-        //       if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-        //           delete(c.socket.demux, dk)
-        //       }
-        //   }
-        //
-        // This was the ROOT CAUSE of the persistent demux miss and h2
-        // fallback. Here's why:
-        //
-        // Each UDP packet from the browser triggers a SEPARATE
-        // freedom.Process call, each creating a new pooledConn with its
-        // own inbox. The Initial's pooledConn registers the client's SCID
-        // (= A) as a DCID in the demux map → demux[A] = inbox1. When that
-        // freedom.Process returns (input pipe exhausted, timer fires),
-        // pooledConn1.Close() REMOVES A from the demux map. Subsequent
-        // short-header packets create new pooledConns, but short headers
-        // don't carry the client's SCID (A) — they carry the server's
-        // SCID (B') as their DCID. So A is never re-registered. All server
-        // replies (which use DCID = A, the client's SCID) → demux miss →
-        // dropped → QUIC handshake fails → browser falls back to h2.
-        //
-        // The fix: don't remove from demux on Close. Let the inbox
-        // channel be closed (close(c.done) above). The readLoop's
-        // non-blocking send to a closed inbox will fail — but we need
-        // to handle that gracefully (see readLoop's send logic).
-        //
-        // New pooledConns that register the same DCID will OVERWRITE the
-        // demux entry, pointing it to their own (live) inbox. This is
-        // the correct behavior: the latest pooledConn for a given DCID
-        // should receive the replies.
-        //
-        // Stale demux entries (pointing to closed inboxes) are cleaned
-        // up lazily by the readLoop when a send fails, or by the socket
-        // reaper when the socket is evicted.
-        //
-        // Test: TestDemuxLifecycleWithFix in demux_test.go verifies this.
-        //
-        // scidsDCID is kept for potential future use (introspection)
-        // but is no longer used for demux cleanup.
+                c.mu.Lock()
+        c.socket.mu.Lock()
+        for dk := range c.scidsDCID {
+                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+                        delete(c.socket.demux, dk)
+                }
+        }
+        c.socket.mu.Unlock()
+        c.mu.Unlock()
 
         c.socket.release()
         return nil

@@ -117,13 +117,6 @@ type DefaultDispatcher struct {
         policy policy.Manager
         stats  stats.Manager
         fdns   dns.FakeDNSEngine
-        // v26.11.48-link: source-IP SNI cache for UDP. When sniffing fails
-        // (short header, no SNI), fall back to the last sniffed SNI for
-        // that source IP. Keyed by source IP string (not IP:port) so it
-        // works in multi-hop chains where the upstream hop's per-session
-        // sockets change source ports.
-        udpSNICache   map[string]string
-        udpSNICacheMu sync.RWMutex
 }
 
 func init() {
@@ -147,7 +140,6 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
         d.router = router
         d.policy = pm
         d.stats = sm
-        d.udpSNICache = make(map[string]string)
         return nil
 }
 
@@ -396,30 +388,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 ob.RouteTarget = destination
                         } else {
                                 ob.Target = destination
-                        }
-                        // v26.11.48-link: cache the SNI by source IP for
-                        // UDP short header fallback.
-                        if destination.Network == net.Network_UDP {
-                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                        srcIP := inbound.Source.Address.IP().String()
-                                        d.udpSNICacheMu.Lock()
-                                        d.udpSNICache[srcIP] = domain
-                                        d.udpSNICacheMu.Unlock()
-                                }
-                        }
-                } else if destination.Network == net.Network_UDP {
-                        // v26.11.48-link: sniffing failed (short header).
-                        // Fall back to the last sniffed SNI for this source IP.
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                srcIP := inbound.Source.Address.IP().String()
-                                d.udpSNICacheMu.RLock()
-                                cachedDomain, ok := d.udpSNICache[srcIP]
-                                d.udpSNICacheMu.RUnlock()
-                                if ok {
-                                        errors.LogInfo(ctx, "udp_sni_fallback: using ", cachedDomain, " for ", inbound.Source.String())
-                                        destination.Address = net.ParseAddress(cachedDomain)
-                                        ob.Target = destination
-                                }
                         }
                 }
                 d.routedDispatch(ctx, outbound, destination)
