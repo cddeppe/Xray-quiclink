@@ -2,6 +2,7 @@ package freedom
 
 import (
         "context"
+        "fmt"
         "encoding/binary"
         "errors"
         "io"
@@ -399,14 +400,15 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) (*
                 p.mu.Unlock()
         }
 
-        inbox := make(chan readResult, 256) // v26.10.20-link: was 32, increased to 256 to absorb YouTube reply bursts
+        inbox := make(chan readResult, 256)
         conn := &pooledConn{
                 socket:    sock,
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
-                source:    source, // v26.11.35-link: for source → SCID cache lookup
+                source:    source,
         }
+        xrayerrors.LogWarning(context.Background(), "DIAG: Acquire dest=", dest.String(), " source=", func() string { if source != nil { return source.String() }; return "(nil)" }(), " socket=", fmt.Sprintf("%p", sock), " conn=", fmt.Sprintf("%p", conn))
         return conn, nil
 }
 
@@ -552,13 +554,7 @@ func (s *pooledSocket) readLoop() {
                 // 1. Large channel (256) so drops are rare during bursts
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
-                // v26.11.34-link: the demux entry may point to a closed
-                // inbox (the pooledConn was Close()d but the DCID was left
-                // in the demux map per the v26.11.34 fix). Sending to a
-                // closed channel panics, so we must recover. If the send
-                // panics, the inbox is stale — silently drop the packet
-                // (the latest pooledConn for this DCID will overwrite the
-                // demux entry on its next RegisterCID call).
+                xrayerrors.LogWarning(context.Background(), "DIAG: readLoop demux HIT dcid=", fmt.Sprintf("%x", dcid), " len=", len(dcid), " from=", addr.String())
                 sentOk := false
                 inboxClosed := false
                 func() {
@@ -745,14 +741,17 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // len(scid) > 0, the 0-length SCID is never registered, and
         // the server's 0-length DCID response can't be demuxed.
         if len(b) > 0 && b[0]&0x80 != 0 {
+                xrayerrors.LogWarning(context.Background(), "DIAG: WriteTo LONG conn=", fmt.Sprintf("%p", c), " socket=", fmt.Sprintf("%p", c.socket), " firstByte=", fmt.Sprintf("0x%02x", b[0]))
                 if scid, _, err := parseQUICSCID(b); err == nil {
+                        xrayerrors.LogWarning(context.Background(), "DIAG: WriteTo LONG SCID=", fmt.Sprintf("%x", scid), " len=", len(scid))
                         c.RegisterCID(scid)
                         // v26.11.37-link: learn the short-header DCID length
                         // from the client's SCID. The server's short-header
                         // DCID = client's SCID, so the length must match.
                         // v26.11.38-link: also set for 0-length SCIDs (Chrome/Edge)
                         // — the readLoop needs to parse 0 bytes, not the default 8.
-                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
+                        old := c.socket.shortHeaderCIDLen.Swap(int32(len(scid)))
+                        xrayerrors.LogWarning(context.Background(), "DIAG: shortHeaderCIDLen SET socket=", fmt.Sprintf("%p", c.socket), " old=", old, " new=", len(scid))
                         // v26.11.35-link: cache (source → client SCID A) so that
                         // subsequent short-header packets from the same source can
                         // re-register A on whatever socket they go to (the DNS
@@ -761,7 +760,9 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         if c.source != nil {
                                 c.socket.pool.sourceSCIDCacheMu.Lock()
                                 c.socket.pool.sourceSCIDCache[c.source.String()] = scid
+                                cl := len(c.socket.pool.sourceSCIDCache)
                                 c.socket.pool.sourceSCIDCacheMu.Unlock()
+                                xrayerrors.LogWarning(context.Background(), "DIAG: sourceSCIDCache SET [", c.source.String(), "] = ", fmt.Sprintf("%x", scid), " size=", cl)
                         }
                 }
                 // Also register the DCID. The client's Initial has DCID =
@@ -825,13 +826,16 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 if c.source != nil {
                         c.socket.pool.sourceSCIDCacheMu.RLock()
                         cachedA, ok := c.socket.pool.sourceSCIDCache[c.source.String()]
+                        cl := len(c.socket.pool.sourceSCIDCache)
                         c.socket.pool.sourceSCIDCacheMu.RUnlock()
-                        // v26.11.38-link: accept 0-length cached SCIDs (Chrome/Edge).
-                        // The `ok` check is sufficient — a cached 0-length []byte
-                        // is a valid entry. RegisterCID handles 0-length CIDs (v26.11.7).
                         if ok {
+                                xrayerrors.LogWarning(context.Background(), "DIAG: sourceSCIDCache HIT [", c.source.String(), "] = ", fmt.Sprintf("%x", cachedA), " size=", cl)
                                 c.RegisterCID(cachedA)
+                        } else {
+                                xrayerrors.LogWarning(context.Background(), "DIAG: sourceSCIDCache MISS [", c.source.String(), "] size=", cl)
                         }
+                } else {
+                        xrayerrors.LogWarning(context.Background(), "DIAG: sourceSCIDCache SKIPPED nil source")
                 }
         }
 
@@ -887,6 +891,7 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
+        xrayerrors.LogWarning(context.Background(), "DIAG: Close conn=", fmt.Sprintf("%p", c), " socket=", fmt.Sprintf("%p", c.socket), " scidsDCID=", len(c.scidsDCID))
         // v26.11.34-link: DO NOT remove the DCID from the demux map on Close.
         //
         // The previous code (v26.10.15 through v26.11.33) removed the

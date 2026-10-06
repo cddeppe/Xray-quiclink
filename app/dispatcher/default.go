@@ -444,7 +444,9 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 domain: domain,
                                 exp:    time.Now().Add(d.udpSNICacheTTL),
                                 }
+                                cl := len(d.udpSNICache)
                                 d.udpSNICacheMu.Unlock()
+                                errors.LogInfo(ctx, "DIAG: udp_sni_cache SET src=", inbound.Source.String(), " domain=", domain, " size=", cl)
                         }
                         }
                 } else {
@@ -462,7 +464,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 entry, ok := d.udpSNICache[srcKey]
                                 d.udpSNICacheMu.RUnlock()
                                 if ok && time.Now().Before(entry.exp) {
-                                // Cache hit — reuse the SNI from the Initial.
+                                errors.LogInfo(ctx, "DIAG: udp_sni_cache HIT src=", inbound.Source.String(), " domain=", entry.domain)
                                 destination.Address = net.ParseAddress(entry.domain)
                                 ob.Target = destination
                                 } else if ok {
@@ -483,9 +485,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                         // the connection within ~1 RTT.
                         if destination.Network == net.Network_UDP {
                                 if destination.Address == net.LocalHostIP {
-                                        // SNI cache miss + loopback dest = drop.
-                                        // Release the cached reader's buffer to
-                                        // prevent the packet from being forwarded.
+                                        errors.LogWarning(context.Background(), "DIAG: LOOPBACK DROP src=", func() string { if inbound := session.InboundFromContext(ctx); inbound != nil { return inbound.Source.String() }; return "(unknown)" }())
                                         if cr, ok := outbound.Reader.(*cachedReader); ok {
                                                 buf.ReleaseMulti(cr.cache)
                                                 cr.cache = nil
