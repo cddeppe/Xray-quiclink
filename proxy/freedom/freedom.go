@@ -715,6 +715,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // v26.10.69-link: For UDP, buf.Copy returns when the input
+                // pipe is exhausted (cachedReader EOF). The UDP connection
+                // is still alive — block on inputCloser to keep the session
+                // alive while responseDone reads YouTube's response.
+                if destination.Network != net.Network_TCP {
+                        // Override the DownlinkOnly timer with ConnectionIdle
+                        // so the session stays alive long enough for the
+                        // response to arrive. DownlinkOnly (default 1s) is
+                        // too short for UDP — the response may take longer.
+                        timer.SetTimeout(plcy.Timeouts.ConnectionIdle)
+                        <-inputCloser
+                }
+
                 return nil
         }
 
