@@ -483,8 +483,13 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                         // the connection within ~1 RTT.
                         if destination.Network == net.Network_UDP {
                                 if destination.Address == net.LocalHostIP {
-                                        // SNI cache miss + loopback dest = drop
-                                        buf.ReleaseMulti(outbound.Reader.(*cachedReader).cache)
+                                        // SNI cache miss + loopback dest = drop.
+                                        // Release the cached reader's buffer to
+                                        // prevent the packet from being forwarded.
+                                        if cr, ok := outbound.Reader.(*cachedReader); ok {
+                                                buf.ReleaseMulti(cr.cache)
+                                                cr.cache = nil
+                                        }
                                         return nil
                                 }
                         }
