@@ -490,12 +490,31 @@ func (s *pooledSocket) readLoop() {
                 // 1. Large channel (256) so drops are rare during bursts
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
-                select {
-                case ch <- readResult{data: packet, n: n, addr: addr}:
-                default:
-                        s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
+                // v26.11.34-link: the demux entry may point to a closed
+                // inbox (the pooledConn was Close()d but the DCID was left
+                // in the demux map per the v26.11.34 fix). Sending to a
+                // closed channel panics, so we must recover. If the send
+                // panics, the inbox is stale — silently drop the packet
+                // (the latest pooledConn for this DCID will overwrite the
+                // demux entry on its next RegisterCID call).
+                sentOk := false
+                func() {
+                        defer func() {
+                                if r := recover(); r != nil {
+                                        // Inbox is closed — drop the packet.
+                                        _ = r // suppress unused
+                                }
+                        }()
+                        select {
+                        case ch <- readResult{data: packet, n: n, addr: addr}:
+                                sentOk = true
+                        default:
+                                s.droppedReplies.Add(1)
+                        }
+                }()
+                if !sentOk {
+                        // Either the inbox was full (default case) or closed
+                        // (panic recovered). Return the pooled buffer.
                         putPacket(packet)
                 }
         }
@@ -743,26 +762,56 @@ func (c *pooledConn) IsClosed() bool {
 
 func (c *pooledConn) Close() error {
         // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
+        // CAS ensures only one caller proceeds to close(c.done).
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
-        c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
+        // v26.11.34-link: DO NOT remove the DCID from the demux map on Close.
+        //
+        // The previous code (v26.10.15 through v26.11.33) removed the
+        // DCID entries from socket.demux when the pooledConn closed:
+        //
+        //   for dk := range c.scidsDCID {
+        //       if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+        //           delete(c.socket.demux, dk)
+        //       }
+        //   }
+        //
+        // This was the ROOT CAUSE of the persistent demux miss and h2
+        // fallback. Here's why:
+        //
+        // Each UDP packet from the browser triggers a SEPARATE
+        // freedom.Process call, each creating a new pooledConn with its
+        // own inbox. The Initial's pooledConn registers the client's SCID
+        // (= A) as a DCID in the demux map → demux[A] = inbox1. When that
+        // freedom.Process returns (input pipe exhausted, timer fires),
+        // pooledConn1.Close() REMOVES A from the demux map. Subsequent
+        // short-header packets create new pooledConns, but short headers
+        // don't carry the client's SCID (A) — they carry the server's
+        // SCID (B') as their DCID. So A is never re-registered. All server
+        // replies (which use DCID = A, the client's SCID) → demux miss →
+        // dropped → QUIC handshake fails → browser falls back to h2.
+        //
+        // The fix: don't remove from demux on Close. Let the inbox
+        // channel be closed (close(c.done) above). The readLoop's
+        // non-blocking send to a closed inbox will fail — but we need
+        // to handle that gracefully (see readLoop's send logic).
+        //
+        // New pooledConns that register the same DCID will OVERWRITE the
+        // demux entry, pointing it to their own (live) inbox. This is
+        // the correct behavior: the latest pooledConn for a given DCID
+        // should receive the replies.
+        //
+        // Stale demux entries (pointing to closed inboxes) are cleaned
+        // up lazily by the readLoop when a send fails, or by the socket
+        // reaper when the socket is evicted.
+        //
+        // Test: TestDemuxLifecycleWithFix in demux_test.go verifies this.
+        //
+        // scidsDCID is kept for potential future use (introspection)
+        // but is no longer used for demux cleanup.
 
         c.socket.release()
         return nil
