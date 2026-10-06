@@ -444,10 +444,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 domain: domain,
                                 exp:    time.Now().Add(d.udpSNICacheTTL),
                                 }
-                                cacheLen := len(d.udpSNICache)
                                 d.udpSNICacheMu.Unlock()
-                                // DIAG 21: udp_sni_cache SET
-                                errors.LogInfo(ctx, "DIAG: udp_sni_cache SET src=", inbound.Source.String(), " domain=", domain, " cache_size=", cacheLen)
                         }
                         }
                 } else {
@@ -466,8 +463,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 d.udpSNICacheMu.RUnlock()
                                 if ok && time.Now().Before(entry.exp) {
                                 // Cache hit — reuse the SNI from the Initial.
-                                // DIAG 22: udp_sni_cache HIT
-                                                errors.LogInfo(ctx, "DIAG: udp_sni_cache HIT src=", inbound.Source.String(), " domain=", entry.domain)
                                 destination.Address = net.ParseAddress(entry.domain)
                                 ob.Target = destination
                                 } else if ok {
