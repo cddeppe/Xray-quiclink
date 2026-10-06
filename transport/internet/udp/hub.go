@@ -74,14 +74,26 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	// rejects packets larger than the path MTU (1500) with
 	// "sendto: message too long". Setting IP_PMTU_DONT allows the
 	// kernel to fragment large UDP packets so they reach the browser.
-	if udpConn, ok := hub.conn.(*net.UDPConn); ok {
-		if rawConn, err := udpConn.SyscallConn(); err == nil {
-			rawConn.Control(func(fd uintptr) {
-				// IP_PMTU_DONT = 0 (allow fragmentation)
-				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 0)
-			})
+	//
+	// v26.11.12-link: also set SO_SNDBUF to 65535 so the kernel
+	// has enough send buffer for large datagrams. And try BOTH
+	// hub.conn and hub.udpConn since FinalMask may wrap the conn.
+	setHubSocketOptions := func(conn net.PacketConn) {
+		type syscallConner interface {
+			SyscallConn() (syscall.RawConn, error)
+		}
+		if sc, ok := conn.(syscallConner); ok {
+			if rawConn, err := sc.SyscallConn(); err == nil {
+				rawConn.Control(func(fd uintptr) {
+					// IP_PMTU_DONT = 0 (allow fragmentation)
+					_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 0)
+					// SO_SNDBUF = 65535 (large send buffer)
+					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 65535)
+				})
+			}
 		}
 	}
+	setHubSocketOptions(hub.conn)
 
 	errors.LogInfo(ctx, "listening UDP on ", address, ":", port)
 	hub.udpConn, _ = hub.conn.(*net.UDPConn)
