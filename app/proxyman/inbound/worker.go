@@ -218,67 +218,28 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 //
-// v26.11.28-link: split coalesced QUIC datagrams into individual UDP
-// datagrams. QUIC servers (nginx, Cloudflare, Google) coalesce Initial +
-// Handshake + 0-RTT packets into one UDP datagram up to 65535 bytes via
-// GSO. Forwarding this as a single UDP datagram requires IP fragmentation
-// (the path MTU is ~1500), which is unreliable across PPPoE, VPN tunnels,
-// IPv6, and many NAT/firewall setups. If even one IP fragment is lost or
-// reordered, the browser's QUIC stack never sees the full datagram, the
-// handshake fails, and the browser falls back to TCP (h2).
+// v26.11.50-link: removed SplitCoalesced. In multi-hop chains,
+// SplitCoalesced made the QUIC handshake appear to succeed (by
+// delivering the split Initial+Handshake to the browser within path
+// MTU), but 1-RTT data couldn't flow (short headers → 127.0.0.1 →
+// fail), causing a 5-minute timeout before TCP fallback.
 //
-// ICMP "Fragmentation Needed" was sent (v26.11.25) but servers ignore it
-// for the Initial — the anti-amplification limit (RFC 9000 §8.1) requires
-// the server to send its Initial + Handshake in one datagram, and the
-// Initial is at least 1200 bytes (§14.1). So PMTUD via ICMP doesn't help.
+// Without SplitCoalesced, the coalesced datagram exceeds path MTU →
+// IP fragmentation → unreliable → browser never sees it → immediate
+// TCP fallback → video plays.
 //
-// The fix: parse the coalesced datagram on the outbound path and send
-// each individual QUIC packet as a separate UDP datagram. Each packet
-// (Initial ~1250, Handshake ~200, 1-RTT ~1250) fits in a single IP frame.
-// RFC 9000 §12.2 explicitly says receivers MUST accept both coalesced
-// and non-coalesced packets, so this transformation is wire-compliant.
-//
-// If the buffer is not coalesced (single packet, or not parseable as
-// QUIC), fall through to a single output call (the pre-v26.11.27 path).
+// Single-hop h3 (cloudflare-quic.com) will need a different approach
+// in the future — perhaps SplitCoalesced only when the SCID is
+// non-zero (Firefox), not 0-length (Chrome).
 func (c *udpConn) Write(buf []byte) (int, error) {
-        if len(buf) <= 1250 {
-                // Fast path: small enough to fit in one IP frame, no split needed.
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        n, err := c.output(buf)
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
         }
-
-        offsets, splitErr := quic.SplitCoalesced(buf)
-        if splitErr != nil || len(offsets) <= 1 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        if err == nil {
+                c.updateActivity()
         }
-
-        total := 0
-        for _, off := range offsets {
-                packet := buf[off[0]:off[1]]
-                n, werr := c.output(packet)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if werr != nil {
-                        return total, werr
-                }
-                total += n
-        }
-        c.updateActivity()
-        return total, nil
+        return n, err
 }
 
 func (c *udpConn) Close() error {
