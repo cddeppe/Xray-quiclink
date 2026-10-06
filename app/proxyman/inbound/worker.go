@@ -470,6 +470,24 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         }
                 }
         }
+        // v26.11.52-link: Solution A — for short headers with no id.dest,
+        // look up the existing conn by srcKey and reuse its id.dest so
+        // getConnection finds the same conn. This avoids creating a new
+        // conn → new DispatchLink → 127.0.0.1 loop.
+        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                w.RLock()
+                if existingID, found := w.srcIndex[id.srcKey]; found {
+                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                // Reuse the existing conn — write directly to its pipe
+                                w.RUnlock()
+                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                                existingConn.updateActivity()
+                                return
+                        }
+                }
+                w.RUnlock()
+        }
+
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
