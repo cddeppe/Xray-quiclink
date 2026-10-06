@@ -759,34 +759,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.RegisterCID(dcid)
                 }
         } else if len(b) > 0 && b[0]&0x40 != 0 {
-                // v26.11.33-link: short header (1-RTT) — register the DCID.
-                //
-                // Each UDP packet from the browser triggers a SEPARATE
-                // freedom.Process call, each creating a new pooledConn with
-                // its own inbox. The Initial's pooledConn registers the DCID
-                // → demux[dcid] = inbox1. When that freedom.Process returns
-                // (input pipe exhausted, timer fires), pooledConn1.Close()
-                // REMOVES the DCID from the demux map (udp_pool.go:730-733).
-                // Subsequent short-header packets create new pooledConns but
-                // don't re-register the DCID → all server replies are demux
-                // misses → dropped → QUIC handshake fails → h2 fallback.
-                //
-                // Fix: register the DCID from short headers too. Each new
-                // pooledConn that sends a short header re-registers demux[dcid]
-                // → its own inbox. RegisterCID is idempotent per-conn (checks
-                // scidsDCID), so this only fires once per pooledConn. The
-                // demux map always points to the latest pooledConn.inbox for
-                // this DCID, so the server's replies always reach a live
-                // responseDone goroutine.
-                //
-                // Note: ParseDCID for short headers uses
-                // DefaultShortHeaderCIDLen (8 bytes). This matches Firefox
-                // and Chrome (which use 8-byte SCIDs, echoed by the server
-                // as 8-byte DCIDs in short headers). If a client uses 0-length
-                // SCID, the long-header path above already handles it.
-                if dcid, _, err := quic.ParseDCID(b); err == nil {
-                        c.RegisterCID(dcid)
-                }
+                // Short header (1-RTT). v26.11.0 did NOT register DCID from
+                // short headers. v26.11.33 added it (to fix demux miss after
+                // Close), but for 0-length SCIDs (Chrome), all connections
+                // share dcidKey{len:0} → demux collision → freeze.
+                // v26.11.49: removed short header DCID registration to match
+                // v26.11.0 behavior. Short headers go through per-session
+                // (non-QUIC first byte) → 127.0.0.1 → TCP fallback → video plays.
         }
 
         // v26.10.34-link (M1 fix): honor the caller-provided addr if it's a
