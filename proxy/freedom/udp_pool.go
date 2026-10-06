@@ -995,6 +995,7 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 		}
 
 		if packetEnd <= offset || packetEnd > len(remaining)+offset {
+			xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK safety check, packetEnd=", packetEnd, " offset=", offset, " remaining_len=", len(remaining))
 			break // safety: offset must advance
 		}
 		pktData := data[offset:packetEnd]
@@ -1004,6 +1005,7 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 		pkt.UDP = udp
 		result = append(result, pkt)
 		offset = packetEnd
+		xrayerrors.LogWarning(context.Background(), "splitCoalesced: packet created, len=", len(pktData), " offset=", offset, " data_len=", len(data))
 	}
 
 	if len(result) <= 1 {
