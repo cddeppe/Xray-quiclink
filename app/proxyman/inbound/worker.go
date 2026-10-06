@@ -593,8 +593,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
+                        errors.LogWarning(ctx, "DIAG worker goroutine: starting proxy.Process for UDP conn src=", source, " id.dest=", id.dest)
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogInfoInner(ctx, err, "connection ends")
+                                errors.LogWarning(ctx, "DIAG worker goroutine: proxy.Process returned error: ", err)
+                        } else {
+                                errors.LogWarning(ctx, "DIAG worker goroutine: proxy.Process returned nil (completed)")
                         }
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better

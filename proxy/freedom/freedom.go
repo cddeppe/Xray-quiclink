@@ -371,8 +371,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         outbounds := session.OutboundsFromContext(ctx)
         ob := outbounds[len(outbounds)-1]
         if !ob.Target.IsValid() {
+                errors.LogWarning(ctx, "DIAG freedom.Process: target NOT valid, returning error")
                 return errors.New("target not specified.")
         }
+        errors.LogWarning(ctx, "DIAG freedom.Process: ENTER dest=", ob.Target, " network=", ob.Target.Network, " socketPool=", h.socketPool != nil)
         ob.Name = "freedom"
         ob.CanSpliceCopy = 1
         inbound := session.InboundFromContext(ctx)
