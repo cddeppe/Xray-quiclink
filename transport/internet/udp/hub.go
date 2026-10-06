@@ -124,6 +124,13 @@ func (h *Hub) start() {
 			continue
 		}
 
+		// v26.10.76-link: diagnostic — confirm the UDP socket is actually
+		// receiving packets. This fires inside the hub's start() loop,
+		// BEFORE the channel send. If this fires but udp_worker: callback
+		// doesn't, the channel is dropping packets or handlePackets isn't
+		// running. If this doesn't fire, the socket isn't receiving.
+		errors.LogWarning(context.Background(), "udp_hub: received src=", udpAddr.String(), " len=", n, " recvOrigDest=", h.recvOrigDest)
+
 		payload := &udp.Packet{
 			Payload: buffer,
 			Source:  net.UDPDestination(net.IPAddress(udpAddr.IP), net.Port(udpAddr.Port)),
