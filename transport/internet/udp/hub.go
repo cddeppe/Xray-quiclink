@@ -92,11 +92,8 @@ func (h *Hub) start() {
 	c := h.cache
 	defer close(c)
 
-	// v26.10.77-link: confirm the hub.start() goroutine is actually
-	// running. If this line doesn't fire on startup, the goroutine
-	// never started (ListenUDP returned nil, or the channel was
-	// never created).
-	errors.LogWarning(context.Background(), "udp_hub: start() goroutine running, listening on ", h.conn.LocalAddr().String(), " udpConn=", h.udpConn != nil, " recvOrigDest=", h.recvOrigDest)
+	// v26.11.00: startup log at debug level (was warning, spammed logs)
+	errors.LogInfo(context.Background(), "udp_hub: start() goroutine running, listening on ", h.conn.LocalAddr().String(), " udpConn=", h.udpConn != nil, " recvOrigDest=", h.recvOrigDest)
 
 	oobBytes := make([]byte, 256)
 
@@ -119,7 +116,7 @@ func (h *Hub) start() {
 		}
 
 		if err != nil {
-			errors.LogWarning(context.Background(), "udp_hub: ReadUDPMsg returned err=", err, " udpConn=", h.udpConn != nil)
+			errors.LogInfoInner(context.Background(), err, "udp_hub: ReadUDPMsg error")
 			buffer.Release()
 			break
 		}
@@ -129,13 +126,6 @@ func (h *Hub) start() {
 			buffer.Release()
 			continue
 		}
-
-		// v26.10.76-link: diagnostic — confirm the UDP socket is actually
-		// receiving packets. This fires inside the hub's start() loop,
-		// BEFORE the channel send. If this fires but udp_worker: callback
-		// doesn't, the channel is dropping packets or handlePackets isn't
-		// running. If this doesn't fire, the socket isn't receiving.
-		errors.LogWarning(context.Background(), "udp_hub: received src=", udpAddr.String(), " len=", n, " recvOrigDest=", h.recvOrigDest)
 
 		payload := &udp.Packet{
 			Payload: buffer,
