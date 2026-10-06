@@ -1,0 +1,84 @@
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
+  },
+  "dns": {
+    "cacheSize": 1000,
+    "disableCache": false,
+    "serveStale": true,
+    "serveExpiredTTL": 300,
+    "prefetchInterval": 60,
+    "prefetchThreshold": 30,
+    "servers": ["127.0.0.1", "[::1]"]
+  },
+  "inbounds": [
+    {
+      "listen": ["203.0.113.10", "2001:db8:2::10"],
+      "port": 443,
+      "protocol": "dokodemo-door",
+      "tag": "in-443",
+      "settings": { "network": "tcp,udp" },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["tls", "quic"]
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true,
+          "tcpUserTimeout": 30000,
+          "tcpKeepAlive": 15
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct",
+      "sendThrough": "origin",
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "useip",
+          "tcpFastOpen": true,
+          "tcpNoDelay": true,
+          "tcpUserTimeout": 30000,
+          "tcpKeepAlive": 15
+        }
+      },
+      "settings": {
+        "domainStrategy": "AsIs",
+        "udpConfig": {
+          "enableSocketPool": true,
+          "enableStickyResolver": true,
+          "preferIpv4": true,
+          "sessionIdleTimeout": 1800,
+          "poolStalenessTimeout": 300,
+          "poolIdleTimeout": 600,
+          "poolUnusedTimeout": 300,
+          "stickyResolverTtl": 60
+        }
+      }
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "connIdle": 1800,
+        "uplinkOnly": 1800,
+        "downlinkOnly": 1800,
+        "handshake": 4
+      }
+    }
+  }
+}
