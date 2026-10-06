@@ -218,28 +218,46 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 //
-// v26.11.50-link: removed SplitCoalesced. In multi-hop chains,
-// SplitCoalesced made the QUIC handshake appear to succeed (by
-// delivering the split Initial+Handshake to the browser within path
-// MTU), but 1-RTT data couldn't flow (short headers → 127.0.0.1 →
-// fail), causing a 5-minute timeout before TCP fallback.
-//
-// Without SplitCoalesced, the coalesced datagram exceeds path MTU →
-// IP fragmentation → unreliable → browser never sees it → immediate
-// TCP fallback → video plays.
-//
-// Single-hop h3 (cloudflare-quic.com) will need a different approach
-// in the future — perhaps SplitCoalesced only when the SCID is
-// non-zero (Firefox), not 0-length (Chrome).
+// v26.11.52-link: SplitCoalesced restored. With Solution A (src-based
+// routing for 1-RTT), the handshake succeeds AND 1-RTT data flows.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        n, err := c.output(buf)
-        if c.downlink != nil {
-                c.downlink.Add(int64(n))
+        if len(buf) <= 1250 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        if err == nil {
-                c.updateActivity()
+
+        offsets, splitErr := quic.SplitCoalesced(buf)
+        if splitErr != nil || len(offsets) <= 1 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        return n, err
+
+        total := 0
+        for _, off := range offsets {
+                packet := buf[off[0]:off[1]]
+                n, werr := c.output(packet)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if werr != nil {
+                        return total, werr
+                }
+                total += n
+        }
+        c.updateActivity()
+        return total, nil
 }
 
 func (c *udpConn) Close() error {

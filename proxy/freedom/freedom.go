@@ -623,29 +623,31 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if peekErr == nil && len(mb) > 0 {
                         peekedPackets = mb
                         if isQUICLongHeader(mb[0].Bytes()) {
-                                remoteAddr := conn.RemoteAddr()
-                                var udpRemote *net.UDPAddr
-                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
-                                        udpRemote = u
+                                // v26.11.52-link: check SCID length. If 0-length
+                                // (Chrome/Edge), DON'T use the pool — the DCID demux
+                                // can't distinguish connections with 0-length CIDs.
+                                // Route through per-session (kernel demuxes by 4-tuple).
+                                if scid, _, err := parseQUICSCID(mb[0].Bytes()); err == nil && len(scid) == 0 {
+                                        errors.LogWarning(ctx, "freedom: UDP path=per-session (0-length SCID)")
                                 } else {
-                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
-                                }
-                                if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
-                                        if err != nil {
-                                                // v26.10.34-link (C3 fix): release peeked packets
-                                                // before returning. Without this, every Acquire
-                                                // failure leaks one MultiBuffer (up to 8KB+ per
-                                                // failure) — unbounded growth under flapping dest.
-                                                buf.ReleaseMulti(peekedPackets)
-                                                peekedPackets = nil
-                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
+                                        remoteAddr := conn.RemoteAddr()
+                                        var udpRemote *net.UDPAddr
+                                        if u, ok := remoteAddr.(*net.UDPAddr); ok {
+                                                udpRemote = u
+                                        } else {
+                                                udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                         }
-                                        defer pooledConn.Close()
-                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
-                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
-                                        outGateway = nil
-                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
+                                        if udpRemote != nil {
+                                                pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                                if err != nil {
+                                                        buf.ReleaseMulti(peekedPackets)
+                                                        peekedPackets = nil
+                                                        return errors.New("failed to acquire pooled UDP conn").Base(err)
+                                                }
+                                                defer pooledConn.Close()
+                                                outGateway = nil
+                                                errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
+                                        }
                                 }
                         } else {
                                 // Non-QUIC UDP first byte — per-session path.
