@@ -236,6 +236,11 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 		}
 	}
 out:
+	// v26.10.75-link: diagnostic — log the target network type right
+	// before calling proxy.Process (freedom). If this shows "tcp:" but
+	// the dispatcher showed "udp:", something between the dispatcher
+	// and here changed the network.
+	errors.LogWarning(ctx, "handler: Dispatch pre-Process target=", ob.Target.String(), " network=", ob.Target.Network, " outboundTag=", h.tag)
 	err := h.proxy.Process(ctx, link, h)
 	var errC error
 	if err != nil {

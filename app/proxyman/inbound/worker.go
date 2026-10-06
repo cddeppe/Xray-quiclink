@@ -409,6 +409,15 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 }
                 b.UDP = &originalDest
         }
+        // v26.10.75-link: diagnostic — log the originalDest network type for
+        // every new UDP connection. If this fires with Network_UDP, the UDP
+        // inbound is working correctly. If it doesn't fire at all, the UDP
+        // packets aren't reaching xray's UDP worker.
+        if !originalDest.IsValid() {
+                errors.LogWarning(context.Background(), "udp_worker: callback originalDest INVALID src=", source.String())
+        } else {
+                errors.LogWarning(context.Background(), "udp_worker: callback src=", source.String(), " originalDest=", originalDest.String(), " network=", originalDest.Network)
+        }
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
