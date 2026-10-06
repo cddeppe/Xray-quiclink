@@ -88,27 +88,30 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 			if err != nil {
 				dest.Address = net.DomainAddress("localhost")
 			} else {
-				// v26.11.3-link: use the actual listen IP from
-				// conn.LocalAddr() instead of hardcoded 127.0.0.1.
+				// v26.11.11-link: reverted v26.11.3. Using the
+				// listen IP (82.21.4.42) as dest.Address caused an
+				// infinite self-dial loop when SNI sniffing failed
+				// (short-header 1-RTT packets). xray dials itself,
+				// each dial creates a new local port, the response
+				// comes back to that port, which triggers another
+				// dial — infinite loop, VPS freezes.
 				//
-				// The upstream code set dest.Address = net.LocalHostIP
-				// (127.0.0.1) even when the packet arrived on a public
-				// IP (e.g., 82.21.4.42). This made ob.OriginalTarget.Address
-				// = 127.0.0.1, which EndpointOverrideWriter used to rewrite
-				// the UDP response source. The FakeUDP socket bound to
-				// 127.0.0.1, so the response went back to the client with
-				// source 127.0.0.1 instead of the public IP the client
-				// connect()ed to. The client's kernel dropped the response
-				// (UDP source-IP mismatch), the QUIC handshake failed, and
-				// the browser fell back to TCP/HTTP2.
+				// Using 127.0.0.1 (localhost) is correct for the
+				// no-SNI case: dialing 127.0.0.1:443 fails fast
+				// (connection refused), the browser falls back
+				// to TCP. For the SNI-succeeds case, the sniffed
+				// SNI overrides the dest, so 127.0.0.1 is never
+				// used.
 				//
-				// Using the actual listen IP makes the response source
-				// match the IP the client sent to, so the kernel accepts
-				// the response and the QUIC handshake completes.
+				// The response source IP is determined by the
+				// kernel (hub.WriteTo sends from the kernel's
+				// chosen source IP = the listen IP), not by
+				// dest.Address. So 127.0.0.1 doesn't affect
+				// the response path.
 				if strings.Contains(host, ".") {
-					dest.Address = net.ParseAddress(host)
+					dest.Address = net.LocalHostIP
 				} else {
-					dest.Address = net.ParseAddress(host)
+					dest.Address = net.LocalHostIPv6
 				}
 			}
 		}
