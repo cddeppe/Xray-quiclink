@@ -596,6 +596,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
+        // v26.10.71-link: log the downstream path explicitly so the log
+        // alone tells us whether QUIC survived end-to-end. The destination
+        // string already shows tcp:/udp: but does not tell us whether the
+        // QUIC pool took the connection (DCID demux) or whether the
+        // per-session path was used (0-length SCID fallback or non-QUIC UDP).
+
         // For UDP pool: peek at the first packet to determine if it's QUIC.
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
@@ -630,11 +636,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
+                                        errors.LogInfo(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
                                 }
+                        } else {
+                                // Non-QUIC UDP first byte — per-session path.
+                                errors.LogInfo(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
+                } else {
+                        // Peek failed (empty input pipe / EOF) — per-session fallback.
+                        errors.LogInfo(ctx, "freedom: UDP path=per-session (peek empty) dest=", destination, " peekErr=", peekErr)
                 }
                 // If peek failed, proceed with existing path (pooledConn stays nil).
+        } else if destination.Network != net.Network_TCP {
+                // socketPool not configured — per-session UDP path.
+                errors.LogInfo(ctx, "freedom: UDP path=per-session (no pool configured) dest=", destination)
+        } else {
+                errors.LogInfo(ctx, "freedom: TCP path dest=", destination)
         }
 
         var newCtx context.Context
