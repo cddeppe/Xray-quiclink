@@ -292,6 +292,23 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 				learnVisits = 3 // default: 3 visits to stabilize
 			}
 			h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, preWarmN, preWarmFirstN, learnVisits)
+			// v26.11.2-link: when the TCP warm pool detects a dead/expired
+			// connection (CDN edge rotation), proactively refresh DNS via the
+			// sticky resolver. The dest key is "ip:port" — extract the IP
+			// and call RefreshByIP, which finds all hostnames pointing at
+			// that IP and triggers background DNS refresh for each.
+			if h.stickyResolver != nil {
+				resolver := h.stickyResolver
+				h.tcpWarmPool.onSocketStale = func(destKey string) {
+					ip := destKey
+					if idx := strings.LastIndex(destKey, ":"); idx > 0 {
+						ip = destKey[:idx]
+					}
+					ip = strings.TrimPrefix(ip, "[")
+					ip = strings.TrimSuffix(ip, "]")
+					resolver.RefreshByIP(ip)
+				}
+			}
 			if preWarmFirstN > 0 {
 				errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s firstN=", preWarmFirstN, " learnVisits=", learnVisits, ")")
 			} else if preWarmN > 0 {
@@ -564,6 +581,31 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 						} else {
 							errors.LogInfoInner(ctx, derr, "freedom: IPv4 fallback dial failed for ", destination.Address.Domain(), " candidate #", i)
 						}
+					}
+				}
+			}
+			// v26.11.2-link: TCP dial failure with DNS refresh.
+			// If the dial failed (connection refused, timeout, etc.)
+			// and the destination was a domain, the cached IP may be
+			// stale (CDN edge rotated). Proactively refresh DNS via the
+			// sticky resolver and retry with the new IP. This catches
+			// the case where the warm pool didn't have a dead conn to
+			// detect (first connection to this host, or pool empty).
+			if destination.Address.Family().IsDomain() && h.stickyResolver != nil {
+				domain := destination.Address.Domain()
+				errors.LogWarning(ctx, "freedom: TCP dial to ", destination, " failed, refreshing DNS and retrying")
+				// Force a fresh DNS lookup (bypass sticky cache)
+				h.stickyResolver.RefreshByDomain(domain)
+				// Wait briefly for the background refresh, then re-resolve
+				if freshIP, rerr := h.stickyResolver.ResolveFresh(ctx, domain); rerr == nil {
+					retryDest := destination
+					retryDest.Address = freshIP
+					if rawConn3, derr := dialer.Dial(ctx, retryDest); derr == nil {
+						conn = rawConn3
+						errors.LogInfo(ctx, "freedom: TCP dial retry succeeded with fresh IP ", freshIP, " for ", domain)
+						return nil
+					} else {
+						errors.LogInfoInner(ctx, derr, "freedom: TCP dial retry with fresh IP failed for ", domain)
 					}
 				}
 			}
