@@ -255,9 +255,8 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 
 	offsets, splitErr := quic.SplitCoalesced(buf)
 	if splitErr != nil || len(offsets) <= 1 {
-		// Not a coalesced QUIC datagram (parse failed, or only one
-		// packet found). Send the whole buffer in one UDP write.
-		// The kernel will IP-fragment as needed.
+		// DIAG 25: SplitCoalesced no split
+		errors.LogWarning(context.Background(), "DIAG: udpConn.Write buf_len=", len(buf), " offsets=", len(offsets), " NO_SPLIT")
 		n, err := c.output(buf)
 		if c.downlink != nil {
 			c.downlink.Add(int64(n))
@@ -268,16 +267,20 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 		return n, err
 	}
 
-	// Split: send each QUIC packet as its own UDP datagram. Each is
-	// ≤1250 bytes (or close to it) so no IP fragmentation occurs.
+	// DIAG 26: SplitCoalesced splitting
+	errors.LogWarning(context.Background(), "DIAG: udpConn.Write buf_len=", len(buf), " offsets=", len(offsets), " SPLITTING")
 	total := 0
-	for _, off := range offsets {
+	for i, off := range offsets {
 		packet := buf[off[0]:off[1]]
+		// DIAG 27: each split packet
+		errors.LogWarning(context.Background(), "DIAG: udpConn.Write split pkt ", i, "/", len(offsets), " offset=[", off[0], ",", off[1], ") len=", len(packet))
 		n, werr := c.output(packet)
 		if c.downlink != nil {
 			c.downlink.Add(int64(n))
 		}
 		if werr != nil {
+			// DIAG 28: output error
+			errors.LogWarning(context.Background(), "DIAG: udpConn.Write output ERROR pkt ", i, " err=", werr)
 			return total, werr
 		}
 		total += n
