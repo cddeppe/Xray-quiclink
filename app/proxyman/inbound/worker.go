@@ -218,6 +218,16 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
+	// v26.11.18-link: truncate to 65507 bytes (max UDP payload).
+	// The server sends coalesced QUIC datagrams up to 65535 bytes via
+	// UDP GSO. The kernel receives them (large recv buffer) but rejects
+	// sends > 65507 (max UDP payload = 65535 - 20 IP - 8 UDP headers).
+	// Truncating to 65507 loses the last 28 bytes. The QUIC parser will
+	// see the Initial + Handshake and the last packet will be truncated.
+	// QUIC retransmission recovers the truncated data.
+	if len(buf) > 65507 {
+		buf = buf[:65507]
+	}
 	n, err := c.output(buf)
 	if c.downlink != nil {
 		c.downlink.Add(int64(n))
