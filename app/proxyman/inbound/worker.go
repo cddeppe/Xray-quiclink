@@ -3,6 +3,7 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        "fmt"
         stdnet "net"
         "sync"
 
@@ -453,6 +454,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
         }
+        // DIAG: log every UDP packet arrival
+        pktBytes := b.Bytes()
+        firstByte := byte(0)
+        if len(pktBytes) > 0 {
+                firstByte = pktBytes[0]
+        }
+        errors.LogWarning(context.Background(), "DIAG worker callback: src=", source, " origDestValid=", originalDest.IsValid(), " origDest=", originalDest, " firstByte=0x", fmt.Sprintf("%02x", firstByte), " pktLen=", len(pktBytes), " isLong=", firstByte&0x80 != 0)
         if originalDest.IsValid() {
                 if !w.cone {
                         id.dest = originalDest
