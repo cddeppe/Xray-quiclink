@@ -160,6 +160,15 @@ func makeUDPSrcKey(d net.Destination) udpSrcKey {
         return k
 }
 
+// makeIPString extracts the IP string from a udpSrcKey for IP-level fallback.
+func makeIPString(k udpSrcKey) string {
+        // Check if IPv4-in-IPv6 mapped
+        if k.ip[10] == 0xff && k.ip[11] == 0xff {
+                return net.IP(k.ip[12:16]).String()
+        }
+        return net.IP(k.ip[:]).String()
+}
+
 func init() {
         common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
                 d := new(DefaultDispatcher)
@@ -475,14 +484,47 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                         }
                         }
                         }
-                        // v26.11.42-link: if the SNI cache missed AND the
-                        // destination is 127.0.0.1 (dokodemo default), DROP the
-                        // packet instead of forwarding to 127.0.0.1. Forwarding
-                        // to 127.0.0.1 creates a loop that wastes resources and
-                        // blocks the browser from re-establishing. Dropping the
-                        // packet forces the browser's QUIC stack to retransmit
-                        // the Initial (which we CAN sniff and cache), recovering
-                        // the connection within ~1 RTT.
+                        // v26.11.46-link: if the SNI cache missed by IP:port, try
+                        // a fallback by source IP only. In multi-hop chains, the
+                        // upstream hop (e.g. 2026) uses per-session UDP sockets
+                        // that create new source ports per freedom.Process call.
+                        // The downstream hop (AL) can't match the changing source
+                        // ports. By falling back to source IP, AL can reuse the
+                        // last sniffed SNI for that upstream IP.
+                        // This is safe in a multi-hop chain where each upstream
+                        // has one IP. If multiple QUIC connections to different
+                        // domains arrive from the same upstream IP, the last
+                        // sniffed SNI wins — but QUIC connections to different
+                        // domains use different source ports on the BROWSER side,
+                        // and the upstream (2026) forwards each on its own per-
+                        // session socket, so the Initial for each domain arrives
+                        // first and updates the IP-level fallback.
+                        if destination.Network == net.Network_UDP && destination.Address == net.LocalHostIP {
+                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                        srcIP := inbound.Source.Address.IP().String()
+                                        d.udpSNICacheMu.RLock()
+                                        var ipFallback string
+                                        var ipFallbackExp time.Time
+                                        for k, v := range d.udpSNICache {
+                                                // Match entries where the IP part matches (ignore port)
+                                                ip := makeIPString(k)
+                                                if ip == srcIP && time.Now().Before(v.exp) {
+                                                        ipFallback = v.domain
+                                                        ipFallbackExp = v.exp
+                                                        break
+                                                }
+                                        }
+                                        d.udpSNICacheMu.RUnlock()
+                                        if ipFallback != "" {
+                                                errors.LogInfo(ctx, "DIAG: udp_sni_cache IP_FALLBACK src=", inbound.Source.String(), " domain=", ipFallback)
+                                                destination.Address = net.ParseAddress(ipFallback)
+                                                ob.Target = destination
+                                        }
+                                        _ = ipFallbackExp
+                                }
+                        }
+                        // v26.11.42-link: if SNI cache missed (including IP fallback)
+                        // AND dest is 127.0.0.1, DROP the packet.
                         if destination.Network == net.Network_UDP {
                                 if destination.Address == net.LocalHostIP {
                                         errors.LogWarning(context.Background(), "DIAG: LOOPBACK DROP src=", func() string { if inbound := session.InboundFromContext(ctx); inbound != nil { return inbound.Source.String() }; return "(unknown)" }())
