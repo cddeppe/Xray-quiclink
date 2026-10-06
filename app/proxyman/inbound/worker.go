@@ -458,6 +458,63 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         id.dest = originalDest
                 }
                 b.UDP = &originalDest
+        } else {
+                // v26.10.78-link: when originalDest is invalid (no TPROXY /
+                // receiveOriginalDestAddress in the inbound sockopt), all UDP
+                // packets from the same source port map to the same connID
+                // {src, dest=zero}. This breaks when multiple QUIC connections
+                // (different DCIDs) arrive from the same source port — they all
+                // get mixed into one conn. Only the first QUIC Initial's SNI is
+                // used for routing; subsequent QUIC connections' data goes to the
+                // first connection's pipe, their handshake fails, and the client
+                // falls back to TCP.
+                //
+                // Fix: for QUIC long-header packets (Initials), parse the DCID
+                // and use it to create a unique id.dest. Different DCIDs produce
+                // different connIDs, so each QUIC connection gets its own conn +
+                // goroutine + sniffer + freedom dial.
+                //
+                // The synthetic dest is only used for connID comparison and
+                // pipe routing — the actual routing destination comes from the
+                // sniffer's SNI extraction in the dispatcher.
+                //
+                // For short-header (1-RTT) packets, the DCID is already
+                // registered in dcidIndex by the Initial, so tryQUICMigration
+                // handles routing. We only need the synthetic dest for Initials.
+                //
+                // v26.11.56-link: this block was removed in v26.11.54's history
+                // rewrite and restored here. Without it, parallel QUIC
+                // connections from the same source port (YouTube's DASH
+                // streaming) collapse into one conn and the handshake fails.
+                packetBytes := b.Bytes()
+                if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 {
+                        if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
+                                id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
+                        }
+                }
+        }
+        // v26.11.52-link: Solution A — for short headers with no id.dest,
+        // look up the existing conn by srcKey and reuse its id.dest so
+        // getConnection finds the same conn. This avoids creating a new
+        // conn → new DispatchLink → sniffing fails (no SNI) → 127.0.0.1
+        // loop → freeze.
+        //
+        // v26.11.56-link: restored (was removed in v26.11.54's rewrite).
+        // Without this, 1-RTT short headers create a new conn, the sniffer
+        // can't extract SNI (short headers don't carry it), and the packet
+        // is routed to 127.0.0.1:443 — a packet loop that kills the QUIC
+        // connection and forces TCP fallback.
+        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                w.RLock()
+                if existingID, found := w.srcIndex[id.srcKey]; found {
+                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                w.RUnlock()
+                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                                existingConn.updateActivity()
+                                return
+                        }
+                }
+                w.RUnlock()
         }
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
