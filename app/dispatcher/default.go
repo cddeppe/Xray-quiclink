@@ -473,6 +473,21 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                         }
                         }
                         }
+                        // v26.11.42-link: if the SNI cache missed AND the
+                        // destination is 127.0.0.1 (dokodemo default), DROP the
+                        // packet instead of forwarding to 127.0.0.1. Forwarding
+                        // to 127.0.0.1 creates a loop that wastes resources and
+                        // blocks the browser from re-establishing. Dropping the
+                        // packet forces the browser's QUIC stack to retransmit
+                        // the Initial (which we CAN sniff and cache), recovering
+                        // the connection within ~1 RTT.
+                        if destination.Network == net.Network_UDP {
+                                if destination.Address == net.LocalHostIP {
+                                        // SNI cache miss + loopback dest = drop
+                                        buf.ReleaseMulti(outbound.Reader.(*cachedReader).cache)
+                                        return nil
+                                }
+                        }
                 }
                 d.routedDispatch(ctx, outbound, destination)
         }
