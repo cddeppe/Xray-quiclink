@@ -87,6 +87,13 @@ type pooledSocket struct {
         // v26.11.35-link: back-reference to the owning pool, so WriteTo
         // can access the pool's source → SCID cache via c.socket.pool.
         pool *UDPSocketPool
+        // v26.11.37-link: shortHeaderCIDLen is the DCID length used by
+        // short-header (1-RTT) packets on this socket. Learned from the
+        // client's Initial SCID length. The readLoop uses this to parse
+        // short-header DCIDs correctly — the global DefaultShortHeaderCIDLen
+        // (8) is wrong for clients that use shorter SCIDs (e.g. 3 bytes).
+        // This is atomic for lock-free reads in the readLoop hot path.
+        shortHeaderCIDLen atomic.Int32
         // v26.10.43-link (audit P5): atomic timestamps to avoid
         // mutex contention on the readLoop hot path.
         lastUsed      atomic.Int64                  // UnixNano
@@ -361,6 +368,10 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) (*
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
                 }
+                // v26.11.37-link: default short header CID length to 8
+                // (Chrome/Firefox default). Updated when we see the
+                // client's Initial SCID length.
+                sock.shortHeaderCIDLen.Store(int32(quic.DefaultShortHeaderCIDLen))
 
                 p.mu.Lock()
                 if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
@@ -456,7 +467,25 @@ func (s *pooledSocket) readLoop() {
                         sendICMPFragmentationNeeded(s.dest, 1250)
                 }
 
-                dcid, _, err := quic.ParseDCID(packet[:n])
+                // v26.11.37-link: parse DCID. For short headers (1-RTT),
+                // use the socket's learned shortHeaderCIDLen (from the
+                // client's Initial SCID) instead of the global default (8).
+                // The server's short-header DCID = client's SCID, so the
+                // length must match. If the client uses a 3-byte SCID, the
+                // server uses a 3-byte DCID — parsing it as 8 bytes produces
+                // a wrong key (3 bytes of DCID + 5 bytes of packet number).
+                var dcid []byte
+                if packet[0]&0x80 != 0 {
+                        // Long header — DCID length is encoded in the packet
+                        dcid, _, err = quic.ParseDCID(packet[:n])
+                } else {
+                        // Short header — use the socket's learned CID length
+                        cidLen := int(s.shortHeaderCIDLen.Load())
+                        if cidLen <= 0 {
+                                cidLen = quic.DefaultShortHeaderCIDLen
+                        }
+                        dcid, _, err = quic.ParseShortHeaderDCIDWithLen(packet[:n], cidLen)
+                }
                 if err != nil {
                         putPacket(packet)
                         continue
@@ -714,6 +743,18 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         // DIAG 6: parsed SCID
                         xrayerrors.LogWarning(context.Background(), "DIAG: WriteTo LONG SCID=", fmt.Sprintf("%x", scid), " len=", len(scid))
                         c.RegisterCID(scid)
+                        // v26.11.37-link: learn the short-header DCID length
+                        // from the client's SCID. The server's short-header
+                        // DCID = client's SCID, so the length must match.
+                        // DefaultShortHeaderCIDLen (8) is wrong for clients
+                        // that use shorter SCIDs (e.g. 3 bytes). The readLoop
+                        // uses this to parse short-header DCIDs correctly.
+                        if len(scid) > 0 {
+                                old := c.socket.shortHeaderCIDLen.Swap(int32(len(scid)))
+                                if old != int32(len(scid)) {
+                                        xrayerrors.LogWarning(context.Background(), "DIAG: shortHeaderCIDLen SET socket=", fmt.Sprintf("%p", c.socket), " old=", old, " new=", len(scid))
+                                }
+                        }
                         // v26.11.35-link: cache (source → client SCID A) so that
                         // subsequent short-header packets from the same source can
                         // re-register A on whatever socket they go to (the DNS
