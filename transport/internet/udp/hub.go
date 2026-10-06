@@ -92,6 +92,12 @@ func (h *Hub) start() {
 	c := h.cache
 	defer close(c)
 
+	// v26.10.77-link: confirm the hub.start() goroutine is actually
+	// running. If this line doesn't fire on startup, the goroutine
+	// never started (ListenUDP returned nil, or the channel was
+	// never created).
+	errors.LogWarning(context.Background(), "udp_hub: start() goroutine running, listening on ", h.conn.LocalAddr().String(), " udpConn=", h.udpConn != nil, " recvOrigDest=", h.recvOrigDest)
+
 	oobBytes := make([]byte, 256)
 
 	for {
@@ -113,7 +119,7 @@ func (h *Hub) start() {
 		}
 
 		if err != nil {
-			errors.LogInfoInner(context.Background(), err, "failed to read UDP msg")
+			errors.LogWarning(context.Background(), "udp_hub: ReadUDPMsg returned err=", err, " udpConn=", h.udpConn != nil)
 			buffer.Release()
 			break
 		}
