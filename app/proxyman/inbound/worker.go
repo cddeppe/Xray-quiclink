@@ -218,14 +218,6 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-	// v26.11.16-link: truncate to 1250 bytes as a fallback. The split
-	// in PooledPacketReader handles most cases, but if the split fails
-	// (returns nil), the full 65535-byte buffer reaches here. Truncating
-	// sends only the first QUIC packet. QUIC retransmission recovers the
-	// rest.
-	if len(buf) > 1250 {
-		buf = buf[:1250]
-	}
 	n, err := c.output(buf)
 	if c.downlink != nil {
 		c.downlink.Add(int64(n))
