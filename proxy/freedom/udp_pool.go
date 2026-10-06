@@ -57,6 +57,25 @@ type UDPSocketPool struct {
         // proactively refreshes DNS for the stale IP's hostname, so the
         // next request gets the fresh IP without waiting for the TTL.
         onSocketStale func(ip string)
+
+        // v26.11.35-link: source → client SCID cache.
+        //
+        // When the browser sends a QUIC Initial (long header), the client's
+        // SCID (= A) is registered in the current socket's demux. But when
+        // DNS rotation sends subsequent short-header packets to a DIFFERENT
+        // destination IP, those packets go to a DIFFERENT socket. The server
+        // replies from that IP with DCID = A (client's SCID), but the new
+        // socket's demux doesn't have A → demux miss → drop → h2 fallback.
+        //
+        // This cache stores (source IP:port → client's SCID A) when we see
+        // a long header. When a short header arrives from the same source,
+        // we look up A and register it on the current socket's demux —
+        // regardless of which IP the short header is being sent to.
+        //
+        // TTL: 5 minutes (longer than any QUIC handshake). Lazy expiration
+        // on lookup. The cache is keyed by source string ("IP:port").
+        sourceSCIDCache    map[string][]byte
+        sourceSCIDCacheMu sync.RWMutex
 }
 
 type pooledSocket struct {
@@ -64,6 +83,9 @@ type pooledSocket struct {
         conn     stdnet.PacketConn
         dest     *stdnet.UDPAddr
         refCount int
+        // v26.11.35-link: back-reference to the owning pool, so WriteTo
+        // can access the pool's source → SCID cache via c.socket.pool.
+        pool *UDPSocketPool
         // v26.10.43-link (audit P5): atomic timestamps to avoid
         // mutex contention on the readLoop hot path.
         lastUsed      atomic.Int64                  // UnixNano
@@ -131,6 +153,11 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+        // v26.11.35-link: source is the browser's source IP:port.
+        // Used to look up the source → SCID cache so we can register
+        // the cached client SCID (A) on this socket's demux when
+        // processing short-header packets.
+        source *stdnet.UDPAddr
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -140,6 +167,7 @@ func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.S
                 idleTimeout:      idle,
                 unusedTimeout:    unused,
                 sockopt:          sockopt,
+                sourceSCIDCache:  make(map[string][]byte),
         }
         p.startReaper()
         return p
@@ -254,7 +282,7 @@ func destKey(dest *stdnet.UDPAddr) string {
         return dest.String()
 }
 
-func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
+func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) (*pooledConn, error) {
         key := destKey(dest)
 
         p.mu.Lock()
@@ -326,6 +354,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
+                        pool:          p, // v26.11.35-link: back-ref for source → SCID cache
                         demux:         make(map[dcidKey]chan<- readResult),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
@@ -363,6 +392,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
+                source:    source, // v26.11.35-link: for source → SCID cache lookup
         }
         return conn, nil
 }
@@ -671,6 +701,15 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil {
                         c.RegisterCID(scid)
+                        // v26.11.35-link: cache (source → client SCID A) so that
+                        // subsequent short-header packets from the same source can
+                        // re-register A on whatever socket they go to (the DNS
+                        // may rotate to a different IP → different socket).
+                        if c.source != nil && len(scid) > 0 {
+                                c.socket.pool.sourceSCIDCacheMu.Lock()
+                                c.socket.pool.sourceSCIDCache[c.source.String()] = scid
+                                c.socket.pool.sourceSCIDCacheMu.Unlock()
+                        }
                 }
                 // Also register the DCID. The client's Initial has DCID =
                 // initial_dcid and SCID = client_scid. The pool registers
@@ -713,6 +752,30 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // SCID, the long-header path above already handles it.
                 if dcid, _, err := quic.ParseDCID(b); err == nil {
                         c.RegisterCID(dcid)
+                }
+
+                // v26.11.35-link: THE REAL FIX for demux miss.
+                //
+                // The short header's DCID is B' (server's SCID), NOT A
+                // (client's SCID). The server replies with DCID = A. So
+                // registering B' is useless — the server never replies with B'.
+                //
+                // The problem: when DNS rotation sends this short header to a
+                // DIFFERENT IP than the Initial, it goes to a DIFFERENT socket.
+                // The Initial registered A on socket1, but the reply arrives
+                // at socket2 (which only has B'). demux miss → drop → h2.
+                //
+                // The fix: look up the cached client SCID (A) for this source
+                // IP:port (cached when the Initial was processed), and register
+                // A on THIS socket's demux → demux[A] = this inbox. The server's
+                // reply with DCID = A will now hit on this socket.
+                if c.source != nil {
+                        c.socket.pool.sourceSCIDCacheMu.RLock()
+                        cachedA, ok := c.socket.pool.sourceSCIDCache[c.source.String()]
+                        c.socket.pool.sourceSCIDCacheMu.RUnlock()
+                        if ok && len(cachedA) > 0 {
+                                c.RegisterCID(cachedA)
+                        }
                 }
         }
 
