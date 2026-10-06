@@ -97,6 +97,7 @@ func makeDCIDKey(dcid []byte) dcidKey {
 // (not per packet), so the alloc cost is negligible.
 type readResult struct {
 	data []byte
+	n    int // v26.11.23: actual bytes (data may be a 65535-byte pooled buffer)
 	addr stdnet.Addr
 }
 
@@ -474,7 +475,7 @@ func (s *pooledSocket) readLoop() {
 		// 2. Non-blocking send so one slow session doesn't starve others
 		// 3. Track drops for observability
 		select {
-		case ch <- readResult{data: packet, addr: addr}:
+		case ch <- readResult{data: packet, n: n, addr: addr}:
 		default:
 			s.droppedReplies.Add(1)
 			// v26.10.42-link (audit P3): return the pooled buffer
@@ -675,7 +676,7 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
 		if !ok {
 			return 0, nil, io.EOF
 		}
-		n := copy(p, rr.data)
+		n := copy(p, rr.data[:rr.n])
 		// v26.10.42-link (audit P3): return the pooled buffer
 		// after copying the data out.
 		putPacket(rr.data)
