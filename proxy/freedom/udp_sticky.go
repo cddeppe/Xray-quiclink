@@ -25,15 +25,16 @@ type StickyResolver struct {
         mu          sync.RWMutex
         ttl         time.Duration
         wildcardTTL time.Duration
-        // v26.11.39-link: wildcardEnabled controls whether *.domain wildcard
-        // matching is used. When false (the default), each subdomain resolves
-        // independently. This prevents all googlevideo subdomains from sharing
-        // one cached IP — when that CDN edge rotates, only the connections to
-        // that specific edge stall, not ALL googlevideo connections.
-        // The wildcard feature was originally added to reduce DNS queries,
-        // but the DNS cache (60s prefetch) already handles that. The wildcard
-        // causes mass-stalls when a CDN edge rotates because all subdomains
-        // point to the same (now-dead) IP.
+        // v26.11.40-link: wildcardEnabled controls whether *.domain wildcard
+        // matching is used. Re-enabled with a 10-second TTL (down from 60s).
+        // CDN edges rotate every 60-90 seconds, so a 10-second wildcard cache
+        // is safe — the IP is still valid when the wildcard expires. This
+        // gives instant resolution (0ms) for new subdomains that arrive
+        // within 10 seconds of the first one, eliminating the 200ms DNS
+        // delay when switching videos. After 10 seconds, a fresh resolution
+        // happens, so we never get stuck on a dead edge for more than 10s.
+        // The old 60s TTL caused mass-stalls because all subdomains shared
+        // one IP for a full minute after the edge rotated.
         wildcardEnabled bool
         PreferIPv4      bool
         PreferIPv6      bool
@@ -63,8 +64,8 @@ func NewStickyResolver(ttl time.Duration) *StickyResolver {
                 entries:         make(map[string]*stickyEntry),
                 refreshing:      make(map[string]chan struct{}),
                 ttl:             ttl,
-                wildcardTTL:     60 * time.Second,
-                wildcardEnabled: false, // v26.11.39-link: disabled — causes mass-stalls on CDN rotation
+                wildcardTTL:     10 * time.Second, // v26.11.40-link: 10s (was 60s) — CDN edges rotate every 60-90s, so 10s is safe
+                wildcardEnabled: true,             // v26.11.40-link: re-enabled with 10s TTL — instant resolution for new subdomains without mass-stall risk
                 stopCh:          make(chan struct{}),
         }
         go s.reaper()
