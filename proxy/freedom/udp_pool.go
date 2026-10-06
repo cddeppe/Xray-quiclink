@@ -822,15 +822,25 @@ func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                         break
                 }
 
-                var destAddr stdnet.Addr
-                if b.UDP != nil {
-                        destAddr = &stdnet.UDPAddr{
-                                IP:   b.UDP.Address.IP(),
-                                Port: int(b.UDP.Port),
-                        }
-                } else {
-                        destAddr = w.conn.socket.dest
-                }
+                // v26.10.74-link: always use socket.dest (the pool's fixed
+                // destination IP that freedom already resolved and dialed).
+                //
+                // The previous code called `b.UDP.Address.IP()` to construct
+                // the destAddr. This was unsafe because the dispatcher's QUIC
+                // sniffing override (default.go:378,390) and the handler's
+                // EndpointOverrideReader (override.go:13-23) rewrite b.UDP.Address
+                // from the original IP to the sniffed SNI domain (a domainAddress).
+                // Calling IP() on a domainAddress panics
+                // (common/net/address.go:171-173: `panic("Calling IP() on a DomainAddress.")`),
+                // killing the goroutine without recover() and causing Chrome
+                // to fall back to HTTP/2.
+                //
+                // Always using socket.dest is both safer (no panic) and more
+                // correct: the pool's entire DCID-demux model assumes one
+                // destination per socket. All packets sent through this writer
+                // should go to socket.dest — the address the pooled socket
+                // was acquired for at freedom.go:619 (h.socketPool.Acquire).
+                destAddr := w.conn.socket.dest
 
                 n, err := w.conn.WriteTo(b.Bytes(), destAddr)
                 b.Release()
