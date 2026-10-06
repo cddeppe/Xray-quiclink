@@ -964,17 +964,21 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 			// Initial: token length (varint) + packet length (varint)
 			tokenLen, tokenLenBytes, ok := readQUICVarint(remaining[afterScid:])
 			if !ok {
+				xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK at token_len read, afterScid=", afterScid, " remaining_len=", len(remaining))
 				break
 			}
 			afterToken := afterScid + tokenLenBytes + int(tokenLen)
 			if afterToken > len(remaining) {
+				xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK afterToken=", afterToken, " > remaining=", len(remaining))
 				break
 			}
 			pktLen, pktLenBytes, ok := readQUICVarint(remaining[afterToken:])
 			if !ok {
+				xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK at pkt_len read, afterToken=", afterToken)
 				break
 			}
 			packetEnd = afterToken + pktLenBytes + int(pktLen)
+			xrayerrors.LogWarning(context.Background(), "splitCoalesced: Initial parsed, tokenLen=", tokenLen, " pktLen=", pktLen, " packetEnd=", packetEnd)
 		} else if packetType == 1 || packetType == 2 {
 			// 0-RTT (type 1) and Handshake (type 2): packet length (varint) after SCID
 			// v26.11.14-link: 0-RTT has the same format as Handshake.
