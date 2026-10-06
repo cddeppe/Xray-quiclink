@@ -2,6 +2,7 @@ package freedom
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	stdnet "net"
@@ -389,6 +390,18 @@ func (s *pooledSocket) readLoop() {
 		// make+copy per packet.
 		packet := getPacket()
 		copy(packet, b[:n])
+
+		// v26.11.19-link: send ICMP "Fragmentation Needed" to the
+		// server when the response exceeds the path MTU. QUIC
+		// servers coalesce Initial+Handshake+0-RTT into one UDP
+		// datagram up to 65535 bytes via GSO. We can't forward this
+		// to the browser (path MTU is 1500, max UDP payload is
+		// 65507). IP fragmentation is unreliable. Instead, send ICMP
+		// Type 3 Code 4 to the server with next-hop MTU = 1250.
+		// The server's QUIC stack will reduce its packet size.
+		if n > 1250 {
+			sendICMPFragmentationNeeded(s.dest, 1250)
+		}
 
 		dcid, _, err := quic.ParseDCID(packet[:n])
 		if err != nil {
@@ -1085,4 +1098,107 @@ func isQUICLongHeader(b []byte) bool {
 		return false
 	}
 	return b[0]&0x80 != 0 && b[0]&0x40 != 0
+}
+
+// v26.11.19-link: sendICMPFragmentationNeeded sends an ICMP
+// "Destination Unreachable - Fragmentation Needed" (Type 3, Code 4)
+// to the server. This tells the server's QUIC stack to reduce its
+// UDP payload size to fit within the path MTU. The server will
+// then send the Handshake in smaller, non-coalesced packets.
+//
+// This is what routers do when a packet is too large to forward.
+// We're doing the same: the proxy can't forward the large coalesced
+// datagram to the browser (path MTU 1500), so we tell the server
+// to use smaller packets.
+//
+// ICMP format (RFC 792):
+//
+//	Type: 3 (Destination Unreachable)
+//	Code: 4 (Fragmentation Needed)
+//	Checksum: 16-bit ones-complement sum
+//	Unused: 4 bytes (0)
+//	Next-hop MTU: 2 bytes
+//	Original packet: IP header + 8 bytes of original datagram
+func sendICMPFragmentationNeeded(dest *stdnet.UDPAddr, nextHopMTU int) {
+	destIP := dest.IP
+	if destIP == nil {
+		return
+	}
+
+	// Create a raw ICMP socket
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+	if err != nil {
+		// Likely no CAP_NET_RAW — silently skip
+		return
+	}
+	defer syscall.Close(fd)
+
+	// Build the ICMP packet
+	// Type 3, Code 4, Checksum, Unused (4 bytes), Next-hop MTU (2 bytes)
+	// + original IP header (20 bytes) + 8 bytes of original payload
+	icmp := make([]byte, 8+20+8) // 36 bytes
+
+	icmp[0] = 3 // Type: Destination Unreachable
+	icmp[1] = 4 // Code: Fragmentation Needed
+	icmp[2] = 0 // Checksum high
+	icmp[3] = 0 // Checksum low
+	// Unused (4 bytes): already 0
+	binary.BigEndian.PutUint16(icmp[6:8], uint16(nextHopMTU))
+
+	// Original IP header (simplified — we don't have the real one)
+	// The server's QUIC stack uses this to identify the connection.
+	// Include the server's IP as destination and the local IP as source.
+	ipHeader := icmp[8:28]
+	ipHeader[0] = 0x45             // Version 4, IHL 5
+	ipHeader[1] = 0                // DSCP/ECN
+	totalLen := uint16(20 + 8 + 8) // IP + UDP + 8 bytes payload
+	binary.BigEndian.PutUint16(ipHeader[2:4], totalLen)
+	ipHeader[4] = 0 // Identification
+	ipHeader[5] = 0
+	ipHeader[6] = 0x40 // DF flag set (Fragmentation Needed requires DF)
+	ipHeader[7] = 0
+	ipHeader[8] = 64 // TTL
+	ipHeader[9] = 17 // Protocol: UDP
+	// Checksum: 0 (we don't need to compute IP checksum for ICMP to work)
+	// Source IP: our IP (the proxy)
+	if v4 := destIP.To4(); v4 != nil {
+		// Use 0.0.0.0 as source — the kernel will fill in the real source
+	}
+	// Destination IP: the server
+	if v4 := destIP.To4(); v4 != nil {
+		copy(ipHeader[16:20], v4)
+	}
+
+	// 8 bytes of original payload (UDP header)
+	udpHeader := icmp[28:36]
+	// Source port: the pool socket's local port (we don't know it, use 0)
+	binary.BigEndian.PutUint16(udpHeader[0:2], 0)
+	// Destination port: 443
+	binary.BigEndian.PutUint16(udpHeader[2:4], uint16(dest.Port))
+
+	// Compute ICMP checksum (ones-complement sum)
+	var sum uint32
+	for i := 0; i < len(icmp); i += 2 {
+		sum += uint32(icmp[i])<<8 | uint32(icmp[i+1])
+	}
+	for sum>>16 > 0 {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+	checksum := ^uint16(sum)
+	icmp[2] = byte(checksum >> 8)
+	icmp[3] = byte(checksum)
+
+	// Send to the server
+	var addr syscall.SockaddrInet4
+	if v4 := destIP.To4(); v4 != nil {
+		copy(addr.Addr[:], v4)
+	} else {
+		return
+	}
+	err = syscall.Sendto(fd, icmp, 0, &addr)
+	if err != nil {
+		xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP send failed: ", err)
+	} else {
+		xrayerrors.LogWarning(context.Background(), "udp_pool: sent ICMP Fragmentation Needed to ", destIP, " mtu=", nextHopMTU)
+	}
 }
