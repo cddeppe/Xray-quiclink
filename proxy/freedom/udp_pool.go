@@ -926,6 +926,9 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 		// Packet type (bits 4-5 of first byte)
 		packetType := (firstByte & 0x30) >> 4
 
+		// v26.11.16-diag: log what the split sees
+		xrayerrors.LogWarning(context.Background(), "splitCoalesced: iter=", i, " offset=", offset, " remaining_len=", len(remaining), " firstByte=", firstByte, " packetType=", packetType, " dcidLen=", dcidLen, " scidLen=", scidLen)
+
 		var packetEnd int
 		if packetType == 0 {
 			// Initial: token length (varint) + packet length (varint)
