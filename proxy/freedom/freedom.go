@@ -112,7 +112,7 @@ type Handler struct {
         socketPool      *UDPSocketPool
         stickyResolver  *StickyResolver
         // v26.10.44-link: TCP warm-pool for connection reuse.
-        tcpWarmPool *TCPSocketPool
+        tcpWarmPool     *TCPSocketPool
         // v26.10.17-link: sockopt config from freedom outbound's streamSettings.
         socketConfig *internet.SocketConfig
 }
@@ -237,13 +237,8 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 }
 
                 if config.UdpConfig.EnableSocketPool {
-                        // v26.11.1-link: reduced default stalenessTimeout from 300s
-                        // to 30s. 300s was too long — when a CDN edge rotates, the
-                        // phone retried for up to 5 minutes before the pool considered
-                        // the socket stale. 30s catches dead edges much faster,
-                        // reducing stall duration from ~42s to ~15s. Config can still
-                        // override via udpConfig.poolStalenessTimeout.
-                        staleness := secondsOrDefault(config.UdpConfig.GetPoolStalenessTimeout(), 30)
+                        // v26.11.1-link: reduced default stalenessTimeout from 300s to 30s.
+        staleness := secondsOrDefault(config.UdpConfig.GetPoolStalenessTimeout(), 30)
                         idle := secondsOrDefault(config.UdpConfig.GetPoolIdleTimeout(), 600)
                         unused := secondsOrDefault(config.UdpConfig.GetPoolUnusedTimeout(), 300)
                         h.socketPool = NewUDPSocketPool(
@@ -269,12 +264,7 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                                 h.stickyResolver.onIPChanged = func(oldIP, _ string) {
                                         pool.InvalidateByIP(oldIP)
                                 }
-                                // v26.11.1-link: when pool detects a stale socket (CDN
-                                // edge rotation), proactively refresh DNS for all hostnames
-                                // pointing at the stale IP. This closes the gap between
-                                // "socket stale" and "resolver gets new IP" — without this,
-                                // the resolver keeps returning the old IP for up to TTL
-                                // seconds, and the phone retries into a black hole.
+                                // v26.11.1-link: when pool detects a stale socket, proactively refresh DNS
                                 pool.onSocketStale = func(staleIP string) {
                                         resolver.RefreshByIP(staleIP)
                                 }
@@ -292,23 +282,6 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                                 learnVisits = 3 // default: 3 visits to stabilize
                         }
                         h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, preWarmN, preWarmFirstN, learnVisits)
-                        // v26.11.2-link: when the TCP warm pool detects a dead/expired
-                        // connection (CDN edge rotation), proactively refresh DNS via the
-                        // sticky resolver. The dest key is "ip:port" — extract the IP
-                        // and call RefreshByIP, which finds all hostnames pointing at
-                        // that IP and triggers background DNS refresh for each.
-                        if h.stickyResolver != nil {
-                                resolver := h.stickyResolver
-                                h.tcpWarmPool.onSocketStale = func(destKey string) {
-                                        ip := destKey
-                                        if idx := strings.LastIndex(destKey, ":"); idx > 0 {
-                                                ip = destKey[:idx]
-                                        }
-                                        ip = strings.TrimPrefix(ip, "[")
-                                        ip = strings.TrimSuffix(ip, "]")
-                                        resolver.RefreshByIP(ip)
-                                }
-                        }
                         if preWarmFirstN > 0 {
                                 errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s firstN=", preWarmFirstN, " learnVisits=", learnVisits, ")")
                         } else if preWarmN > 0 {
@@ -584,31 +557,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.2-link: TCP dial failure with DNS refresh.
-                        // If the dial failed (connection refused, timeout, etc.)
-                        // and the destination was a domain, the cached IP may be
-                        // stale (CDN edge rotated). Proactively refresh DNS via the
-                        // sticky resolver and retry with the new IP. This catches
-                        // the case where the warm pool didn't have a dead conn to
-                        // detect (first connection to this host, or pool empty).
-                        if destination.Address.Family().IsDomain() && h.stickyResolver != nil {
-                                domain := destination.Address.Domain()
-                                errors.LogWarning(ctx, "freedom: TCP dial to ", destination, " failed, refreshing DNS and retrying")
-                                // Force a fresh DNS lookup (bypass sticky cache)
-                                h.stickyResolver.RefreshByDomain(domain)
-                                // Wait briefly for the background refresh, then re-resolve
-                                if freshIP, rerr := h.stickyResolver.ResolveFresh(ctx, domain); rerr == nil {
-                                        retryDest := destination
-                                        retryDest.Address = freshIP
-                                        if rawConn3, derr := dialer.Dial(ctx, retryDest); derr == nil {
-                                                conn = rawConn3
-                                                errors.LogInfo(ctx, "freedom: TCP dial retry succeeded with fresh IP ", freshIP, " for ", domain)
-                                                return nil
-                                        } else {
-                                                errors.LogInfoInner(ctx, derr, "freedom: TCP dial retry with fresh IP failed for ", domain)
-                                        }
-                                }
-                        }
                         return err
                 }
 
@@ -674,48 +622,34 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 mb, peekErr := input.ReadMultiBuffer()
                 if peekErr == nil && len(mb) > 0 {
                         peekedPackets = mb
-                        if isQUICPacket(mb[0].Bytes()) {
-                                // v26.11.45-link: check SCID length. If 0-length (Chrome/Edge
-                                // default), DON'T use the pool — the DCID demux can't distinguish
-                                // connections with 0-length CIDs (they all share dcidKey{len:0}).
-                                // Route through per-session instead (dedicated socket per connection,
-                                // kernel handles demux by 4-tuple).
-                                if isQUICLongHeader(mb[0].Bytes()) {
-                                        if scid, _, err := parseQUICSCID(mb[0].Bytes()); err == nil && len(scid) == 0 {
-                                                errors.LogWarning(ctx, "freedom: UDP path=per-session (0-length SCID — pool demux impossible)")
-                                                // Fall through to per-session path (pooledConn stays nil)
-                                                // but keep the peeked packets so they get written.
-                                        } else if scid, _, err := parseQUICSCID(mb[0].Bytes()); err == nil && len(scid) > 0 {
-                                                remoteAddr := conn.RemoteAddr()
-                                                var udpRemote *net.UDPAddr
-                                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
-                                                        udpRemote = u
-                                                } else {
-                                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
-                                                }
-                                                if udpRemote != nil {
-                                                        var sourceUDP *net.UDPAddr
-                                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                            sourceUDP = &net.UDPAddr{IP: inbound.Source.Address.IP(), Port: int(inbound.Source.Port)}
-                                                        }
-                                                        pooledConn, err = h.socketPool.Acquire(udpRemote, sourceUDP)
-                                                        if err != nil {
-                                                                buf.ReleaseMulti(peekedPackets)
-                                                                peekedPackets = nil
-                                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
-                                                        }
-                                                        defer pooledConn.Close()
-                                                        outGateway = nil
-                                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
-                                                }
-                                        } else {
-                                                // Short header or SCID parse failed — can't determine SCID.
-                                                // Fall through to per-session (safe default).
-                                                errors.LogWarning(ctx, "freedom: UDP path=per-session (short header or SCID parse fail) dest=", destination)
-                                        }
+                        if isQUICLongHeader(mb[0].Bytes()) {
+                                remoteAddr := conn.RemoteAddr()
+                                var udpRemote *net.UDPAddr
+                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
+                                        udpRemote = u
                                 } else {
-                                        errors.LogWarning(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
+                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
+                                if udpRemote != nil {
+                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        if err != nil {
+                                                // v26.10.34-link (C3 fix): release peeked packets
+                                                // before returning. Without this, every Acquire
+                                                // failure leaks one MultiBuffer (up to 8KB+ per
+                                                // failure) — unbounded growth under flapping dest.
+                                                buf.ReleaseMulti(peekedPackets)
+                                                peekedPackets = nil
+                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
+                                        }
+                                        defer pooledConn.Close()
+                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
+                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
+                                        outGateway = nil
+                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
+                                }
+                        } else {
+                                // Non-QUIC UDP first byte — per-session path.
+                                errors.LogWarning(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
                 } else {
@@ -854,8 +788,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         return errors.New("failed to process response").Base(err)
                 }
-                // v26.11.5-diag: log when responseDone finishes reading
-                errors.LogWarning(ctx, "freedom: responseDone finished reading, dest=", destination.String())
                 return nil
         }
 

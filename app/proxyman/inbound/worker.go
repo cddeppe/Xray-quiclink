@@ -255,7 +255,6 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 
         offsets, splitErr := quic.SplitCoalesced(buf)
         if splitErr != nil || len(offsets) <= 1 {
-                errors.LogWarning(context.Background(), "DIAG: udpConn.Write buf=", len(buf), " offsets=", len(offsets), " NO_SPLIT")
                 n, err := c.output(buf)
                 if c.downlink != nil {
                         c.downlink.Add(int64(n))
@@ -266,17 +265,14 @@ func (c *udpConn) Write(buf []byte) (int, error) {
                 return n, err
         }
 
-        errors.LogWarning(context.Background(), "DIAG: udpConn.Write buf=", len(buf), " offsets=", len(offsets), " SPLITTING")
         total := 0
-        for i, off := range offsets {
+        for _, off := range offsets {
                 packet := buf[off[0]:off[1]]
-                errors.LogWarning(context.Background(), "DIAG: udpConn.Write split ", i, "/", len(offsets), " len=", len(packet))
                 n, werr := c.output(packet)
                 if c.downlink != nil {
                         c.downlink.Add(int64(n))
                 }
                 if werr != nil {
-                        errors.LogWarning(context.Background(), "DIAG: udpConn.Write ERROR pkt=", i, " err=", werr)
                         return total, werr
                 }
                 total += n
