@@ -353,6 +353,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !destination.IsValid() {
                 return errors.New("Dispatcher: Invalid destination.")
         }
+        errors.LogWarning(ctx, "DIAG L01 DispatchLink ENTER dest=", destination, " network=", destination.Network)
         outbounds := session.OutboundsFromContext(ctx)
         if len(outbounds) == 0 {
                 outbounds = []*session.Outbound{{}}
@@ -369,8 +370,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         outbound = WrapLink(ctx, d.policy, d.stats, outbound)
         sniffingRequest := content.SniffingRequest
         if !sniffingRequest.Enabled {
+                errors.LogWarning(ctx, "DIAG L02 sniffing NOT enabled, routedDispatch direct")
                 d.routedDispatch(ctx, outbound, destination)
         } else {
+                errors.LogWarning(ctx, "DIAG L03 sniffing enabled, creating cachedReader + calling sniffer SYNCHRONOUSLY")
                 cReader := &cachedReader{
                         reader: outbound.Reader.(buf.TimeoutReader),
                         cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange
@@ -397,7 +400,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                         } else {
                                 ob.Target = destination
                         }
+                } else {
+                        errors.LogWarning(ctx, "DIAG L04 shouldOverride=false or err, using original dest=", destination)
                 }
+                errors.LogWarning(ctx, "DIAG L05 calling routedDispatch dest=", destination)
                 d.routedDispatch(ctx, outbound, destination)
         }
 
