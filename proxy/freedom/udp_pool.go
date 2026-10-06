@@ -923,6 +923,7 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 	for i := 0; i < 16 && offset < len(data); i++ {
 		remaining := data[offset:]
 		firstByte := remaining[0]
+		xrayerrors.LogWarning(context.Background(), "splitCoalesced: LOOP iter=", i, " offset=", offset, " data_len=", len(data), " remaining_len=", len(remaining))
 
 		// Short header — extends to end of datagram
 		if firstByte&0x80 == 0 {
