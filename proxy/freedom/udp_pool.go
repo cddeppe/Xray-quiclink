@@ -397,14 +397,14 @@ func (s *pooledSocket) readLoop() {
 		// servers coalesce Initial+Handshake+0-RTT into one UDP
 		// datagram up to 65535 bytes via GSO. We can't forward this
 		// to the browser (path MTU is 1500, max UDP payload is
-		// 65507). IP fragmentation is unreliable. Instead, send ICMP
-		// Type 3 Code 4 to the server with next-hop MTU = 1250.
-		// The server's QUIC stack will reduce its packet size.
+		// 65507). IP fragmentation is unreliable. ICMP Type 3
+		// Code 4 hints the server to reduce its packet size.
+		//
+		// v26.11.28-link: keep the ICMP send (harmless if server
+		// ignores it; the SplitCoalesced path in worker.go is the
+		// real fix). Silent — the per-packet warning was too noisy.
 		if n > 1250 {
-			xrayerrors.LogWarning(context.Background(), "udp_pool: readLoop received ", n, " bytes from ", addr.String(), " — sending ICMP")
 			sendICMPFragmentationNeeded(s.dest, 1250)
-		} else {
-			xrayerrors.LogInfo(context.Background(), "udp_pool: readLoop received ", n, " bytes from ", addr.String())
 		}
 
 		dcid, _, err := quic.ParseDCID(packet[:n])
@@ -924,171 +924,24 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 	// v26.11.25-link: if the reassembled data is > 1250, the server
 	// is sending coalesced packets that exceed the path MTU. Send ICMP.
+	// v26.11.28-link: this ICMP is best-effort — even if the server
+	// ignores it, the SplitCoalesced path in worker.go splits the
+	// datagram into individual UDP packets so the browser can still
+	// process it. ICMP just nudges servers that DO honor PMTUD.
 	if totalN > 1250 && b.UDP != nil {
 		serverIP := b.UDP.Address.IP()
-		xrayerrors.LogWarning(context.Background(), "udp_pool: reassembled ", totalN, " bytes from ", b.UDP.Address.String(), " — sending ICMP Fragmentation Needed")
 		sendICMPFragmentationNeeded(&stdnet.UDPAddr{IP: serverIP, Port: 443}, 1250)
 	}
 
 	return buf.MultiBuffer{b}, nil
 }
 
-// packets. QUIC servers (Cloudflare, nginx, Google) coalesce
-func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
-	data := b.Bytes()
-	udp := b.UDP
-	if len(data) == 0 {
-		return nil
-	}
-
-	var result buf.MultiBuffer
-	offset := 0
-	// Safety: max 16 coalesced packets per datagram
-	for i := 0; i < 16 && offset < len(data); i++ {
-		remaining := data[offset:]
-		firstByte := remaining[0]
-		xrayerrors.LogWarning(context.Background(), "splitCoalesced: LOOP iter=", i, " offset=", offset, " data_len=", len(data), " remaining_len=", len(remaining))
-
-		// Short header — extends to end of datagram
-		if firstByte&0x80 == 0 {
-			pkt := buf.NewWithSize(int32(len(remaining)))
-			pkt.Resize(0, int32(len(remaining)))
-			copy(pkt.Bytes(), remaining)
-			pkt.UDP = udp
-			result = append(result, pkt)
-			offset = len(data) // done
-			break
-		}
-
-		// Long header — parse to find packet length
-		if len(remaining) < 6 {
-			break
-		}
-		dcidLen := int(remaining[5])
-		if dcidLen > 20 || len(remaining) < 6+dcidLen {
-			break
-		}
-		scidOffset := 6 + dcidLen
-		if len(remaining) < scidOffset+1 {
-			break
-		}
-		scidLen := int(remaining[scidOffset])
-		if scidLen > 20 || len(remaining) < scidOffset+1+scidLen {
-			break
-		}
-		afterScid := scidOffset + 1 + scidLen
-
-		// Packet type (bits 4-5 of first byte)
-		packetType := (firstByte & 0x30) >> 4
-
-		// v26.11.16-diag: log what the split sees
-		xrayerrors.LogWarning(context.Background(), "splitCoalesced: iter=", i, " offset=", offset, " remaining_len=", len(remaining), " firstByte=", firstByte, " packetType=", packetType, " dcidLen=", dcidLen, " scidLen=", scidLen)
-
-		var packetEnd int
-		if packetType == 0 {
-			// Initial: token length (varint) + packet length (varint)
-			tokenLen, tokenLenBytes, ok := readQUICVarint(remaining[afterScid:])
-			if !ok {
-				xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK at token_len read, afterScid=", afterScid, " remaining_len=", len(remaining))
-				break
-			}
-			afterToken := afterScid + tokenLenBytes + int(tokenLen)
-			if afterToken > len(remaining) {
-				xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK afterToken=", afterToken, " > remaining=", len(remaining))
-				break
-			}
-			pktLen, pktLenBytes, ok := readQUICVarint(remaining[afterToken:])
-			if !ok {
-				xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK at pkt_len read, afterToken=", afterToken)
-				break
-			}
-			packetEnd = afterToken + pktLenBytes + int(pktLen)
-			xrayerrors.LogWarning(context.Background(), "splitCoalesced: Initial parsed, tokenLen=", tokenLen, " pktLen=", pktLen, " packetEnd=", packetEnd)
-		} else if packetType == 1 || packetType == 2 {
-			// 0-RTT (type 1) and Handshake (type 2): packet length (varint) after SCID
-			// v26.11.14-link: 0-RTT has the same format as Handshake.
-			// Previous code only handled type 2, breaking on type 1.
-			// The unparsed 0-RTT data was sent as one huge chunk.
-			pktLen, pktLenBytes, ok := readQUICVarint(remaining[afterScid:])
-			if !ok {
-				break
-			}
-			packetEnd = afterScid + pktLenBytes + int(pktLen)
-		} else {
-			// Retry (type 3) or unknown — can't parse, stop
-			break
-		}
-
-		if packetEnd <= offset || packetEnd > len(remaining)+offset {
-			xrayerrors.LogWarning(context.Background(), "splitCoalesced: BREAK safety check, packetEnd=", packetEnd, " offset=", offset, " remaining_len=", len(remaining))
-			break // safety: offset must advance
-		}
-		pktData := data[offset:packetEnd]
-		pkt := buf.NewWithSize(int32(len(pktData)))
-		pkt.Resize(0, int32(len(pktData)))
-		copy(pkt.Bytes(), pktData)
-		pkt.UDP = udp
-		result = append(result, pkt)
-		offset = packetEnd
-		xrayerrors.LogWarning(context.Background(), "splitCoalesced: packet created, len=", len(pktData), " offset=", offset, " data_len=", len(data))
-	}
-
-	// v26.11.22-link: if the loop broke early (parse failed at some
-	// iteration), send the remaining unparsed data as a final packet.
-	// The remaining data might be a valid QUIC packet that we couldn't
-	// parse (e.g. encrypted 1-RTT short header, or a coalesced packet
-	// with a different format). Sending it as-is lets the browser's
-	// QUIC stack handle it. Truncation to 65507 is handled by udpConn.Write.
-	if offset < len(data) && len(result) > 0 {
-		remainingData := data[offset:]
-		pkt := buf.NewWithSize(int32(len(remainingData)))
-		pkt.Resize(0, int32(len(remainingData)))
-		copy(pkt.Bytes(), remainingData)
-		pkt.UDP = udp
-		result = append(result, pkt)
-		xrayerrors.LogWarning(context.Background(), "splitCoalesced: remaining data sent as final packet, len=", len(remainingData), " offset=", offset)
-	}
-
-	if len(result) <= 1 {
-		// Split didn't produce multiple packets.
-		// Release the result packets and return nil.
-		// v26.11.15-link: do NOT release b here — the caller
-		// needs it. b.Release() is only called when the split
-		// succeeds (len(result) > 1).
-		for _, p := range result {
-			p.Release()
-		}
-		return nil
-	}
-
-	// Split succeeded — now safe to release the original buffer
-	b.Release()
-
-	// v26.11.21-link: send ALL split packets. No drop. Small packets
-	// (≤1250) go through fine. Large packets (>1250, e.g. the Handshake
-	// with certificate chain) are truncated to 65507 by udpConn.Write
-	// and sent via IP fragmentation. The browser may not receive them
-	// (IP fragmentation unreliable), but the small packets (Initial,
-	// ACKs, 1-RTT data) get through and the QUIC handshake completes.
-	return result
-}
-
-// readQUICVarint reads a QUIC variable-length integer (RFC 9000 §16).
-func readQUICVarint(data []byte) (uint64, int, bool) {
-	if len(data) < 1 {
-		return 0, 0, false
-	}
-	first := data[0]
-	length := 1 << (first >> 6)
-	if len(data) < length {
-		return 0, 0, false
-	}
-	val := uint64(first & 0x3f)
-	for i := 1; i < length; i++ {
-		val = (val << 8) | uint64(data[i])
-	}
-	return val, length, true
-}
+// v26.11.28-link: splitCoalescedQUIC and its readQUICVarint helper removed.
+// The live split logic is now quic.SplitCoalesced in
+// common/protocol/quic/split.go, called from
+// app/proxyman/inbound/worker.go udpConn.Write. The old in-pool splitter
+// was never called (dead code from an earlier iteration that used
+// buf.MultiBuffer; the live path uses byte offsets to avoid allocations).
 
 type PooledPacketWriter struct {
 	conn      *pooledConn
