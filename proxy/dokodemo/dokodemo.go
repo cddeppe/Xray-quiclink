@@ -180,54 +180,27 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 	} else {
 		// if we are in TPROXY mode, use linux's udp forging functionality
 		//
-		// v26.11.4-link: for UDP, ALWAYS use the FakeUDP (PacketWriter)
-		// path, even when destinationOverridden is false. The previous
-		// code used SequentialWriter when !destinationOverridden, which
-		// writes via udpConn.Write → hub.WriteTo(b, srcCopy). The
-		// response packet's source IP is the server's IP (e.g.,
-		// 104.18.27.14 for cloudflare-quic.com), not the listen IP
-		// (82.21.4.42). The browser's kernel drops the response (UDP
-		// source-IP mismatch — it connect()ed to the listen IP).
+		// v26.11.6-link: reverted v26.11.4's FakeUDP-for-all change.
+		// v26.11.4 made ALL UDP paths use FakeUDP, but FakeUDP binds
+		// to the listen IP:port with SO_REUSEPORT. This created a
+		// second socket on the same port as the inbound hub, and the
+		// kernel delivered incoming QUIC packets to the FakeUDP socket
+		// (which has no readLoop) instead of the inbound hub. The
+		// packet sat in the FakeUDP socket's receive queue forever,
+		// and the QUIC handshake never started.
 		//
-		// The FakeUDP path uses IP_TRANSPARENT to bind the response
-		// socket to dest.Address (the listen IP), so the response
-		// goes back with source = listen IP. The browser's kernel
-		// accepts it.
+		// For !destinationOverridden (non-FollowRedirect), use
+		// SequentialWriter as upstream does. The response goes back
+		// via hub.WriteTo which sends from the kernel-chosen source
+		// IP (the listen IP, since the kernel picks the right source
+		// for the destination). The browser accepts it because the
+		// source IP matches.
 		//
-		// When !destinationOverridden, dest.Address is the listen IP
-		// (from conn.LocalAddr(), set in v26.11.3). FakeUDP binds to
-		// that, which is correct.
-		//
-		// When destinationOverridden (FollowRedirect mode), dest.Address
-		// is ob.Target — which may be the listen IP or a forwarded IP
-		// depending on the config. FakeUDP binds to that, which is
-		// also correct.
+		// For destinationOverridden (FollowRedirect), use FakeUDP as
+		// before — the response needs to come from the original dest
+		// IP which may differ from the kernel's choice.
 		if !destinationOverridden {
-			// Use the listen IP as the FakeUDP bind address.
-			// dest.Address was set to the listen IP from
-			// conn.LocalAddr() in the !FollowRedirect path above.
-			back := conn.RemoteAddr().(*net.UDPAddr)
-			if !dest.Address.Family().IsIP() {
-				if len(back.IP) == 4 {
-					dest.Address = net.AnyIP
-				} else {
-					dest.Address = net.AnyIPv6
-				}
-			}
-			addr := &net.UDPAddr{
-				IP:   dest.Address.IP(),
-				Port: int(dest.Port),
-			}
-			var mark int
-			if d.sockopt != nil {
-				mark = int(d.sockopt.Mark)
-			}
-			pConn, err := FakeUDP(addr, mark)
-			if err != nil {
-				return err
-			}
-			writer = NewPacketWriter(pConn, &dest, mark, back)
-			defer writer.(*PacketWriter).Close() // close fake UDP conns
+			writer = &buf.SequentialWriter{Writer: conn}
 		} else {
 			back := conn.RemoteAddr().(*net.UDPAddr)
 			if !dest.Address.Family().IsIP() {
