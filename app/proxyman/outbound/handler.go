@@ -179,49 +179,7 @@ func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	content := session.ContentFromContext(ctx)
-
-	// v26.10.73-link: also pre-resolve the domain for UDP traffic when
-	// OriginalTarget is an IP, even when HasStrategy() is false.
-	//
-	// Without this, for freedom outbounds where infra/conf/xray.go:411
-	// migrates TargetStrategy to AS_IS (so HasStrategy() returns false),
-	// the dispatcher's QUIC sniffing override at default.go:378,390 sets
-	// ob.Target.Address to a domainAddress (the sniffed SNI, e.g.
-	// "youtube.com"), while ob.OriginalTarget.Address stays as the
-	// original ipv4Address/ipv6Address that the inbound's dokodemo
-	// received. Then at handler.go:204-205, EndpointOverrideReader/Writer
-	// are created with w.Dest = domainAddress("youtube.com").
-	//
-	// When the server replies, PacketReader/PooledPacketReader set
-	// b.UDP.Address = IPAddress(serverReplyIP) — an ipv4Address. The
-	// EndpointOverrideWriter comparison at common/buf/override.go:33
-	// (`b.UDP.Address == w.Dest`) compares an ipv4Address to a
-	// domainAddress. Go's interface == requires the same concrete type,
-	// so this comparison is ALWAYS false. The source IP rewrite never
-	// fires. The dokodemo PacketWriter then binds a FakeUDP socket
-	// (proxy/dokodemo/dokodemo.go:233-239, fakeudp_linux.go:15) to the
-	// server's reply IP instead of the original IP the client expected.
-	// The client's QUIC socket was connect()ed to the original IP, so
-	// the kernel silently drops the reply (UDP source-IP mismatch
-	// security feature). The QUIC handshake never completes; the client
-	// falls back to TCP/HTTP2.
-	//
-	// The fix: for UDP where OriginalTarget is an IP (i.e., the
-	// destination was sniffed and overridden from a real IP to a domain),
-	// always pre-resolve the domain at the handler. After pre-resolution,
-	// ob.Target.Address becomes an ipv4Address, so EndpointOverrideWriter's
-	// w.Dest is also an IP, the comparison matches the server's reply
-	// source IP, the rewrite fires, and the kernel accepts the reply.
-	//
-	// This preserves existing behavior for TCP (still gated by
-	// HasStrategy()) and for UDP where OriginalTarget is also a domain
-	// (the gate `ob.OriginalTarget.Address.Family().IsIP()` is false).
-	shouldPreResolveForUDP := ob.Target.Network == net.Network_UDP &&
-		ob.OriginalTarget.Address != nil &&
-		ob.OriginalTarget.Address.Family().IsIP()
-
-	if h.senderSettings != nil && ob.Target.Address.Family().IsDomain() && (content == nil || !content.SkipDNSResolve) &&
-		(h.senderSettings.TargetStrategy.HasStrategy() || shouldPreResolveForUDP) {
+	if h.senderSettings != nil && h.senderSettings.TargetStrategy.HasStrategy() && ob.Target.Address.Family().IsDomain() && (content == nil || !content.SkipDNSResolve) {
 		strategy := h.senderSettings.TargetStrategy
 		if ob.Target.Network == net.Network_UDP && ob.OriginalTarget.Address != nil {
 			strategy = strategy.GetDynamicStrategy(ob.OriginalTarget.Address.Family())
