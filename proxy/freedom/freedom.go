@@ -675,42 +675,47 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if peekErr == nil && len(mb) > 0 {
                         peekedPackets = mb
                         if isQUICPacket(mb[0].Bytes()) {
-                                remoteAddr := conn.RemoteAddr()
-                                var udpRemote *net.UDPAddr
-                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
-                                        udpRemote = u
+                                // v26.11.45-link: check SCID length. If 0-length (Chrome/Edge
+                                // default), DON'T use the pool — the DCID demux can't distinguish
+                                // connections with 0-length CIDs (they all share dcidKey{len:0}).
+                                // Route through per-session instead (dedicated socket per connection,
+                                // kernel handles demux by 4-tuple).
+                                if isQUICLongHeader(mb[0].Bytes()) {
+                                        if scid, _, err := parseQUICSCID(mb[0].Bytes()); err == nil && len(scid) == 0 {
+                                                errors.LogWarning(ctx, "freedom: UDP path=per-session (0-length SCID — pool demux impossible)")
+                                                // Fall through to per-session path (pooledConn stays nil)
+                                                // but keep the peeked packets so they get written.
+                                        } else if scid, _, err := parseQUICSCID(mb[0].Bytes()); err == nil && len(scid) > 0 {
+                                                remoteAddr := conn.RemoteAddr()
+                                                var udpRemote *net.UDPAddr
+                                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
+                                                        udpRemote = u
+                                                } else {
+                                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
+                                                }
+                                                if udpRemote != nil {
+                                                        var sourceUDP *net.UDPAddr
+                                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                            sourceUDP = &net.UDPAddr{IP: inbound.Source.Address.IP(), Port: int(inbound.Source.Port)}
+                                                        }
+                                                        pooledConn, err = h.socketPool.Acquire(udpRemote, sourceUDP)
+                                                        if err != nil {
+                                                                buf.ReleaseMulti(peekedPackets)
+                                                                peekedPackets = nil
+                                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
+                                                        }
+                                                        defer pooledConn.Close()
+                                                        outGateway = nil
+                                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
+                                                }
+                                        } else {
+                                                // Short header or SCID parse failed — can't determine SCID.
+                                                // Fall through to per-session (safe default).
+                                                errors.LogWarning(ctx, "freedom: UDP path=per-session (short header or SCID parse fail) dest=", destination)
+                                        }
                                 } else {
-                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
+                                        errors.LogWarning(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
                                 }
-                                if udpRemote != nil {
-                                        // v26.11.35-link: pass the browser source IP:port to Acquire
-                                        // so the pool can use the source -> SCID cache for the demux fix.
-                                        var sourceUDP *net.UDPAddr
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                            sourceUDP = &net.UDPAddr{IP: inbound.Source.Address.IP(), Port: int(inbound.Source.Port)}
-                                        }
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote, sourceUDP)
-                                        if err != nil {
-                                                // v26.10.34-link (C3 fix): release peeked packets
-                                                // before returning. Without this, every Acquire
-                                                // failure leaks one MultiBuffer (up to 8KB+ per
-                                                // failure) — unbounded growth under flapping dest.
-                                                buf.ReleaseMulti(peekedPackets)
-                                                peekedPackets = nil
-                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
-                                        }
-                                        defer pooledConn.Close()
-                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
-                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
-                                        outGateway = nil
-                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
-                                }
-                        } else {
-                                // Non-QUIC UDP first byte — per-session path.
-                                // v26.11.32-link: this now only fires for non-QUIC UDP
-                                // (WireGuard, DNS, games). QUIC short headers (1-RTT)
-                                // are now routed to the pool via isQUICPacket.
-                                errors.LogWarning(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
                 } else {
