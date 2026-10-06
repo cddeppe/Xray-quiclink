@@ -427,24 +427,19 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         conn, existing := w.getConnection(id)
 
-        // v26.10.43-link (audit C3 from 2-b): re-check under lock that no
-        // other goroutine created a conn with the same id between
-        // tryQUICMigration returning nil and getConnection returning. If
-        // a race occurred (two Initials arriving simultaneously), the
-        // second goroutine would create a duplicate conn. Re-check catches
-        // this: if a conn now exists, discard the duplicate and use the
-        // existing one.
-        if !existing {
-                w.Lock()
-                if existingConn, found := w.activeConn[id]; found && !existingConn.done.Done() {
-                        // Another goroutine won the race. Use their conn.
-                        w.Unlock()
-                        conn = existingConn
-                        existing = true
-                } else {
-                        w.Unlock()
-                }
-        }
+        // v26.10.53-link REVERT (re-applied v26.10.78): the v26.10.43 C3
+        // "fix" broke ALL new UDP connections. The re-check under lock
+        // ALWAYS found the conn that getConnection just created (because
+        // getConnection stores the new conn in w.activeConn[id] before
+        // returning), so it set existing=true and skipped the goroutine
+        // that processes the connection. The packet sat in the pipe
+        // forever — client timed out. This broke ALL UDP: QUIC, DNS,
+        // masque, shadowsocks UDP relay.
+        //
+        // The C3 fix was intended to catch a race between two goroutines
+        // creating duplicate conns. But getConnection already holds the
+        // lock during creation, so the race is already prevented.
+        // The C3 re-check is unnecessary AND broken — reverted.
 
         // Record DCID and src for new QUIC connections
         if !existing {
