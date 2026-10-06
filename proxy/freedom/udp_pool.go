@@ -857,7 +857,141 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			Network: xraynet.Network_UDP,
 		}
 	}
+
+	// v26.11.13-link: split coalesced QUIC datagrams into individual
+	// packets. QUIC servers (Cloudflare, nginx, Google) coalesce
+	// Initial + Handshake + 0-RTT into one UDP datagram. The full
+	// datagram can exceed the max UDP payload (65507) or the path
+	// MTU (1500), causing "sendto: message too long". Each individual
+	// QUIC packet is ≤1250 bytes (RFC 9000 §14). Splitting them lets
+	// each packet be sent as a separate UDP datagram.
+	if n > 1250 && b.UDP != nil {
+		mb := splitCoalescedQUIC(b)
+		if mb != nil {
+			return mb, nil
+		}
+	}
+
 	return buf.MultiBuffer{b}, nil
+}
+
+// splitCoalescedQUIC splits a coalesced QUIC datagram into individual
+// QUIC packets. Returns nil if splitting fails (caller uses original buffer).
+//
+// v26.11.13-link: fixed the infinite loop from v26.11.8 by adding a
+// safety guard: if offset doesn't advance, break immediately.
+func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
+	data := b.Bytes()
+	udp := b.UDP
+	if len(data) == 0 {
+		return nil
+	}
+
+	var result buf.MultiBuffer
+	offset := 0
+	// Safety: max 16 coalesced packets per datagram
+	for i := 0; i < 16 && offset < len(data); i++ {
+		remaining := data[offset:]
+		firstByte := remaining[0]
+
+		// Short header — extends to end of datagram
+		if firstByte&0x80 == 0 {
+			pkt := buf.NewWithSize(int32(len(remaining)))
+			pkt.Resize(0, int32(len(remaining)))
+			copy(pkt.Bytes(), remaining)
+			pkt.UDP = udp
+			result = append(result, pkt)
+			offset = len(data) // done
+			break
+		}
+
+		// Long header — parse to find packet length
+		if len(remaining) < 6 {
+			break
+		}
+		dcidLen := int(remaining[5])
+		if dcidLen > 20 || len(remaining) < 6+dcidLen {
+			break
+		}
+		scidOffset := 6 + dcidLen
+		if len(remaining) < scidOffset+1 {
+			break
+		}
+		scidLen := int(remaining[scidOffset])
+		if scidLen > 20 || len(remaining) < scidOffset+1+scidLen {
+			break
+		}
+		afterScid := scidOffset + 1 + scidLen
+
+		// Packet type (bits 4-5 of first byte)
+		packetType := (firstByte & 0x30) >> 4
+
+		var packetEnd int
+		if packetType == 0 {
+			// Initial: token length (varint) + packet length (varint)
+			tokenLen, tokenLenBytes, ok := readQUICVarint(remaining[afterScid:])
+			if !ok {
+				break
+			}
+			afterToken := afterScid + tokenLenBytes + int(tokenLen)
+			if afterToken > len(remaining) {
+				break
+			}
+			pktLen, pktLenBytes, ok := readQUICVarint(remaining[afterToken:])
+			if !ok {
+				break
+			}
+			packetEnd = afterToken + pktLenBytes + int(pktLen)
+		} else if packetType == 2 {
+			// Handshake: packet length (varint) after SCID
+			pktLen, pktLenBytes, ok := readQUICVarint(remaining[afterScid:])
+			if !ok {
+				break
+			}
+			packetEnd = afterScid + pktLenBytes + int(pktLen)
+		} else {
+			// 0-RTT, Retry, or unknown — can't parse, stop
+			break
+		}
+
+		if packetEnd <= offset || packetEnd > len(remaining)+offset {
+			break // safety: offset must advance
+		}
+		pktData := data[offset:packetEnd]
+		pkt := buf.NewWithSize(int32(len(pktData)))
+		pkt.Resize(0, int32(len(pktData)))
+		copy(pkt.Bytes(), pktData)
+		pkt.UDP = udp
+		result = append(result, pkt)
+		offset = packetEnd
+	}
+
+	b.Release()
+
+	if len(result) <= 1 {
+		for _, p := range result {
+			p.Release()
+		}
+		return nil
+	}
+	return result
+}
+
+// readQUICVarint reads a QUIC variable-length integer (RFC 9000 §16).
+func readQUICVarint(data []byte) (uint64, int, bool) {
+	if len(data) < 1 {
+		return 0, 0, false
+	}
+	first := data[0]
+	length := 1 << (first >> 6)
+	if len(data) < length {
+		return 0, 0, false
+	}
+	val := uint64(first & 0x3f)
+	for i := 1; i < length; i++ {
+		val = (val << 8) | uint64(data[i])
+	}
+	return val, length, true
 }
 
 type PooledPacketWriter struct {
