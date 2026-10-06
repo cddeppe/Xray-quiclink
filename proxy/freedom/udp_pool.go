@@ -21,6 +21,22 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
+// registerQUICPoolCIDs pre-registers the packet's SCID/DCID before sending it
+// on the pooled socket. This avoids the race where the server's reply arrives
+// before the demux map is populated, leading to a demux miss and the reply
+// being silently dropped.
+func registerQUICPoolCIDs(c *pooledConn, packet []byte) {
+	if c == nil || len(packet) == 0 || packet[0]&0x80 == 0 {
+		return
+	}
+	if scid, _, err := parseQUICSCID(packet); err == nil {
+		c.RegisterCID(scid)
+	}
+	if dcid, _, err := quic.ParseDCID(packet); err == nil {
+		c.RegisterCID(dcid)
+	}
+}
+
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
 // UDP socket. Reply packets are demuxed by parsing the QUIC DCID.
@@ -255,9 +271,9 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 		//
 		// v26.11.1-link: reduced default stalenessTimeout from 300s
 		// to 30s (see freedom.go). 300s was too long — when a CDN edge
-		// rotates, the phone retries for up to 5 minutes before the
-		// pool considers the socket stale. 30s catches dead edges
-		// much faster, reducing stall duration from ~42s to ~15s.
+		// rotates, the phone retries for up to 5 minutes before the pool considers
+		// the socket stale. 30s catches dead edges much faster, reducing stall
+		// duration from ~42s to ~15s.
 		sock.mu.Lock()
 		// v26.10.43-link (audit P5): atomic read
 		isStale := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.stalenessTimeout
@@ -614,6 +630,12 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 	if c.closed.Load() {
 		return 0, io.EOF
 	}
+
+	// v26.11.30-link: pre-register QUIC SCID/DCID before writing to the socket.
+	// If we wait until after WriteTo, the server can reply before the demux map is
+	// populated and the reply is silently dropped as a demux miss. This was the
+	// actual H3 failure mode for quic.nginx.org / cloudflare-quic.com.
+	registerQUICPoolCIDs(c, b)
 
 	// v26.10.15-link: only parse SCID for long headers (Initial,
 	// 0-RTT, Handshake). Short headers (1-RTT, bit 7 = 0) don't
