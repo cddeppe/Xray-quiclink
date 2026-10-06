@@ -47,6 +47,7 @@ type pooledSocket struct {
         lastUsed      atomic.Int64 // UnixNano
         lastReplyTime atomic.Int64  // UnixNano
         demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
+        demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -103,6 +104,11 @@ type pooledConn struct {
         // can check it without acquiring mu. mu is still needed to
         // protect scids map mutations during Close.
         closed atomic.Bool
+        // v26.11.52-link (Solution B): source is the inbound client's
+        // source IP:port, captured at Acquire time in freedom.go so the
+        // pool can bind outbound packets to the originating client. nil
+        // for non-QUIC / per-session paths.
+        source *stdnet.UDPAddr
         // v26.10.16-link: scidsDCID stores the SCIDs we've registered
         // in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
         // so Close() can index demux directly without converting from
@@ -288,6 +294,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         conn:          pc,
                         dest:          dest,
                         demux:         make(map[dcidKey]chan<- readResult),
+                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
@@ -385,6 +392,7 @@ func (s *pooledSocket) readLoop() {
                 // and Close (which use Lock), so RLock is correct here.
                 s.mu.RLock()
                 ch, ok := s.demux[dk]
+                src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
                 // Update timestamps under Lock. This is a short critical
@@ -430,13 +438,25 @@ func (s *pooledSocket) readLoop() {
                 // 1. Large channel (256) so drops are rare during bursts
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
+                sentOk := false
                 select {
                 case ch <- readResult{data: packet, addr: addr}:
+                        sentOk = true
                 default:
                         s.droppedReplies.Add(1)
                         // v26.10.42-link (audit P3): return the pooled buffer
                         // when the inbox is full and we drop the packet.
                         putPacket(packet)
+                }
+
+                if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        pktType := (packet[0] >> 4) & 0x03
+                        if pktType == 0x00 {
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidCopy := append([]byte(nil), scid...)
+                                        quic.NotifyServerSCID(scidCopy, src)
+                                }
+                        }
                 }
         }
 }
@@ -550,6 +570,9 @@ func (c *pooledConn) RegisterCID(cid []byte) {
                 }
                 c.socket.mu.Lock()
                 c.socket.demux[dk] = c.inbox
+                if c.source != nil {
+                        c.socket.demuxSource[dk] = c.source
+                }
                 c.socket.mu.Unlock()
                 c.mu.Unlock()
         }
@@ -636,6 +659,7 @@ func (c *pooledConn) Close() error {
         for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
                         delete(c.socket.demux, dk)
+                        delete(c.socket.demuxSource, dk)
                 }
         }
         c.socket.mu.Unlock()

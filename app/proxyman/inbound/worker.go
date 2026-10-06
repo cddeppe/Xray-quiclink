@@ -3,6 +3,7 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        stdnet "net"
         "sync"
 
         "github.com/xtls/xray-core/common/protocol/quic"
@@ -218,14 +219,41 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        n, err := c.output(buf)
-        if c.downlink != nil {
-                c.downlink.Add(int64(n))
+        if len(buf) <= 1250 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        if err == nil {
-                c.updateActivity()
+        offsets, splitErr := quic.SplitCoalesced(buf)
+        if splitErr != nil || len(offsets) <= 1 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        return n, err
+        total := 0
+        for _, off := range offsets {
+                packet := buf[off[0]:off[1]]
+                n, werr := c.output(packet)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if werr != nil {
+                        return total, werr
+                }
+                total += n
+        }
+        c.updateActivity()
+        return total, nil
 }
 
 func (c *udpConn) Close() error {
@@ -293,6 +321,28 @@ func makeSrcKey(d net.Destination) srcKey {
                 copy(k.ip[:], ip.To16())
         }
         k.port = uint16(d.Port)
+        return k
+}
+
+// makeSrcKeyFromUDPAddr computes a srcKey from a stdnet.UDPAddr.
+// Used by OnServerSCID to map a *stdnet.UDPAddr (handed in by the
+// SCID hook) onto the same srcKey form produced by makeSrcKey, so
+// that lookups in w.srcIndex succeed regardless of whether the
+// source address came from a net.Destination (inbound packet
+// path) or a *stdnet.UDPAddr (outbound SCID notification path).
+func makeSrcKeyFromUDPAddr(addr *stdnet.UDPAddr) srcKey {
+        var k srcKey
+        if addr == nil || addr.IP == nil {
+                return k
+        }
+        if ip4 := addr.IP.To4(); ip4 != nil {
+                copy(k.ip[12:], ip4)
+                k.ip[10] = 0xff
+                k.ip[11] = 0xff
+        } else {
+                copy(k.ip[:], addr.IP.To16())
+        }
+        k.port = uint16(addr.Port)
         return k
 }
 
@@ -783,6 +833,45 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
         }
 }
 
+// OnServerSCID is invoked by the quic worker-hook dispatcher when a
+// server-side Initial (or other long-header) packet is observed
+// carrying serverSCID. The browserSrc is the *stdnet.UDPAddr of the
+// downstream browser that the server-side dispatcher saw the packet
+// from. We translate that into a srcKey and, if a connection already
+// exists for that srcKey, additionally record the server SCID → connID
+// association in w.dcidIndex so that subsequent 1-RTT packets with the
+// rotated DCID can be demuxed to the correct udpConn.
+//
+// This implements the browser-side half of Solution B: the browser
+// never has to wait for a CID rotation — we record the server-chosen
+// SCID as soon as we observe it and treat it as an alternate DCID for
+// the same udpConn.
+func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) {
+        if len(serverSCID) == 0 || browserSrc == nil {
+                return
+        }
+        sk := makeSrcKeyFromUDPAddr(browserSrc)
+        if sk.port == 0 && sk.ip == ([16]byte{}) {
+                return
+        }
+        w.Lock()
+        defer w.Unlock()
+        existingID, found := w.srcIndex[sk]
+        if !found {
+                return
+        }
+        existingConn, ok := w.activeConn[existingID]
+        if !ok || existingConn.done.Done() {
+                delete(w.srcIndex, sk)
+                return
+        }
+        _ = existingConn
+        dk := makeDCIDKey(serverSCID)
+        if _, exists := w.dcidIndex[dk]; !exists {
+                w.dcidIndex[dk] = existingID
+        }
+}
+
 func (w *udpWorker) handlePackets() {
         receive := w.hub.Receive()
         for payload := range receive {
@@ -849,11 +938,13 @@ func (w *udpWorker) Start() error {
         }
 
         w.hub = h
+        quic.RegisterWorkerSCIDHook(w)
         go w.handlePackets()
         return nil
 }
 
 func (w *udpWorker) Close() error {
+        quic.UnregisterWorkerSCIDHook(w)
         w.Lock()
         defer w.Unlock()
 

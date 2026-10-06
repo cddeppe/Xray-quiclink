@@ -5,6 +5,7 @@ import (
         "crypto/rand"
         stderrors "errors"
         "io"
+        stdnet "net"
         "strings"
         "sync/atomic"
         "syscall"
@@ -625,6 +626,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
+                                        }
+                                        // v26.11.52-link (Solution B): bind the pooled socket's
+                                        // source to the inbound client's source IP:port so that
+                                        // pool reply packets (read via wildcard listen) are
+                                        // demuxed back to the originating client. Without this,
+                                        // all QUIC sessions sharing a pooled socket collapse to
+                                        // the socket's local (kernel-chosen) source and the
+                                        // 4-tuple-based reply routing breaks under NAT.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                pooledConn.source = &stdnet.UDPAddr{
+                                                        IP:   inbound.Source.Address.IP(),
+                                                        Port: int(inbound.Source.Port),
+                                                }
                                         }
                                         defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
