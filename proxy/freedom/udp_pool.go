@@ -560,11 +560,13 @@ func (s *pooledSocket) readLoop() {
                 // (the latest pooledConn for this DCID will overwrite the
                 // demux entry on its next RegisterCID call).
                 sentOk := false
+                inboxClosed := false
                 func() {
                         defer func() {
                                 if r := recover(); r != nil {
-                                        // Inbox is closed — drop the packet.
-                                        _ = r // suppress unused
+                                        // Inbox is closed — mark for cleanup.
+                                        inboxClosed = true
+                                        _ = r
                                 }
                         }()
                         select {
@@ -575,9 +577,23 @@ func (s *pooledSocket) readLoop() {
                         }
                 }()
                 if !sentOk {
-                        // Either the inbox was full (default case) or closed
-                        // (panic recovered). Return the pooled buffer.
                         putPacket(packet)
+                        // v26.11.41-link: if the inbox was closed, DELETE the
+                        // stale demux entry. Without this, the stale entry
+                        // stays forever and ALL future replies with this DCID
+                        // are dropped (sent to the closed inbox → panic → drop).
+                        // With YouTube opening 5+ concurrent QUIC connections
+                        // from the same port, stale entries accumulate and
+                        // freeze all video playback.
+                        // Deleting the entry lets the next Initial from the
+                        // browser re-register the DCID on a new live inbox.
+                        if inboxClosed {
+                                s.mu.Lock()
+                                if existing, ok := s.demux[dk]; ok && existing == ch {
+                                        delete(s.demux, dk)
+                                }
+                                s.mu.Unlock()
+                        }
                 }
         }
 }
