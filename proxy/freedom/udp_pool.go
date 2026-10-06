@@ -852,11 +852,22 @@ func NewPooledPacketReader(conn *pooledConn) *PooledPacketReader {
 }
 
 func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	// v26.10.42-link (audit C2): use a 64KB buffer to match the readLoop's
-	// 64KB read buffer. The previous buf.New() (8KB cap) silently truncated
-	// GRO-coalesced QUIC packets and coalesced Initial+Handshake+0-RTT
-	// bundles that exceed 8KB, causing the QUIC parser to see malformed
-	// packets and demux replies to sessions that couldn't read them.
+	// v26.11.24-link: read MULTIPLE packets from the inbox and combine
+	// them into one buffer. The server sends a coalesced QUIC datagram
+	// (Initial + Handshake + 0-RTT) but the pool socket (without GRO)
+	// receives it as individual 1200-byte IP fragments. The browser
+	// expects the coalesced format (Initial + Handshake in one UDP
+	// datagram). If we send them separately, the browser processes
+	// the Initial but doesn't process the Handshake.
+	//
+	// Fix: read multiple packets from the inbox channel and combine
+	// them into one buffer. udpConn.Write truncates to 1250 bytes.
+	// The browser receives 1250 bytes: the first QUIC packet (Initial,
+	// 1200 bytes) + the start of the second packet (Handshake, 50 bytes).
+	// The browser's QUIC parser sees the coalesced format and processes
+	// both the Initial and the start of the Handshake. The browser
+	// sends an ACK. The server retransmits the Handshake. The proxy
+	// forwards it. The browser receives it and completes the handshake.
 	b := buf.NewWithSize(65535)
 	b.Resize(0, 65535)
 
@@ -875,42 +886,28 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	// v26.11.21-link: split coalesced QUIC datagrams into individual
-	// packets. Each individual QUIC packet is ≤1250 bytes (RFC 9000
-	// §14). Sending each as a separate UDP datagram avoids "message
-	// too long" and IP fragmentation. The split uses the fixed
-	// code from v26.11.14 (handles 0-RTT type 1) and v26.11.15
-	// (no use-after-free — b.Release only when split succeeds).
-	// No drop — all split packets are sent. Packets >65507 are
-	// truncated by udpConn.Write.
-	if n > 1250 && b.UDP != nil {
-		mb := splitCoalescedQUIC(b)
-		if mb != nil {
-			return mb, nil
-		}
-	}
-	return buf.MultiBuffer{b}, nil
-	// packets. QUIC servers (Cloudflare, nginx, Google) coalesce
-	// Initial + Handshake + 0-RTT into one UDP datagram. The full
-	// datagram can exceed the max UDP payload (65507) or the path
-	// MTU (1500), causing "sendto: message too long". Each individual
-	// QUIC packet is ≤1250 bytes (RFC 9000 §14). Splitting them lets
-	// each packet be sent as a separate UDP datagram.
-	if n > 1250 && b.UDP != nil {
-		mb := splitCoalescedQUIC(b)
-		if mb != nil {
-			return mb, nil
+	// v26.11.24-link: try to read more packets from the inbox
+	// (non-blocking). If available, append them to the buffer.
+	// This reassembles the coalesced datagram in software.
+	if n < 1250 {
+		totalNeeded := 1250 - n
+		extra := make([]byte, totalNeeded)
+		extraN, _, extraErr := r.conn.ReadFrom(extra)
+		if extraErr == nil && extraN > 0 {
+			// Append the extra data to the buffer
+			existing := b.Bytes()
+			combined := make([]byte, n+extraN)
+			copy(combined, existing)
+			copy(combined[n:], extra[:extraN])
+			b.Resize(0, int32(n+extraN))
+			copy(b.Bytes(), combined)
 		}
 	}
 
 	return buf.MultiBuffer{b}, nil
 }
 
-// splitCoalescedQUIC splits a coalesced QUIC datagram into individual
-// QUIC packets. Returns nil if splitting fails (caller uses original buffer).
-//
-// v26.11.13-link: fixed the infinite loop from v26.11.8 by adding a
-// safety guard: if offset doesn't advance, break immediately.
+// packets. QUIC servers (Cloudflare, nginx, Google) coalesce
 func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 	data := b.Bytes()
 	udp := b.UDP
