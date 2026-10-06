@@ -986,7 +986,28 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 
 	// Split succeeded — now safe to release the original buffer
 	b.Release()
-	return result
+
+	// v26.11.16-link: drop packets > 1250 bytes. QUIC servers
+	// coalesce the Handshake (with certificate chain) into one
+	// 65000+ byte packet. We can't split a single QUIC packet
+	// further, and sending it via IP fragmentation is unreliable
+	// (if any fragment is lost, the entire datagram is dropped).
+	// Dropping it lets QUIC's loss detection trigger a retransmit.
+	// The server will resend the Handshake as a single non-coalesced
+	// packet that fits within the MTU.
+	var filtered buf.MultiBuffer
+	for _, p := range result {
+		if p.Len() <= 1250 {
+			filtered = append(filtered, p)
+		} else {
+			xrayerrors.LogWarning(context.Background(), "udp_pool: dropping oversized QUIC packet len=", p.Len(), " (will trigger retransmit)")
+			p.Release()
+		}
+	}
+	if len(filtered) == 0 {
+		return nil // all packets were oversized — caller uses original (which will also be dropped by udpConn.Write truncation)
+	}
+	return filtered
 }
 
 // readQUICVarint reads a QUIC variable-length integer (RFC 9000 §16).
