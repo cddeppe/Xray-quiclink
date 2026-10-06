@@ -887,26 +887,39 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	// v26.11.25-link: read ALL remaining packets from the inbox
-	// (non-blocking) and combine them. The server sends a coalesced
+	// (NON-BLOCKING) and combine them. The server sends a coalesced
 	// 65535-byte datagram. The pool socket receives it as multiple
 	// 1200-byte reads. We need to combine ALL of them to get the
 	// full coalesced datagram.
+	//
+	// IMPORTANT: must be non-blocking. If we block on ReadFrom,
+	// the PooledPacketReader never returns and the browser gets
+	// no response at all.
 	totalN := n
 	for totalN < 65535 {
-		extraSpace := 65535 - totalN
-		extraBuf := make([]byte, extraSpace)
-		extraN, _, extraErr := r.conn.ReadFrom(extraBuf)
-		if extraErr != nil || extraN <= 0 {
-			break // no more data available
+		select {
+		case rr, ok := <-r.conn.inbox:
+			if !ok {
+				break
+			}
+			extraN := rr.n
+			if totalN+extraN > 65535 {
+				extraN = 65535 - totalN
+			}
+			existing := b.Bytes()
+			combined := make([]byte, totalN+extraN)
+			copy(combined, existing)
+			copy(combined[totalN:], rr.data[:extraN])
+			totalN += extraN
+			b.Resize(0, int32(totalN))
+			copy(b.Bytes(), combined)
+			putPacket(rr.data)
+		case <-r.conn.done:
+			break
+		default:
+			break // no more data available right now
 		}
-		// Append to buffer
-		existing := b.Bytes()
-		combined := make([]byte, totalN+extraN)
-		copy(combined, existing)
-		copy(combined[totalN:], extraBuf[:extraN])
-		totalN += extraN
-		b.Resize(0, int32(totalN))
-		copy(b.Bytes(), combined)
+		break // only do one non-blocking check
 	}
 
 	// v26.11.25-link: if the reassembled data is > 1250, the server
