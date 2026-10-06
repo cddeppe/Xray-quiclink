@@ -738,10 +738,18 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil {
                         c.RegisterCID(scid)
-                        // v26.11.37-link: learn the short-header DCID length
-                        // from the client's SCID. The server's short-header
-                        // DCID = client's SCID, so the length must match.
-                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
+                        // v26.11.48-link: learn the short-header DCID length
+                        // from the client's SCID — but ONLY for non-zero SCIDs.
+                        // For 0-length SCIDs (Chrome/Edge), DON'T learn — keep
+                        // the default 8. With shortHeaderCIDLen=0, ALL connections
+                        // share dcidKey{len:0} → demux collision → replies go to
+                        // wrong inbox → freeze. With the default 8, 1-RTT replies
+                        // are demux misses (dropped) → browser falls back to TCP →
+                        // video plays. For 3-byte SCIDs (Firefox/quic.nginx.org),
+                        // shortHeaderCIDLen=3 → correct demux → QUIC works.
+                        if len(scid) > 0 {
+                                c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
+                        }
                 }
                 // Also register the DCID. The client's Initial has DCID =
                 // initial_dcid and SCID = client_scid. The pool registers
