@@ -218,13 +218,15 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-	// v26.11.24-link: truncate to 1250 bytes. The PooledPacketReader
-	// combines multiple 1200-byte packets into one buffer (reassembly).
-	// Truncating to 1250 sends the first 1200 bytes (Initial) + 50 bytes
-	// (start of Handshake) in one UDP datagram. The browser sees the
-	// coalesced format and processes both.
-	if len(buf) > 1250 {
-		buf = buf[:1250]
+	// v26.11.27-link: truncate to 65507 bytes (max UDP payload).
+	// The reassembled coalesced datagram is typically 2400-65535 bytes.
+	// 2400 < 65507 so the kernel accepts it. IP_MTU_DISCOVER=0 allows
+	// IP fragmentation (2-44 fragments depending on size). The browser
+	// reassembles the IP fragments and delivers the full UDP datagram
+	// to the QUIC stack, which sees the coalesced format (Initial +
+	// Handshake in one datagram).
+	if len(buf) > 65507 {
+		buf = buf[:65507]
 	}
 	n, err := c.output(buf)
 	if c.downlink != nil {
