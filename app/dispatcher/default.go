@@ -117,6 +117,47 @@ type DefaultDispatcher struct {
         policy policy.Manager
         stats  stats.Manager
         fdns   dns.FakeDNSEngine
+
+        // v26.11.31-link: UDP SNI cache. When sniffing succeeds for a
+        // UDP packet (typically the QUIC Initial long header), we cache
+        // the source IP:port -> sniffed SNI. When subsequent UDP packets
+        // from the same source arrive (0-RTT, 1-RTT short headers that
+        // don't carry SNI), we look up the cache and use the cached SNI
+        // as the destination. Without this, sniffing fails on short
+        // headers and the dispatcher falls back to the dokodemo-door's
+        // default destination (127.0.0.1:443), causing a loop and QUIC
+        // handshake failure -> browser falls back to h2.
+        udpSNICache    map[udpSrcKey]udpSNIEntry
+        udpSNICacheMu  sync.RWMutex
+        udpSNICacheTTL time.Duration
+}
+
+// udpSrcKey is a zero-allocation map key for UDP source IP:port.
+// 16 bytes for IP (IPv4-in-IPv6 mapped) + 2 bytes for port = 18 bytes.
+type udpSrcKey struct {
+        ip   [16]byte
+        port uint16
+}
+
+// udpSNIEntry stores the sniffed SNI and its expiration time.
+type udpSNIEntry struct {
+        domain string
+        exp    time.Time
+}
+
+// makeUDPSrcKey computes a udpSrcKey from a net.Destination.
+func makeUDPSrcKey(d net.Destination) udpSrcKey {
+        var k udpSrcKey
+        ip := d.Address.IP()
+        if ip4 := ip.To4(); ip4 != nil {
+                copy(k.ip[12:], ip4)
+                k.ip[10] = 0xff
+                k.ip[11] = 0xff
+        } else {
+                copy(k.ip[:], ip.To16())
+        }
+        k.port = uint16(d.Port)
+        return k
 }
 
 func init() {
@@ -140,6 +181,8 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
         d.router = router
         d.policy = pm
         d.stats = sm
+        d.udpSNICache = make(map[udpSrcKey]udpSNIEntry)
+        d.udpSNICacheTTL = 5 * time.Minute
         return nil
 }
 
@@ -388,6 +431,48 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 ob.RouteTarget = destination
                         } else {
                                 ob.Target = destination
+                        }
+                        // v26.11.31-link: cache the sniffed SNI for this UDP source.
+                        // Subsequent UDP packets from the same source (0-RTT, 1-RTT
+                        // short headers) don't carry SNI and will fail sniffing.
+                        // The cache lets us reuse the SNI from the Initial.
+                        if destination.Network == net.Network_UDP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                srcKey := makeUDPSrcKey(inbound.Source)
+                                d.udpSNICacheMu.Lock()
+                                d.udpSNICache[srcKey] = udpSNIEntry{
+                                domain: domain,
+                                exp:    time.Now().Add(d.udpSNICacheTTL),
+                                }
+                                d.udpSNICacheMu.Unlock()
+                        }
+                        }
+                } else {
+                        // v26.11.31-link: sniffing failed (or no override). For UDP
+                        // packets, look up the SNI cache by source IP:port. The
+                        // first packet of a QUIC connection (Initial long header)
+                        // carries the SNI; subsequent packets (short headers,
+                        // 0-RTT) don't. Without this cache lookup, the dispatcher
+                        // falls back to the dokodemo-door's default dest (typically
+                        // 127.0.0.1:443), causing a loop and QUIC handshake failure.
+                        if destination.Network == net.Network_UDP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                srcKey := makeUDPSrcKey(inbound.Source)
+                                d.udpSNICacheMu.RLock()
+                                entry, ok := d.udpSNICache[srcKey]
+                                d.udpSNICacheMu.RUnlock()
+                                if ok && time.Now().Before(entry.exp) {
+                                // Cache hit — reuse the SNI from the Initial.
+                                errors.LogInfo(ctx, "udp_sni_cache: hit for ", inbound.Source.String(), " -> ", entry.domain)
+                                destination.Address = net.ParseAddress(entry.domain)
+                                ob.Target = destination
+                                } else if ok {
+                                // Expired — remove and fall through.
+                                d.udpSNICacheMu.Lock()
+                                delete(d.udpSNICache, srcKey)
+                                d.udpSNICacheMu.Unlock()
+                        }
+                        }
                         }
                 }
                 d.routedDispatch(ctx, outbound, destination)
