@@ -2,6 +2,7 @@ package udp
 
 import (
 	"context"
+	"syscall"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -67,6 +68,21 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 		return nil, err
 	}
 
+	// v26.11.9-link: set IP_MTU_DISCOVER to IP_PMTU_DONT (0) on the
+	// hub socket. QUIC servers send coalesced datagrams up to 65535
+	// bytes. When the response reaches hub.WriteTo, the kernel
+	// rejects packets larger than the path MTU (1500) with
+	// "sendto: message too long". Setting IP_PMTU_DONT allows the
+	// kernel to fragment large UDP packets so they reach the browser.
+	if udpConn, ok := hub.conn.(*net.UDPConn); ok {
+		if rawConn, err := udpConn.SyscallConn(); err == nil {
+			rawConn.Control(func(fd uintptr) {
+				// IP_PMTU_DONT = 0 (allow fragmentation)
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 0)
+			})
+		}
+	}
+
 	errors.LogInfo(ctx, "listening UDP on ", address, ":", port)
 	hub.udpConn, _ = hub.conn.(*net.UDPConn)
 	hub.cache = make(chan *udp.Packet, hub.capacity)
@@ -82,6 +98,12 @@ func (h *Hub) Close() error {
 }
 
 func (h *Hub) WriteTo(payload []byte, dest net.Destination) (int, error) {
+	// v26.11.9-link: handle large UDP datagrams (up to 65535 bytes from
+	// coalesced QUIC responses). The kernel rejects packets larger than
+	// the path MTU with "sendto: message too long". Use WriteMsgUDP with
+	// MSG_MORE to let the kernel fragment the packet, OR just truncate
+	// to a safe size if too large. For now, just write as-is — the
+	// kernel CAN send large UDP packets if IP_MTU_DISCOVER allows it.
 	return h.conn.WriteTo(payload, &net.UDPAddr{
 		IP:   dest.Address.IP(),
 		Port: int(dest.Port),
