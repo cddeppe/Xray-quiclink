@@ -858,7 +858,10 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	// v26.11.13-link: split coalesced QUIC datagrams into individual
+	// v26.11.17-link: send the full coalesced datagram as-is.
+	// The SO_SNDBUF + IP_MTU_DISCOVER setsockopt on the hub socket
+	// allows the kernel to send large UDP packets via IP fragmentation.
+	return buf.MultiBuffer{b}, nil
 	// packets. QUIC servers (Cloudflare, nginx, Google) coalesce
 	// Initial + Handshake + 0-RTT into one UDP datagram. The full
 	// datagram can exceed the max UDP payload (65507) or the path
