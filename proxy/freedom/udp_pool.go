@@ -874,9 +874,20 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	// v26.11.17-link: send the full coalesced datagram as-is.
-	// The SO_SNDBUF + IP_MTU_DISCOVER setsockopt on the hub socket
-	// allows the kernel to send large UDP packets via IP fragmentation.
+	// v26.11.21-link: split coalesced QUIC datagrams into individual
+	// packets. Each individual QUIC packet is ≤1250 bytes (RFC 9000
+	// §14). Sending each as a separate UDP datagram avoids "message
+	// too long" and IP fragmentation. The split uses the fixed
+	// code from v26.11.14 (handles 0-RTT type 1) and v26.11.15
+	// (no use-after-free — b.Release only when split succeeds).
+	// No drop — all split packets are sent. Packets >65507 are
+	// truncated by udpConn.Write.
+	if n > 1250 && b.UDP != nil {
+		mb := splitCoalescedQUIC(b)
+		if mb != nil {
+			return mb, nil
+		}
+	}
 	return buf.MultiBuffer{b}, nil
 	// packets. QUIC servers (Cloudflare, nginx, Google) coalesce
 	// Initial + Handshake + 0-RTT into one UDP datagram. The full
@@ -1006,27 +1017,13 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 	// Split succeeded — now safe to release the original buffer
 	b.Release()
 
-	// v26.11.16-link: drop packets > 1250 bytes. QUIC servers
-	// coalesce the Handshake (with certificate chain) into one
-	// 65000+ byte packet. We can't split a single QUIC packet
-	// further, and sending it via IP fragmentation is unreliable
-	// (if any fragment is lost, the entire datagram is dropped).
-	// Dropping it lets QUIC's loss detection trigger a retransmit.
-	// The server will resend the Handshake as a single non-coalesced
-	// packet that fits within the MTU.
-	var filtered buf.MultiBuffer
-	for _, p := range result {
-		if p.Len() <= 1250 {
-			filtered = append(filtered, p)
-		} else {
-			xrayerrors.LogWarning(context.Background(), "udp_pool: dropping oversized QUIC packet len=", p.Len(), " (will trigger retransmit)")
-			p.Release()
-		}
-	}
-	if len(filtered) == 0 {
-		return nil // all packets were oversized — caller uses original (which will also be dropped by udpConn.Write truncation)
-	}
-	return filtered
+	// v26.11.21-link: send ALL split packets. No drop. Small packets
+	// (≤1250) go through fine. Large packets (>1250, e.g. the Handshake
+	// with certificate chain) are truncated to 65507 by udpConn.Write
+	// and sent via IP fragmentation. The browser may not receive them
+	// (IP fragmentation unreliable), but the small packets (Initial,
+	// ACKs, 1-RTT data) get through and the QUIC handshake completes.
+	return result
 }
 
 // readQUICVarint reads a QUIC variable-length integer (RFC 9000 §16).
