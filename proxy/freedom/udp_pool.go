@@ -852,22 +852,22 @@ func NewPooledPacketReader(conn *pooledConn) *PooledPacketReader {
 }
 
 func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	// v26.11.24-link: read MULTIPLE packets from the inbox and combine
-	// them into one buffer. The server sends a coalesced QUIC datagram
-	// (Initial + Handshake + 0-RTT) but the pool socket (without GRO)
-	// receives it as individual 1200-byte IP fragments. The browser
-	// expects the coalesced format (Initial + Handshake in one UDP
-	// datagram). If we send them separately, the browser processes
-	// the Initial but doesn't process the Handshake.
+	// v26.11.25-link: read ALL available packets from the inbox and
+	// combine them into one buffer. The server sends a coalesced QUIC
+	// datagram (Initial + Handshake + 0-RTT) via GSO. The pool socket
+	// (without GRO) receives it as individual 1200-byte IP fragments.
+	// We reassemble them in software.
 	//
-	// Fix: read multiple packets from the inbox channel and combine
-	// them into one buffer. udpConn.Write truncates to 1250 bytes.
-	// The browser receives 1250 bytes: the first QUIC packet (Initial,
-	// 1200 bytes) + the start of the second packet (Handshake, 50 bytes).
-	// The browser's QUIC parser sees the coalesced format and processes
-	// both the Initial and the start of the Handshake. The browser
-	// sends an ACK. The server retransmits the Handshake. The proxy
-	// forwards it. The browser receives it and completes the handshake.
+	// If the total reassembled size > 1250, the server is sending
+	// coalesced packets that exceed the path MTU. Send ICMP
+	// "Fragmentation Needed" to the server, telling it to use
+	// packets ≤ 1250 bytes. The server will then send the Handshake
+	// as a separate, non-coalesced packet.
+	//
+	// Truncate to 1250 in udpConn.Write. The browser receives
+	// 1250 bytes: the Initial (1200) + start of Handshake (50).
+	// The browser processes the Initial and ACKs. The server
+	// retransmits with smaller packets (after receiving ICMP).
 	b := buf.NewWithSize(65535)
 	b.Resize(0, 65535)
 
@@ -886,22 +886,35 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	// v26.11.24-link: try to read more packets from the inbox
-	// (non-blocking). If available, append them to the buffer.
-	// This reassembles the coalesced datagram in software.
-	if n < 1250 {
-		totalNeeded := 1250 - n
-		extra := make([]byte, totalNeeded)
-		extraN, _, extraErr := r.conn.ReadFrom(extra)
-		if extraErr == nil && extraN > 0 {
-			// Append the extra data to the buffer
-			existing := b.Bytes()
-			combined := make([]byte, n+extraN)
-			copy(combined, existing)
-			copy(combined[n:], extra[:extraN])
-			b.Resize(0, int32(n+extraN))
-			copy(b.Bytes(), combined)
+	// v26.11.25-link: read ALL remaining packets from the inbox
+	// (non-blocking) and combine them. The server sends a coalesced
+	// 65535-byte datagram. The pool socket receives it as multiple
+	// 1200-byte reads. We need to combine ALL of them to get the
+	// full coalesced datagram.
+	totalN := n
+	for totalN < 65535 {
+		extraSpace := 65535 - totalN
+		extraBuf := make([]byte, extraSpace)
+		extraN, _, extraErr := r.conn.ReadFrom(extraBuf)
+		if extraErr != nil || extraN <= 0 {
+			break // no more data available
 		}
+		// Append to buffer
+		existing := b.Bytes()
+		combined := make([]byte, totalN+extraN)
+		copy(combined, existing)
+		copy(combined[totalN:], extraBuf[:extraN])
+		totalN += extraN
+		b.Resize(0, int32(totalN))
+		copy(b.Bytes(), combined)
+	}
+
+	// v26.11.25-link: if the reassembled data is > 1250, the server
+	// is sending coalesced packets that exceed the path MTU. Send ICMP.
+	if totalN > 1250 && b.UDP != nil {
+		serverIP := b.UDP.Address.IP()
+		xrayerrors.LogWarning(context.Background(), "udp_pool: reassembled ", totalN, " bytes from ", b.UDP.Address.String(), " — sending ICMP Fragmentation Needed")
+		sendICMPFragmentationNeeded(&stdnet.UDPAddr{IP: serverIP, Port: 443}, 1250)
 	}
 
 	return buf.MultiBuffer{b}, nil
