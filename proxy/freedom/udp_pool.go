@@ -400,7 +400,10 @@ func (s *pooledSocket) readLoop() {
 		// Type 3 Code 4 to the server with next-hop MTU = 1250.
 		// The server's QUIC stack will reduce its packet size.
 		if n > 1250 {
+			xrayerrors.LogWarning(context.Background(), "udp_pool: readLoop received ", n, " bytes from ", addr.String(), " — sending ICMP")
 			sendICMPFragmentationNeeded(s.dest, 1250)
+		} else {
+			xrayerrors.LogInfo(context.Background(), "udp_pool: readLoop received ", n, " bytes from ", addr.String())
 		}
 
 		dcid, _, err := quic.ParseDCID(packet[:n])
