@@ -2,13 +2,15 @@ package udp
 
 import (
 	"context"
-	"syscall"
+	"fmt"
+	stdnet "net"
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/udp"
 	"github.com/xtls/xray-core/transport/internet"
+	"golang.org/x/sys/unix"
 )
 
 type HubOption func(h *Hub)
@@ -68,35 +70,41 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 		return nil, err
 	}
 
-	// v26.11.9-link: set IP_MTU_DISCOVER to IP_PMTU_DONT (0) on the
-	// hub socket. QUIC servers send coalesced datagrams up to 65535
-	// bytes. When the response reaches hub.WriteTo, the kernel
-	// rejects packets larger than the path MTU (1500) with
-	// "sendto: message too long". Setting IP_PMTU_DONT allows the
-	// kernel to fragment large UDP packets so they reach the browser.
+	// v26.11.12-link: set IP_MTU_DISCOVER=IP_PMTUDISC_DONT and
+	// SO_SNDBUF=65535 on the hub socket. QUIC servers coalesce
+	// Initial+Handshake+0-RTT into one UDP datagram up to 65535
+	// bytes. Without these options, the kernel rejects the send
+	// with "sendto: message too long" because the packet is larger
+	// than the path MTU (1500).
 	//
-	// v26.11.12-link: also set SO_SNDBUF to 65535 so the kernel
-	// has enough send buffer for large datagrams. And try BOTH
-	// hub.conn and hub.udpConn since FinalMask may wrap the conn.
-	setHubSocketOptions := func(conn net.PacketConn) {
-		type syscallConner interface {
-			SyscallConn() (syscall.RawConn, error)
+	// IP_PMTUDISC_DONT (0) = don't set DF flag, allow IP fragmentation.
+	// SO_SNDBUF (65535) = large send buffer for big datagrams.
+	//
+	// Previous attempt (v26.11.9) used syscall package constants
+	// which may not have matched. This version uses golang.org/x/sys/unix
+	// which is guaranteed correct for the platform.
+	if udpConn, ok := hub.conn.(*stdnet.UDPConn); ok {
+		errors.LogWarning(context.Background(), "udp_hub: setting IP_MTU_DISCOVER and SO_SNDBUF on hub socket")
+		if rawConn, err := udpConn.SyscallConn(); err == nil {
+			rawConn.Control(func(fd uintptr) {
+				// IP_MTU_DISCOVER = IP_PMTUDISC_DONT (0) = allow fragmentation
+				if err := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, 0); err != nil {
+					errors.LogWarning(context.Background(), "udp_hub: failed to set IP_MTU_DISCOVER: ", err)
+				}
+				// SO_SNDBUF = 65535
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 65535); err != nil {
+					errors.LogWarning(context.Background(), "udp_hub: failed to set SO_SNDBUF: ", err)
+				}
+			})
+		} else {
+			errors.LogWarning(context.Background(), "udp_hub: failed to get SyscallConn: ", err)
 		}
-		if sc, ok := conn.(syscallConner); ok {
-			if rawConn, err := sc.SyscallConn(); err == nil {
-				rawConn.Control(func(fd uintptr) {
-					// IP_PMTU_DONT = 0 (allow fragmentation)
-					_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 0)
-					// SO_SNDBUF = 65535 (large send buffer)
-					_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 65535)
-				})
-			}
-		}
+	} else {
+		errors.LogWarning(context.Background(), "udp_hub: conn is not *net.UDPConn, type=", fmt.Sprintf("%T", hub.conn))
 	}
-	setHubSocketOptions(hub.conn)
 
 	errors.LogInfo(ctx, "listening UDP on ", address, ":", port)
-	hub.udpConn, _ = hub.conn.(*net.UDPConn)
+	hub.udpConn, _ = hub.conn.(*stdnet.UDPConn)
 	hub.cache = make(chan *udp.Packet, hub.capacity)
 
 	go hub.start()
