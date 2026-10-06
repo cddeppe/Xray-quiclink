@@ -572,6 +572,18 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
                 }
+                // Also register the DCID. The client's Initial has DCID =
+                // initial_dcid and SCID = client_scid. The pool registers
+                // client_scid (above) so the server's Initial reply (DCID =
+                // client_scid) is demuxed correctly. BUT the server's Retry
+                // packet has DCID = initial_dcid (the client's DCID from the
+                // Initial, NOT the SCID). Without registering initial_dcid,
+                // Retry packets are silently dropped by readLoop's demux
+                // lookup, and the QUIC handshake never completes — the
+                // browser times out QUIC and falls back to H2/TCP.
+                if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
+                        c.RegisterCID(dcid)
+                }
         }
 
         // v26.10.34-link (M1 fix): honor the caller-provided addr if it's a
