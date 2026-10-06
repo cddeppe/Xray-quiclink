@@ -840,6 +840,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
 			return errors.New("failed to process response").Base(err)
 		}
+		// v26.11.5-diag: log when responseDone finishes reading
+		errors.LogWarning(ctx, "freedom: responseDone finished reading, dest=", destination.String())
 		return nil
 	}
 
