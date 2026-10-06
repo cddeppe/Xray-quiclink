@@ -1,14 +1,14 @@
 package freedom
 
 import (
-        "context"
-        "sync"
-        "time"
+	"context"
+	"sync"
+	"time"
 
-        "github.com/xtls/xray-core/common/errors"
-        "github.com/xtls/xray-core/common/net"
-        "github.com/xtls/xray-core/transport/internet"
-        "github.com/xtls/xray-core/transport/internet/stat"
+	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 // TCPSocketPool is a warm-pool for outbound TCP connections.
@@ -21,117 +21,154 @@ import (
 // site family instead of 20 globally. More targeted: pre-warms the
 // IPs the browser hits first (page load), not the ones it hits most
 // (analytics/tracking fire after the page loads).
+// v26.11.2-link: onSocketStale callback + dead-conn detection in
+// Acquire. When a warm connection is found dead (closed by remote,
+// CDN edge rotation) or expired, the pool notifies the sticky resolver
+// to proactively refresh DNS for the destination's hostname. This
+// closes the same gap that v26.11.1 closed for UDP: the resolver would
+// otherwise keep returning the old (stale) IP for up to TTL seconds.
 type TCPSocketPool struct {
-        mu       sync.Mutex
-        warm     map[string]*warmConn
-        timeout  time.Duration
+	mu      sync.Mutex
+	warm    map[string]*warmConn
+	timeout time.Duration
 
-        // v26.10.46-link: per-wildcard first-N learning
-        patterns   map[string]*wildcardPattern
-        preWarmN   int    // how many first-N to pre-warm per wildcard
-        learnVisits int   // how many visits before a pattern is stable
-        dialFunc   func(ctx context.Context, dest net.Destination) (stat.Connection, error)
-        stopCh     chan struct{}
+	// v26.10.46-link: per-wildcard first-N learning
+	patterns    map[string]*wildcardPattern
+	preWarmN    int // how many first-N to pre-warm per wildcard
+	learnVisits int // how many visits before a pattern is stable
+	dialFunc    func(ctx context.Context, dest net.Destination) (stat.Connection, error)
+	stopCh      chan struct{}
+
+	// v26.11.2-link: callback to notify the sticky resolver when a
+	// warm TCP connection is found dead or expired. The resolver
+	// proactively refreshes DNS for the destination's hostname so the
+	// next dial gets a fresh IP without waiting for the TTL.
+	// The callback receives the destination key (ip:port string).
+	onSocketStale func(destKey string)
 }
 
 // wildcardPattern tracks the critical-path IPs for a site family
 // (e.g., *.hulu.com). It learns which IPs are hit first on each visit,
 // stabilizes after learnVisits visits, and is then used for pre-warming.
 type wildcardPattern struct {
-        mu          sync.Mutex
-        wildcard    string
-        candidate   []string
-        stable      []string
-        visitCount  int
-        lastVisit   time.Time
-        stabilized  bool
-        // v26.10.47-link: track total domains seen (before dedup by IP)
-        // so the stabilization log shows how many domains map to the
-        // learned unique IPs — confirms the dedup is working.
-        totalDomains  int
-        uniqueIPs     map[string]bool // dedup tracker
+	mu         sync.Mutex
+	wildcard   string
+	candidate  []string
+	stable     []string
+	visitCount int
+	lastVisit  time.Time
+	stabilized bool
+	// v26.10.47-link: track total domains seen (before dedup by IP)
+	// so the stabilization log shows how many domains map to the
+	// learned unique IPs — confirms the dedup is working.
+	totalDomains int
+	uniqueIPs    map[string]bool // dedup tracker
 }
 
 type warmConn struct {
-        conn      stat.Connection
-        dest      string
-        expiresAt time.Time
-        preWarmed bool
+	conn      stat.Connection
+	dest      string
+	expiresAt time.Time
+	preWarmed bool
 }
 
 func NewTCPSocketPool(timeout time.Duration, preWarmN int, preWarmFirstN int, learnVisits int) *TCPSocketPool {
-        p := &TCPSocketPool{
-                warm:        make(map[string]*warmConn),
-                timeout:     timeout,
-                patterns:    make(map[string]*wildcardPattern),
-                preWarmN:    preWarmFirstN,
-                learnVisits: learnVisits,
-                stopCh:      make(chan struct{}),
-        }
-        go p.reaper()
-        if preWarmFirstN > 0 || preWarmN > 0 {
-                go p.preWarmLoop()
-        }
-        return p
+	p := &TCPSocketPool{
+		warm:        make(map[string]*warmConn),
+		timeout:     timeout,
+		patterns:    make(map[string]*wildcardPattern),
+		preWarmN:    preWarmFirstN,
+		learnVisits: learnVisits,
+		stopCh:      make(chan struct{}),
+	}
+	go p.reaper()
+	if preWarmFirstN > 0 || preWarmN > 0 {
+		go p.preWarmLoop()
+	}
+	return p
 }
 
 // SetDialFunc provides the dialer function needed for pre-warming.
 func (p *TCPSocketPool) SetDialFunc(f func(ctx context.Context, dest net.Destination) (stat.Connection, error)) {
-        if p == nil {
-                return
-        }
-        p.mu.Lock()
-        p.dialFunc = f
-        p.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.dialFunc = f
+	p.mu.Unlock()
 }
 
 // Acquire returns a warm TCP connection for the given destination.
 // Also tracks the access for first-N learning.
+//
+// v26.11.2-link: dead-conn detection. When a warm connection is found
+// but is closed (RemoteAddr is nil or the conn is already closed), we
+// notify the onSocketStale callback so the sticky resolver can
+// proactively refresh DNS for the stale IP. This catches CDN edge
+// rotation on the TCP side — without this, the resolver keeps
+// returning the old IP for up to TTL seconds and the phone retries
+// into a black hole.
 func (p *TCPSocketPool) Acquire(dest net.Destination) stat.Connection {
-        if p == nil {
-                return nil
-        }
-        key := tcpDestKey(dest)
+	if p == nil {
+		return nil
+	}
+	key := tcpDestKey(dest)
 
-        // v26.10.46-link: track for first-N learning
-        if p.preWarmN > 0 {
-                p.trackFirstN(dest)
-        }
+	// v26.10.46-link: track for first-N learning
+	if p.preWarmN > 0 {
+		p.trackFirstN(dest)
+	}
 
-        p.mu.Lock()
-        wc, ok := p.warm[key]
-        if ok {
-                delete(p.warm, key)
-        }
-        p.mu.Unlock()
-        if !ok || wc == nil {
-                return nil
-        }
-        if time.Now().After(wc.expiresAt) {
-                wc.conn.Close()
-                return nil
-        }
-        return wc.conn
+	p.mu.Lock()
+	wc, ok := p.warm[key]
+	if ok {
+		delete(p.warm, key)
+	}
+	p.mu.Unlock()
+	if !ok || wc == nil {
+		return nil
+	}
+	if time.Now().After(wc.expiresAt) {
+		// v26.11.2-link: warm conn expired — notify stale callback.
+		// The IP may have rotated while the conn sat in the pool.
+		wc.conn.Close()
+		if p.onSocketStale != nil {
+			go p.onSocketStale(key)
+		}
+		return nil
+	}
+	// v26.11.2-link: detect dead connections. A warm conn whose
+	// RemoteAddr is nil has been closed by the remote (RST/FIN) or
+	// by the kernel. Don't return it to the caller — it would fail
+	// immediately. Notify the stale callback so the resolver refreshes.
+	if wc.conn.RemoteAddr() == nil {
+		wc.conn.Close()
+		if p.onSocketStale != nil {
+			go p.onSocketStale(key)
+		}
+		return nil
+	}
+	return wc.conn
 }
 
 // Release puts a TCP connection into the warm pool for reuse.
 func (p *TCPSocketPool) Release(conn stat.Connection, dest net.Destination) {
-        if p == nil {
-                conn.Close()
-                return
-        }
-        key := tcpDestKey(dest)
-        p.mu.Lock()
-        if old, ok := p.warm[key]; ok {
-                old.conn.Close()
-                delete(p.warm, key)
-        }
-        p.warm[key] = &warmConn{
-                conn:      conn,
-                dest:      key,
-                expiresAt: time.Now().Add(p.timeout),
-        }
-        p.mu.Unlock()
+	if p == nil {
+		conn.Close()
+		return
+	}
+	key := tcpDestKey(dest)
+	p.mu.Lock()
+	if old, ok := p.warm[key]; ok {
+		old.conn.Close()
+		delete(p.warm, key)
+	}
+	p.warm[key] = &warmConn{
+		conn:      conn,
+		dest:      key,
+		expiresAt: time.Now().Add(p.timeout),
+	}
+	p.mu.Unlock()
 }
 
 // trackFirstN records a new destination's first-N order for its wildcard
@@ -142,276 +179,278 @@ func (p *TCPSocketPool) Release(conn stat.Connection, dest net.Destination) {
 // we track by IP. The first-N learning groups IPs by their DNS wildcard
 // parent, which is tracked at resolve time.
 func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
-        if p == nil || p.preWarmN == 0 {
-                return
-        }
-        key := tcpDestKey(dest)
+	if p == nil || p.preWarmN == 0 {
+		return
+	}
+	key := tcpDestKey(dest)
 
-        // Find the wildcard group for this destination. We track by IP
-        // (the resolved address), so we need a mapping from IP to wildcard.
-        // The sticky resolver knows the hostname, but the warm pool only
-        // sees the resolved destination.
-        //
-        // Approach: track a "visit" by checking if we've seen this IP
-        // recently. If not, it's a new IP in this visit cycle. After
-        // p.learnVisits complete visit cycles, the pattern stabilizes.
-        //
-        // Simpler approach: track the order of first connections per
-        // wildcard. The wildcard is determined by the domain that was
-        // resolved to this IP. We need the domain — but the warm pool
-        // only has the IP.
-        //
-        // Even simpler: track the first N unique IPs seen in each 60s
-        // window. After 3 windows with the same first N, stabilize.
-        // This doesn't group by wildcard, but it catches the critical-
-        // path pattern: the first 5 IPs are always the same for a site.
-        //
-        // Let me use the simplest approach that works: track the order
-        // of unique IPs within a "session" (defined as a 10-second window
-        // of activity). After learnVisits sessions with the same first N,
-        // stabilize.
+	// Find the wildcard group for this destination. We track by IP
+	// (the resolved address), so we need a mapping from IP to wildcard.
+	// The sticky resolver knows the hostname, but the warm pool only
+	// sees the resolved destination.
+	//
+	// Approach: track a "visit" by checking if we've seen this IP
+	// recently. If not, it's a new IP in this visit cycle. After
+	// p.learnVisits complete visit cycles, the pattern stabilizes.
+	//
+	// Simpler approach: track the order of first connections per
+	// wildcard. The wildcard is determined by the domain that was
+	// resolved to this IP. We need the domain — but the warm pool
+	// only has the IP.
+	//
+	// Even simpler: track the first N unique IPs seen in each 60s
+	// window. After 3 windows with the same first N, stabilize.
+	// This doesn't group by wildcard, but it catches the critical-
+	// path pattern: the first 5 IPs are always the same for a site.
+	//
+	// Let me use the simplest approach that works: track the order
+	// of unique IPs within a "session" (defined as a 10-second window
+	// of activity). After learnVisits sessions with the same first N,
+	// stabilize.
 
-        p.mu.Lock()
-        defer p.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-        // Use a single global pattern (not per-wildcard) for simplicity.
-        // The first N IPs across all activity represent the critical path.
-        // This is simpler than per-wildcard grouping and still avoids the
-        // frequency problem (analytics IPs fire later, not in the first N).
-        if p.patterns["__global__"] == nil {
-                p.patterns["__global__"] = &wildcardPattern{
-                        wildcard:   "__global__",
-                        lastVisit:  time.Now(),
-                        uniqueIPs:  make(map[string]bool),
-                }
-        }
-        wp := p.patterns["__global__"]
-        wp.mu.Lock()
-        defer wp.mu.Unlock()
+	// Use a single global pattern (not per-wildcard) for simplicity.
+	// The first N IPs across all activity represent the critical path.
+	// This is simpler than per-wildcard grouping and still avoids the
+	// frequency problem (analytics IPs fire later, not in the first N).
+	if p.patterns["__global__"] == nil {
+		p.patterns["__global__"] = &wildcardPattern{
+			wildcard:  "__global__",
+			lastVisit: time.Now(),
+			uniqueIPs: make(map[string]bool),
+		}
+	}
+	wp := p.patterns["__global__"]
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
 
-        // Check if this is a new "visit" (10s gap since last activity)
-        now := time.Now()
-        if now.Sub(wp.lastVisit) > 10*time.Second {
-                // New visit — finalize the candidate and start a new one
-                if len(wp.candidate) > 0 {
-                        wp.visitCount++
-                        if wp.visitCount >= p.learnVisits {
-                                // Check if candidate matches stable
-                                if !wp.stabilized {
-                                        if len(wp.stable) == 0 {
-                                                // First stabilization — adopt the candidate
-                                                wp.stable = append([]string{}, wp.candidate...)
-                                                wp.stabilized = true
-                                                dupCount := wp.totalDomains - len(wp.stable)
-                                                if dupCount < 0 { dupCount = 0 }
-                                                errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern stabilized after ", wp.visitCount, " visits, ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains — ", dupCount, " shared IPs)")
-                                        } else if stringSlicesMatch(wp.stable, wp.candidate) {
-                                                // Already stable, still matches — good
-                                        } else {
-                                                // Pattern changed — update (CDN migration)
-                                                wp.stable = append([]string{}, wp.candidate...)
-                                                errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern updated (CDN migration?) — ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains)")
-                                        }
-                                }
-                        }
-                }
-                wp.candidate = nil
-                wp.lastVisit = now
-        }
+	// Check if this is a new "visit" (10s gap since last activity)
+	now := time.Now()
+	if now.Sub(wp.lastVisit) > 10*time.Second {
+		// New visit — finalize the candidate and start a new one
+		if len(wp.candidate) > 0 {
+			wp.visitCount++
+			if wp.visitCount >= p.learnVisits {
+				// Check if candidate matches stable
+				if !wp.stabilized {
+					if len(wp.stable) == 0 {
+						// First stabilization — adopt the candidate
+						wp.stable = append([]string{}, wp.candidate...)
+						wp.stabilized = true
+						dupCount := wp.totalDomains - len(wp.stable)
+						if dupCount < 0 {
+							dupCount = 0
+						}
+						errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern stabilized after ", wp.visitCount, " visits, ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains — ", dupCount, " shared IPs)")
+					} else if stringSlicesMatch(wp.stable, wp.candidate) {
+						// Already stable, still matches — good
+					} else {
+						// Pattern changed — update (CDN migration)
+						wp.stable = append([]string{}, wp.candidate...)
+						errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern updated (CDN migration?) — ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains)")
+					}
+				}
+			}
+		}
+		wp.candidate = nil
+		wp.lastVisit = now
+	}
 
-        // Add this IP to the candidate if not already present and we
-        // haven't exceeded preWarmN
-        if !containsString(wp.candidate, key) && len(wp.candidate) < p.preWarmN {
-                wp.candidate = append(wp.candidate, key)
-        }
-        // v26.10.47-link: count total connections (before dedup by IP).
-        // This lets the stabilization log show how many connections
-        // mapped to the learned unique IPs — confirms that shared-IP
-        // dedup is working (e.g., "5 critical-path IPs from 12
-        // connections — 7 shared IPs").
-        wp.totalDomains++
-        wp.uniqueIPs[key] = true
-        wp.lastVisit = now
+	// Add this IP to the candidate if not already present and we
+	// haven't exceeded preWarmN
+	if !containsString(wp.candidate, key) && len(wp.candidate) < p.preWarmN {
+		wp.candidate = append(wp.candidate, key)
+	}
+	// v26.10.47-link: count total connections (before dedup by IP).
+	// This lets the stabilization log show how many connections
+	// mapped to the learned unique IPs — confirms that shared-IP
+	// dedup is working (e.g., "5 critical-path IPs from 12
+	// connections — 7 shared IPs").
+	wp.totalDomains++
+	wp.uniqueIPs[key] = true
+	wp.lastVisit = now
 }
 
 // preWarmLoop periodically pre-establishes TCP connections for the
 // learned first-N pattern. Runs every 60 seconds.
 func (p *TCPSocketPool) preWarmLoop() {
-        t := time.NewTicker(60 * time.Second)
-        defer t.Stop()
-        for {
-                select {
-                case <-p.stopCh:
-                        return
-                case <-t.C:
-                        p.doPreWarm()
-                }
-        }
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-t.C:
+			p.doPreWarm()
+		}
+	}
 }
 
 func (p *TCPSocketPool) doPreWarm() {
-        p.mu.Lock()
-        dialFunc := p.dialFunc
-        if dialFunc == nil {
-                p.mu.Unlock()
-                return
-        }
+	p.mu.Lock()
+	dialFunc := p.dialFunc
+	if dialFunc == nil {
+		p.mu.Unlock()
+		return
+	}
 
-        // Get the stabilized first-N pattern
-        wp := p.patterns["__global__"]
-        if wp == nil {
-                p.mu.Unlock()
-                return
-        }
-        wp.mu.Lock()
-        stable := append([]string{}, wp.stable...)
-        wp.mu.Unlock()
-        p.mu.Unlock()
+	// Get the stabilized first-N pattern
+	wp := p.patterns["__global__"]
+	if wp == nil {
+		p.mu.Unlock()
+		return
+	}
+	wp.mu.Lock()
+	stable := append([]string{}, wp.stable...)
+	wp.mu.Unlock()
+	p.mu.Unlock()
 
-        if len(stable) == 0 {
-                return
-        }
+	if len(stable) == 0 {
+		return
+	}
 
-        // Pre-warm each IP in the stable pattern that doesn't already
-        // have a warm connection. Dial in parallel to speed up the cycle.
-        var wg sync.WaitGroup
-        for _, key := range stable {
-                p.mu.Lock()
-                _, exists := p.warm[key]
-                p.mu.Unlock()
-                if exists {
-                        continue
-                }
+	// Pre-warm each IP in the stable pattern that doesn't already
+	// have a warm connection. Dial in parallel to speed up the cycle.
+	var wg sync.WaitGroup
+	for _, key := range stable {
+		p.mu.Lock()
+		_, exists := p.warm[key]
+		p.mu.Unlock()
+		if exists {
+			continue
+		}
 
-                dest := parseDestKey(key)
-                if dest == nil {
-                        continue
-                }
+		dest := parseDestKey(key)
+		if dest == nil {
+			continue
+		}
 
-                wg.Add(1)
-                go func(d net.Destination, k string) {
-                        defer wg.Done()
-                        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-                        conn, err := dialFunc(ctx, d)
-                        cancel()
-                        if err != nil {
-                                return
-                        }
-                        p.mu.Lock()
-                        if old, ok := p.warm[k]; ok {
-                                old.conn.Close()
-                        }
-                        p.warm[k] = &warmConn{
-                                conn:      conn,
-                                dest:      k,
-                                expiresAt:  time.Now().Add(p.timeout * 12),
-                                preWarmed:  true,
-                        }
-                        p.mu.Unlock()
-                        errors.LogInfo(context.Background(), "tcp warm pool: pre-warmed connection to ", k)
-                }(*dest, key)
-        }
-        wg.Wait()
+		wg.Add(1)
+		go func(d net.Destination, k string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			conn, err := dialFunc(ctx, d)
+			cancel()
+			if err != nil {
+				return
+			}
+			p.mu.Lock()
+			if old, ok := p.warm[k]; ok {
+				old.conn.Close()
+			}
+			p.warm[k] = &warmConn{
+				conn:      conn,
+				dest:      k,
+				expiresAt: time.Now().Add(p.timeout * 12),
+				preWarmed: true,
+			}
+			p.mu.Unlock()
+			errors.LogInfo(context.Background(), "tcp warm pool: pre-warmed connection to ", k)
+		}(*dest, key)
+	}
+	wg.Wait()
 }
 
 // reaper periodically closes expired warm connections.
 func (p *TCPSocketPool) reaper() {
-        t := time.NewTicker(p.timeout)
-        defer t.Stop()
-        for {
-                select {
-                case <-p.stopCh:
-                        return
-                case <-t.C:
-                        p.evictExpired()
-                }
-        }
+	t := time.NewTicker(p.timeout)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-t.C:
+			p.evictExpired()
+		}
+	}
 }
 
 func (p *TCPSocketPool) evictExpired() {
-        now := time.Now()
-        p.mu.Lock()
-        for key, wc := range p.warm {
-                if now.After(wc.expiresAt) {
-                        wc.conn.Close()
-                        delete(p.warm, key)
-                }
-        }
-        p.mu.Unlock()
+	now := time.Now()
+	p.mu.Lock()
+	for key, wc := range p.warm {
+		if now.After(wc.expiresAt) {
+			wc.conn.Close()
+			delete(p.warm, key)
+		}
+	}
+	p.mu.Unlock()
 }
 
 // Close closes all warm connections and stops goroutines.
 func (p *TCPSocketPool) Close() {
-        if p == nil {
-                return
-        }
-        select {
-        case <-p.stopCh:
-        default:
-                close(p.stopCh)
-        }
-        p.mu.Lock()
-        for _, wc := range p.warm {
-                wc.conn.Close()
-        }
-        p.warm = make(map[string]*warmConn)
-        p.mu.Unlock()
+	if p == nil {
+		return
+	}
+	select {
+	case <-p.stopCh:
+	default:
+		close(p.stopCh)
+	}
+	p.mu.Lock()
+	for _, wc := range p.warm {
+		wc.conn.Close()
+	}
+	p.warm = make(map[string]*warmConn)
+	p.mu.Unlock()
 }
 
 // tcpDestKey converts a net.Destination to a string key.
 func tcpDestKey(dest net.Destination) string {
-        return dest.Address.String() + ":" + dest.Port.String()
+	return dest.Address.String() + ":" + dest.Port.String()
 }
 
 // parseDestKey converts a string key back to a net.Destination.
 func parseDestKey(key string) *net.Destination {
-        addr, portStr := "", ""
-        for i := len(key) - 1; i >= 0; i-- {
-                if key[i] == ':' {
-                        addr = key[:i]
-                        portStr = key[i+1:]
-                        break
-                }
-        }
-        if addr == "" || portStr == "" {
-                return nil
-        }
-        address := net.ParseAddress(addr)
-        if address == nil {
-                return nil
-        }
-        port, err := net.PortFromString(portStr)
-        if err != nil {
-                return nil
-        }
-        return &net.Destination{
-                Network: net.Network_TCP,
-                Address: address,
-                Port:    port,
-        }
+	addr, portStr := "", ""
+	for i := len(key) - 1; i >= 0; i-- {
+		if key[i] == ':' {
+			addr = key[:i]
+			portStr = key[i+1:]
+			break
+		}
+	}
+	if addr == "" || portStr == "" {
+		return nil
+	}
+	address := net.ParseAddress(addr)
+	if address == nil {
+		return nil
+	}
+	port, err := net.PortFromString(portStr)
+	if err != nil {
+		return nil
+	}
+	return &net.Destination{
+		Network: net.Network_TCP,
+		Address: address,
+		Port:    port,
+	}
 }
 
 // Helper functions
 
 func containsString(s []string, v string) bool {
-        for _, x := range s {
-                if x == v {
-                        return true
-                }
-        }
-        return false
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 func stringSlicesMatch(a, b []string) bool {
-        if len(a) != len(b) {
-                return false
-        }
-        for i := range a {
-                if a[i] != b[i] {
-                        return false
-                }
-        }
-        return true
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 var _ = internet.DomainStrategy_USE_IP

@@ -90,7 +90,13 @@ func (s *StickyResolver) RefreshByIP(staleIP string) {
 	s.mu.RLock()
 	var toRefresh []string
 	for host, entry := range s.entries {
-		if entry.ip.String() == staleIP {
+		// v26.11.2-link: use entry.ip.IP().String() instead of entry.ip.String()
+		// for IPv6 compatibility. entry.ip.String() for IPv6 returns "[ip]"
+		// (with brackets), but staleIP comes in without brackets. Using
+		// entry.ip.IP().String() returns the raw IP without brackets for
+		// both IPv4 and IPv6, so the comparison works for both families.
+		// Guard against domainAddress (which panics on IP()).
+		if entry.ip.Family().IsIP() && entry.ip.IP().String() == staleIP {
 			toRefresh = append(toRefresh, host)
 		}
 	}
@@ -101,6 +107,28 @@ func (s *StickyResolver) RefreshByIP(staleIP string) {
 	if len(toRefresh) > 0 {
 		errors.LogInfo(context.Background(), "sticky: proactive refresh triggered for ", len(toRefresh), " host(s) with stale IP ", staleIP)
 	}
+}
+
+// RefreshByDomain triggers a background DNS refresh for the given
+// hostname, bypassing the TTL check. Called by the TCP dial-failure
+// retry path (v26.11.2-link) when a dial fails — the cached IP may be
+// stale (CDN edge rotated), so we force a fresh lookup.
+func (s *StickyResolver) RefreshByDomain(hostname string) {
+	if hostname == "" {
+		return
+	}
+	go s.refreshExact(hostname)
+	errors.LogInfo(context.Background(), "sticky: proactive refresh triggered for ", hostname, " (TCP dial failure)")
+}
+
+// ResolveFresh resolves the hostname via DNS (bypassing the sticky cache)
+// and returns the fresh IP synchronously. Used by the TCP dial-failure
+// retry path (v26.11.2-link) to get a fresh IP immediately after
+// RefreshByDomain kicks off the background refresh.
+//
+// The fresh IP is also cached so subsequent requests benefit from it.
+func (s *StickyResolver) ResolveFresh(ctx context.Context, hostname string) (net.Address, error) {
+	return s.resolveAndCache(ctx, hostname)
 }
 
 // reaper periodically evicts entries that haven't been used in a while.
