@@ -546,12 +546,21 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-	if len(cid) == 0 {
-		return
-	}
-	// v26.10.16-link: use zero-alloc dcidKey for both the scids set
-	// and the demux map. Eliminates hex.EncodeToString per SCID
-	// registration (was 1 string alloc; now zero).
+	// v26.11.7-link: register 0-length CIDs too. Chrome/Edge send a
+	// 0-length SCID in their QUIC Initial. The server's Initial response
+	// uses the client's SCID as its DCID — which is also 0-length. If we
+	// skip 0-length CIDs (the old `if len(cid) == 0 { return }`), the
+	// server's response is never registered in the demux map, and the
+	// readLoop silently drops it. The QUIC handshake fails and the
+	// browser falls back to TCP.
+	//
+	// makeDCIDKey with len=0 creates a key with len=0 and an empty cid
+	// array. This is a valid map key — it just represents "any 0-length
+	// DCID". Since all 0-length SCID connections share the same key,
+	// they'll all map to the same inbox. This is correct for 0-length
+	// SCID — there's only one "connection" per 0-length SCID because
+	// the server can't distinguish between different 0-length SCID
+	// connections (they all look the same on the wire).
 	dk := makeDCIDKey(cid)
 
 	// v26.10.15-link: atomic closed check avoids acquiring mu
