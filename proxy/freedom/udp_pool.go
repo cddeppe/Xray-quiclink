@@ -1009,6 +1009,22 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 		xrayerrors.LogWarning(context.Background(), "splitCoalesced: packet created, len=", len(pktData), " offset=", offset, " data_len=", len(data))
 	}
 
+	// v26.11.22-link: if the loop broke early (parse failed at some
+	// iteration), send the remaining unparsed data as a final packet.
+	// The remaining data might be a valid QUIC packet that we couldn't
+	// parse (e.g. encrypted 1-RTT short header, or a coalesced packet
+	// with a different format). Sending it as-is lets the browser's
+	// QUIC stack handle it. Truncation to 65507 is handled by udpConn.Write.
+	if offset < len(data) && len(result) > 0 {
+		remainingData := data[offset:]
+		pkt := buf.NewWithSize(int32(len(remainingData)))
+		pkt.Resize(0, int32(len(remainingData)))
+		copy(pkt.Bytes(), remainingData)
+		pkt.UDP = udp
+		result = append(result, pkt)
+		xrayerrors.LogWarning(context.Background(), "splitCoalesced: remaining data sent as final packet, len=", len(remainingData), " offset=", offset)
+	}
+
 	if len(result) <= 1 {
 		// Split didn't produce multiple packets.
 		// Release the result packets and return nil.
