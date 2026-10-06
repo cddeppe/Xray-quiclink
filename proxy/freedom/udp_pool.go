@@ -874,22 +874,30 @@ func NewPooledPacketReader(conn *pooledConn) *PooledPacketReader {
 }
 
 func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	// v26.11.25-link: read ALL available packets from the inbox and
-	// combine them into one buffer. The server sends a coalesced QUIC
-	// datagram (Initial + Handshake + 0-RTT) via GSO. The pool socket
-	// (without GRO) receives it as individual 1200-byte IP fragments.
-	// We reassemble them in software.
+	// v26.11.30-link: read ONE datagram from the inbox and return it as-is.
 	//
-	// If the total reassembled size > 1250, the server is sending
-	// coalesced packets that exceed the path MTU. Send ICMP
-	// "Fragmentation Needed" to the server, telling it to use
-	// packets ≤ 1250 bytes. The server will then send the Handshake
-	// as a separate, non-coalesced packet.
+	// v26.11.25 added a software reassembly loop here, based on the
+	// assumption that the pool socket receives coalesced QUIC datagrams
+	// as individual IP fragments. That assumption was wrong: IP
+	// fragments are kernel-reassembled BEFORE socket delivery. The
+	// pool socket already receives the full coalesced datagram (up to
+	// 65535 bytes) in a single ReadFrom.
 	//
-	// Truncate to 1250 in udpConn.Write. The browser receives
-	// 1250 bytes: the Initial (1200) + start of Handshake (50).
-	// The browser processes the Initial and ACKs. The server
-	// retransmits with smaller packets (after receiving ICMP).
+	// The software reassembly was therefore:
+	//   - Redundant for the IP-fragment case (kernel already reassembled)
+	//   - Actively harmful for the 1-RTT case: when two 1-RTT short-header
+	//     packets are queued back-to-back in the inbox (common in
+	//     long-lived QUIC like YouTube streaming), the loop concatenated
+	//     them. SplitCoalesced then saw the first short header, treated
+	//     it as "extends to end of datagram" (RFC 9000 §17.3 has no
+	//     Length field), and returned ONE offset covering both packets.
+	//     udpConn.Write sent the combined buffer as one UDP datagram.
+	//     Browser AEAD decryption failed, dropped the packet, QUIC
+	//     stalled → h2 fallback.
+	//
+	// Removing the loop. SplitCoalesced in worker.go handles coalesced
+	// datagrams on its own. Each individual QUIC packet is sent as its
+	// own UDP datagram to the browser (RFC 9000 §12.2 compliant).
 	b := buf.NewWithSize(65535)
 	b.Resize(0, 65535)
 
@@ -908,49 +916,12 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		}
 	}
 
-	// v26.11.25-link: read ALL remaining packets from the inbox
-	// (NON-BLOCKING) and combine them. The server sends a coalesced
-	// 65535-byte datagram. The pool socket receives it as multiple
-	// 1200-byte reads. We need to combine ALL of them to get the
-	// full coalesced datagram.
-	//
-	// IMPORTANT: must be non-blocking. If we block on ReadFrom,
-	// the PooledPacketReader never returns and the browser gets
-	// no response at all.
-	totalN := n
-	for totalN < 65535 {
-		select {
-		case rr, ok := <-r.conn.inbox:
-			if !ok {
-				break
-			}
-			extraN := rr.n
-			if totalN+extraN > 65535 {
-				extraN = 65535 - totalN
-			}
-			existing := b.Bytes()
-			combined := make([]byte, totalN+extraN)
-			copy(combined, existing)
-			copy(combined[totalN:], rr.data[:extraN])
-			totalN += extraN
-			b.Resize(0, int32(totalN))
-			copy(b.Bytes(), combined)
-			putPacket(rr.data)
-		case <-r.conn.done:
-			break
-		default:
-			break // no more data available right now
-		}
-		break // only do one non-blocking check
-	}
-
-	// v26.11.25-link: if the reassembled data is > 1250, the server
-	// is sending coalesced packets that exceed the path MTU. Send ICMP.
-	// v26.11.28-link: this ICMP is best-effort — even if the server
-	// ignores it, the SplitCoalesced path in worker.go splits the
-	// datagram into individual UDP packets so the browser can still
-	// process it. ICMP just nudges servers that DO honor PMTUD.
-	if totalN > 1250 && b.UDP != nil {
+	// v26.11.19-link / v26.11.25-link: send ICMP "Fragmentation Needed"
+	// to the server when the datagram exceeds the path MTU. Best-effort
+	// — many servers ignore it for the Initial (RFC 9000 §8.1
+	// anti-amplification requires Initial + Handshake in one coalesced
+	// datagram). SplitCoalesced is the real fix; ICMP is a nudge.
+	if n > 1250 && b.UDP != nil {
 		serverIP := b.UDP.Address.IP()
 		sendICMPFragmentationNeeded(&stdnet.UDPAddr{IP: serverIP, Port: 443}, 1250)
 	}
