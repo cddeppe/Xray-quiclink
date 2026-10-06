@@ -969,14 +969,20 @@ func splitCoalescedQUIC(b *buf.Buffer) buf.MultiBuffer {
 		offset = packetEnd
 	}
 
-	b.Release()
-
 	if len(result) <= 1 {
+		// Split didn't produce multiple packets.
+		// Release the result packets and return nil.
+		// v26.11.15-link: do NOT release b here — the caller
+		// needs it. b.Release() is only called when the split
+		// succeeds (len(result) > 1).
 		for _, p := range result {
 			p.Release()
 		}
 		return nil
 	}
+
+	// Split succeeded — now safe to release the original buffer
+	b.Release()
 	return result
 }
 
