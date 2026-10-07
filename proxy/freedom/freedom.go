@@ -406,6 +406,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         input := link.Reader
         output := link.Writer
 
+        // v26.11.104: Drop UDP packets destined to loopback:443.
+        // When SNI sniffing fails, destination stays as 127.0.0.1:443 (dokodemo default).
+        // Without this drop, freedom.Process dials 127.0.0.1:443 → loops back to
+        // the dokodemo listener → infinite loop → resource exhaustion → all QUIC fails.
+        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
+                common.Interrupt(input)
+                common.Close(output)
+                return errors.New("dropping loopback UDP:443 — SNI extraction failed")
+        }
+
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
         // When the remote peer (e.g. YouTube) closes the outbound TCP, we
         // must close the inbound input pipe too — otherwise requestDone's
