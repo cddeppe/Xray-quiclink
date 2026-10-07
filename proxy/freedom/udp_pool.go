@@ -475,6 +475,29 @@ func (s *pooledSocket) readLoop() {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidCopy := append([]byte(nil), scid...)
                                         quic.NotifyServerSCID(scidCopy, src)
+
+                                        // v26.11.79-link: CRITICAL FIX — register the server's
+                                        // SCID in demux so future 1-RTT packets (DCID=serverSCID)
+                                        // hit demux instead of being dropped.
+                                        //
+                                        // The server chooses a new SCID during the handshake.
+                                        // Chrome uses this SCID as the DCID in all subsequent
+                                        // 1-RTT packets. But WriteTo only registered Chrome's
+                                        // DCID and SCID — NOT the server's SCID. So when the
+                                        // server's 1-RTT replies arrive with DCID=serverSCID,
+                                        // demux misses and the packet is DROPPED. This causes
+                                        // QUIC handshake to complete but ALL subsequent data
+                                        // (video segments) to be dropped → video freezes.
+                                        scidKey := makeDCIDKey(scid)
+                                        s.mu.Lock()
+                                        if _, exists := s.demux[scidKey]; !exists {
+                                                s.demux[scidKey] = ch
+                                                if src != nil {
+                                                        s.demuxSource[scidKey] = src
+                                                }
+                                                xrayerrors.LogWarning(context.Background(), "DIAG RL11 readLoop REGISTERED server SCID in demux scid=", fmt.Sprintf("%x", scid[:min(len(scid), 8)]))
+                                        }
+                                        s.mu.Unlock()
                                 }
                         }
                 }
