@@ -335,6 +335,7 @@ type udpWorker struct {
         activeConn map[connID]*udpConn
         dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
         srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
+        connBySrc  map[srcKey]*udpConn // v26.11.110: direct srcKey → *udpConn cache for short headers
 
         ctx  context.Context
         cone bool
@@ -438,31 +439,33 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         }
                 }
         }
-        // v26.11.52-link: Solution A — for short headers with no id.dest,
-        // look up the existing conn by srcKey and reuse its pipe. This
-        // avoids creating a new conn → new DispatchLink → sniffing fails
-        // (no SNI in short headers) → 127.0.0.1:443 loop → freeze.
+
+        // v26.11.110: Source-port-based conn cache.
+        // Maps srcKey → *udpConn (direct pointer, not connID).
         //
-        // v26.11.107: RESTORED from v26.11.56. Without this, 1-RTT short
-        // headers create a new conn, the sniffer can't extract SNI, and
-        // the packet is routed to 127.0.0.1:443 — a packet loop that kills
-        // the QUIC connection.
-        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+        // This replaces Solution A (which used srcIndex[srcKey] → connID →
+        // activeConn[connID] → *udpConn). Solution A failed because:
+        // - The Initial's conn has id.dest = synthetic dest (DCID[:4]:443)
+        // - srcIndex stores srcKey → connID (which includes the synthetic dest)
+        // - When a 1-RTT short header arrives, id.dest is zero (no DCID parse
+        //   for short headers), so the srcIndex lookup key is different
+        //
+        // This cache stores srcKey → *udpConn directly, bypassing the connID
+        // lookup entirely. Any packet from the same source port finds the
+        // existing conn and writes to its pipe — no new conn, no new sniffer,
+        // no new freedom.Process, no new pooled socket, no new demux.
+        //
+        // The packet flows through the EXISTING conn's freedom.Process →
+        // EXISTING pooled socket → EXISTING demux map (which has the
+        // Server CID registered from the Initial). This is the correct fix.
+        if len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                // Short header (1-RTT) — try the source-port conn cache
                 w.RLock()
-                if existingID, found := w.srcIndex[id.srcKey]; found {
-                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                w.RUnlock()
-                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                existingConn.updateActivity()
-                                return
-                        } else {
-                                // v26.11.108 DIAG: Solution A found srcIndex entry but conn was gone/closed
-                                errors.LogWarning(context.Background(), "DIAG SA1 Solution A: srcIndex FOUND but conn gone src=", source,
-                                        " connFound=", connFound, " done=", existingConn.done.Done())
-                        }
-                } else {
-                        // v26.11.108 DIAG: Solution A srcIndex lookup FAILED
-                        errors.LogWarning(context.Background(), "DIAG SA2 Solution A: srcIndex MISS src=", source, " pktLen=", len(b.Bytes()))
+                if existingConn, found := w.connBySrc[id.srcKey]; found && !existingConn.done.Done() {
+                        w.RUnlock()
+                        existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                        existingConn.updateActivity()
+                        return
                 }
                 w.RUnlock()
         }
@@ -493,6 +496,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         if !existing {
                 w.recordDCID(b.Bytes(), id, conn)
                 w.recordSrc(id, conn)
+                // v26.11.110: Populate the source-port conn cache.
+                // This MUST be under w.Lock() to race with the short header
+                // path's RLock read. recordSrc already acquires w.Lock(),
+                // but connBySrc is a separate map — store here under Lock.
+                w.Lock()
+                w.connBySrc[id.srcKey] = conn
+                w.Unlock()
         }
 
         // payload will be discarded in pipe is full.
@@ -554,6 +564,7 @@ func (w *udpWorker) removeConn(id connID) {
                         }
                 }
                 delete(w.srcIndex, id.srcKey)
+                delete(w.connBySrc, id.srcKey) // v26.11.110: clean up source-port cache
                 delete(w.activeConn, id)
         } else {
                 // H3 fix: conn was migrated and re-keyed under a new id.
@@ -878,6 +889,7 @@ func (w *udpWorker) clean() error {
                 w.activeConn = make(map[connID]*udpConn, 16)
                 w.dcidIndex = make(map[dcidKey]connID)
                 w.srcIndex = make(map[srcKey]connID)
+                w.connBySrc = make(map[srcKey]*udpConn)
         }
 
         return nil
@@ -887,6 +899,7 @@ func (w *udpWorker) Start() error {
         w.activeConn = make(map[connID]*udpConn, 16)
         w.dcidIndex = make(map[dcidKey]connID)
         w.srcIndex = make(map[srcKey]connID)
+        w.connBySrc = make(map[srcKey]*udpConn)
         ctx := context.Background()
         h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
         if err != nil {
