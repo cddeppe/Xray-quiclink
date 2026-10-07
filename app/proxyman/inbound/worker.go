@@ -595,6 +595,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         outbounds := []*session.Outbound{{}}
                         if originalDest.IsValid() {
                                 outbounds[0].Target = originalDest
+                        } else {
+                                // v26.11.65-link: when there's no TPROXY (originalDest invalid),
+                                // set the target to a UDP destination so the sniffer knows to run
+                                // the QUIC sniffer. Without this, the target stays as zero-value
+                                // (Network=TCP), and the QUIC sniffer never runs — so no SNI is
+                                // extracted, and packets loop to 127.0.0.1:443.
+                                outbounds[0].Target = net.UDPDestination(w.address, w.port)
                         }
                         ctx = session.ContextWithOutbounds(ctx, outbounds)
                         local := net.DestinationFromAddr(w.hub.Addr())
