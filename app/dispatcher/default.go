@@ -2,6 +2,7 @@ package dispatcher
 
 import (
         "context"
+        "fmt"
         "strings"
         "sync"
         "time"
@@ -371,19 +372,23 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                 //
                 // For TCP, keep synchronous (TCP sniffing is fast — single packet).
                 if destination.Network == net.Network_UDP {
+                        errors.LogWarning(ctx, "DIAG D01 DispatchLink UDP dest=", destination, " sniffingEnabled=", sniffingRequest.Enabled, " metadataOnly=", sniffingRequest.MetadataOnly)
                         cReader := &cachedReader{
                                 reader: outbound.Reader.(buf.TimeoutReader),
                                 cache:  make(buf.MultiBuffer, 0, 8),
                         }
                         outbound.Reader = cReader
                         go func() {
+                                errors.LogWarning(ctx, "DIAG D02 UDP sniffer goroutine STARTED")
                                 result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+                                errors.LogWarning(ctx, "DIAG D03 UDP sniffer returned err=", err, " result=", result != nil)
                                 if err == nil {
                                         content.Protocol = result.Protocol()
                                 }
                                 if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
                                         domain := result.Domain()
                                         errors.LogInfo(ctx, "sniffed domain: ", domain)
+                                        errors.LogWarning(ctx, "DIAG D04 UDP SNI OVERRIDDEN domain=", domain)
                                         destination.Address = net.ParseAddress(domain)
                                         protocol := result.Protocol()
                                         if resComp, ok := result.(SnifferResultComposite); ok {
@@ -439,14 +444,17 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
+        errors.LogWarning(ctx, "DIAG S01 sniffer() ENTER metadataOnly=", metadataOnly, " network=", network)
         payload := buf.NewWithSize(32767)
         defer payload.Release()
 
         sniffer := NewSniffer(ctx)
 
         metaresult, metadataErr := sniffer.SniffMetadata(ctx)
+        errors.LogWarning(ctx, "DIAG S02 SniffMetadata returned metadataErr=", metadataErr)
 
         if metadataOnly {
+                errors.LogWarning(ctx, "DIAG S03 metadataOnly=true — content sniffer SKIPPED")
                 return metaresult, metadataErr
         }
 
@@ -456,18 +464,30 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                 for {
                         select {
                         case <-ctx.Done():
+                                errors.LogWarning(ctx, "DIAG S04 ctx.Done() — sniffer cancelled")
                                 return nil, ctx.Err()
                         default:
                                 cachingStartingTimeStamp := time.Now()
+                                errors.LogWarning(ctx, "DIAG S05 calling cReader.Cache() cacheDeadline=", cacheDeadline)
                                 err := cReader.Cache(payload, cacheDeadline)
                                 if err != nil {
+                                        errors.LogWarning(ctx, "DIAG S06 cReader.Cache() returned err=", err)
                                         return nil, err
                                 }
                                 cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
                                 cacheDeadline -= cachingTimeElapsed
 
+                                errors.LogWarning(ctx, "DIAG S07 cReader.Cache() OK payload.Len=", payload.Len(), " elapsed=", cachingTimeElapsed, " remaining=", cacheDeadline)
+
                                 if !payload.IsEmpty() {
-                                        result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
+                                        firstByte := byte(0)
+                                        pb := payload.Bytes()
+                                        if len(pb) > 0 {
+                                                firstByte = pb[0]
+                                        }
+                                        errors.LogWarning(ctx, "DIAG S08 calling sniffer.Sniff() firstByte=0x", fmt.Sprintf("%02x", firstByte), " len=", len(pb), " network=", network)
+                                        result, err := sniffer.Sniff(ctx, pb, network)
+                                        errors.LogWarning(ctx, "DIAG S09 sniffer.Sniff() returned err=", err)
                                         switch err {
                                         case common.ErrNoClue:
                                                 totalAttempt++
@@ -476,14 +496,17 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                                                 return result, err
                                         }
                                 } else {
+                                        errors.LogWarning(ctx, "DIAG S08a payload is empty — totalAttempt++")
                                         totalAttempt++
                                 }
                                 if totalAttempt >= 2 || cacheDeadline <= 0 {
+                                        errors.LogWarning(ctx, "DIAG S10 returning errSniffingTimeout totalAttempt=", totalAttempt, " cacheDeadline=", cacheDeadline)
                                         return nil, errSniffingTimeout
                                 }
                         }
                 }
         }()
+        errors.LogWarning(ctx, "DIAG S11 content sniffer done contentErr=", contentErr, " metadataErr=", metadataErr)
         if contentErr != nil && metadataErr == nil {
                 return metaresult, nil
         }
