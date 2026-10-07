@@ -419,33 +419,55 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // address (loopback:443). The pool bypassed this by peeking the
         // packet directly. Without the pool, we do the same: peek the first
         // packet, check if it's QUIC, and try quic.SniffQUIC to extract SNI.
+        // If SniffQUIC returns ErrProtoNeedMoreData (ClientHello split across
+        // multiple packets), accumulate more packets and retry.
         var peekedPackets buf.MultiBuffer
         if destination.Network == net.Network_UDP && destination.Port == 443 {
                 destIP := destination.Address.IP()
                 if destIP.IsLoopback() || destIP.IsUnspecified() {
-                        mb, peekErr := input.ReadMultiBuffer()
-                        if peekErr == nil && len(mb) > 0 {
-                                peekedPackets = mb
-                                pktBytes := mb[0].Bytes()
-                                if len(pktBytes) > 0 && pktBytes[0]&0x80 != 0 && pktBytes[0]&0x40 != 0 {
-                                        if sniffResult, sniffErr := quic.SniffQUIC(pktBytes); sniffErr == nil && sniffResult != nil {
-                                                domain := sniffResult.Domain()
-                                                if domain != "" {
-                                                        errors.LogWarning(ctx, "DIAG P20 manual SNI extraction SUCCEEDED domain=", domain)
-                                                        destination = net.UDPDestination(net.DomainAddress(domain), 443)
-                                                        goto skipLoopbackDrop
-                                                }
-                                                errors.LogWarning(ctx, "DIAG P21 SniffQUIC ok but domain empty pktLen=", len(pktBytes))
-                                        } else {
-                                                errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed err=", sniffErr, " pktLen=", len(pktBytes), " firstByte=0x", fmt.Sprintf("%02x", pktBytes[0]))
-                                        }
-                                        errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed for QUIC packet, dropping to prevent loop")
+                        // Read packets and accumulate for SNI extraction
+                        var accumulated []byte
+                        for attempt := 0; attempt < 10; attempt++ {
+                                mb, peekErr := input.ReadMultiBuffer()
+                                if peekErr != nil {
+                                        errors.LogWarning(ctx, "DIAG P19 peek failed err=", peekErr, " attempt=", attempt)
                                         return nil
                                 }
-                                errors.LogWarning(ctx, "DIAG P22 not a QUIC long header, dropping to prevent loop")
-                                return nil
+                                peekedPackets = append(peekedPackets, mb...)
+                                for _, b := range mb {
+                                        accumulated = append(accumulated, b.Bytes()...)
+                                }
+                                if len(accumulated) == 0 {
+                                        continue
+                                }
+                                firstByte := accumulated[0]
+                                if firstByte&0x80 == 0 || firstByte&0x40 == 0 {
+                                        errors.LogWarning(ctx, "DIAG P22 not QUIC long header firstByte=0x", fmt.Sprintf("%02x", firstByte))
+                                        return nil
+                                }
+                                result, sniffErr := quic.SniffQUIC(accumulated)
+                                if sniffErr == nil && result != nil {
+                                        domain := result.Domain()
+                                        if domain != "" {
+                                                errors.LogWarning(ctx, "DIAG P20 manual SNI extraction SUCCEEDED domain=", domain, " after ", attempt+1, " packets len=", len(accumulated))
+                                                destination = net.UDPDestination(net.DomainAddress(domain), 443)
+                                                goto skipLoopbackDrop
+                                        }
+                                }
+                                // Check if it's "need more data" — try reading another packet
+                                if sniffErr != nil {
+                                        errStr := sniffErr.Error()
+                                        if strings.Contains(errStr, "need more data") {
+                                                errors.LogWarning(ctx, "DIAG P23 need more data, reading next packet attempt=", attempt+1, " accLen=", len(accumulated))
+                                                continue
+                                        }
+                                        // Hard error — can't sniff
+                                        errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed err=", sniffErr, " pktLen=", len(accumulated), " firstByte=0x", fmt.Sprintf("%02x", firstByte))
+                                        return nil
+                                }
                         }
-                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP:443 (peek failed)")
+                        // Exhausted retries — drop to prevent loop
+                        errors.LogWarning(ctx, "DIAG P21 SniffQUIC exhausted retries, dropping accLen=", len(accumulated))
                         return nil
                 }
         skipLoopbackDrop:
