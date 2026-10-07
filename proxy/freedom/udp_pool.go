@@ -353,13 +353,22 @@ func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn,
                 p.mu.Unlock()
         }
 
-        inbox := make(chan readResult, 256) // v26.10.20-link: was 32, increased to 256 to absorb YouTube reply bursts
+        inbox := make(chan readResult, 256)
         conn := &pooledConn{
                 socket:    sock,
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
+        // v26.11.94-link: CRITICAL FIX — set lastActiveCh BEFORE returning.
+        // The readLoop starts immediately after socket creation. Server replies
+        // can arrive before the first WriteTo (which sets lastActiveCh).
+        // Without this, replies are dropped because lastActiveCh is nil.
+        // This fixes the race condition that causes QUIC connections to die
+        // after a few seconds.
+        sock.mu.Lock()
+        sock.lastActiveCh = inbox
+        sock.mu.Unlock()
         return conn, nil
 }
 
