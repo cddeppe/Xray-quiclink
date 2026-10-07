@@ -892,7 +892,9 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                                         if offset == 0 && cryptoLen == 0 && !fastPathTried {
                                                 fastPathTried = true
                                                 tlsHdr := &ptls.SniffHeader{}
-                                                if err := ptls.ReadClientHello(frameData, tlsHdr); err == nil {
+                                                err := ptls.ReadClientHello(frameData, tlsHdr)
+                                                if err == nil {
+                                                        errors.LogWarning(context.Background(), "DIAG Q10 FAST PATH SNI extracted: domain=", tlsHdr.Domain(), " alpn=", tlsHdr.ALPN(), " hasECH=", tlsHdr.HasECH(), " cryptoLen=", length)
                                                         if state != nil {
                                                                 state.setResult(tlsHdr.Domain(), tlsHdr.ALPN(), tlsHdr.HasECH())
                                                         }
@@ -902,6 +904,7 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                                                                 hasECH: tlsHdr.HasECH(),
                                                         }, nil
                                                 }
+                                                errors.LogWarning(context.Background(), "DIAG Q10a fast path ReadClientHello err=", err, " cryptoLen=", length, " (v26.11.75: truncated ClientHello now extracts SNI from partial data)")
                                                 // Parse failed (incomplete ClientHello split
                                                 // across packets?) — fall through to the
                                                 // accumulation path and try again after
@@ -934,6 +937,7 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                         tlsHdr := &ptls.SniffHeader{}
                         err := ptls.ReadClientHello(cryptoDataBuf.BytesRange(0, cryptoLen), tlsHdr)
                         if err == nil {
+                                errors.LogWarning(context.Background(), "DIAG Q11 ACCUM PATH SNI extracted: domain=", tlsHdr.Domain(), " alpn=", tlsHdr.ALPN(), " hasECH=", tlsHdr.HasECH(), " cryptoLen=", cryptoLen)
                                 if state != nil {
                                         state.setResult(tlsHdr.Domain(), tlsHdr.ALPN(), tlsHdr.HasECH())
                                 }
@@ -943,11 +947,13 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                                         hasECH: tlsHdr.HasECH(),
                                 }, nil
                         }
+                        errors.LogWarning(context.Background(), "DIAG Q11a accum path ReadClientHello err=", err, " cryptoLen=", cryptoLen)
                 }
 
                 b = restPayload
         }
 
+        errors.LogWarning(context.Background(), "DIAG Q12 SniffQUIC returning ErrProtoNeedMoreData (no SNI extracted from available packets)")
         return nil, protocol.ErrProtoNeedMoreData
 }
 
