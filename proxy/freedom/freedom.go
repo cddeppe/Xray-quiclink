@@ -382,6 +382,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         destination := ob.Target
+
+        // v26.11.66-link: drop UDP packets destined to loopback. Without
+        // TPROXY, when the QUIC sniffer fails to extract the SNI, the
+        // destination stays as the Gateway (inbound listen address, usually
+        // 0.0.0.0 or 127.0.0.1). Sending to this creates an infinite loop
+        // (xray → xray → xray...) that prevents anything from loading.
+        // Dropping the packet lets QUIC retransmit; if the sniffer succeeds
+        // on the retransmit, the packet routes correctly.
+        if destination.Network == net.Network_UDP {
+                destIP := destination.Address.IP()
+                if destIP.IsLoopback() || destIP.IsUnspecified() {
+                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP dest=", destination, " (sniffer failed, preventing loop)")
+                        return nil
+                }
+        }
         origTargetAddr := ob.OriginalTarget.Address
         if origTargetAddr == nil {
                 origTargetAddr = ob.Target.Address
@@ -609,7 +624,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
         errors.LogWarning(ctx, "DIAG P02 dialed dest=", destination, " pool=", h.socketPool != nil)
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
-		errors.LogWarning(ctx, "DIAG P02 dialed conn dest=", destination, " network=", destination.Network, " pool=", h.socketPool != nil)
+                errors.LogWarning(ctx, "DIAG P02 dialed conn dest=", destination, " network=", destination.Network, " pool=", h.socketPool != nil)
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
@@ -720,10 +735,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
 
                 errors.LogWarning(ctx, "DIAG P09 buf.Copy input->writer START")
-		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+                if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
         errors.LogWarning(ctx, "DIAG P09 buf.Copy input->writer returned")
                         errors.LogWarning(ctx, "DIAG P10 requestDone buf.Copy returned err=", err)
-			// v26.10.38-link: swallow ErrClosedPipe when inputCloser has
+                        // v26.10.38-link: swallow ErrClosedPipe when inputCloser has
                         // fired (responseDone returned, so YouTube closed the outbound).
                         // Without this guard, the ErrClosedPipe propagates out of
                         // freedom.Process, and handler.Dispatch (handler.go:254-258)
@@ -853,7 +868,7 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         continue
                 }
                 b.Resize(0, int32(n))
-			errors.LogWarning(context.Background(), "DIAG R07 reply resized n=", n)
+                        errors.LogWarning(context.Background(), "DIAG R07 reply resized n=", n)
 
                 // if udp dest addr is changed, we are unable to get the correct src addr
                 // so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
@@ -932,7 +947,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                 var n int
                 var err error
                 errors.LogWarning(context.Background(), "DIAG W04 b.UDP=", b.UDP, " override=", w.UDPOverride)
-			if b.UDP != nil {
+                        if b.UDP != nil {
                         if w.UDPOverride.Address != nil {
                                 b.UDP.Address = w.UDPOverride.Address
                         }
@@ -981,9 +996,9 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 continue
                         }
                         errors.LogWarning(context.Background(), "DIAG W07 calling WriteTo len=", len(b.Bytes()))
-				n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+                                n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
             errors.LogWarning(context.Background(), "DIAG W07 WriteTo returned")
-				errors.LogWarning(context.Background(), "DIAG W08 WriteTo n=", n, " err=", err)
+                                errors.LogWarning(context.Background(), "DIAG W08 WriteTo n=", n, " err=", err)
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
                 }
