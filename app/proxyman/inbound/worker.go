@@ -190,6 +190,8 @@ type udpConn struct {
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
+        worker           *udpWorker       // v26.11.83-link: back-reference for dcidIndex registration
+        id               connID           // v26.11.83-link: this conn's id for dcidIndex registration
 }
 
 func (c *udpConn) setInactive() {
@@ -229,6 +231,26 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // truncate to 1250 as an absolute last resort if the full send
 // fails with EMSGSIZE.
 func (c *udpConn) Write(buf []byte) (int, error) {
+        // v26.11.83-link: Register server's SCID in dcidIndex when we see
+        // the server's Initial reply. Chrome's 1-RTT packets use DCID=
+        // serverSCID. Without registering it here, connection migration
+        // (new source port) fails — tryQUICMigration can't find the DCID
+        // in dcidIndex, creates a new conn, runs the sniffer (which fails
+        // on short headers), and drops the packet.
+        if len(buf) > 0 && buf[0]&0x80 != 0 && c.worker != nil {
+                pktType := (buf[0] >> 4) & 0x03
+                if pktType == 0x00 { // Initial
+                        if scid, _, err := quic.ParseSCID(buf); err == nil && len(scid) > 0 {
+                                c.worker.Lock()
+                                dk := makeDCIDKey(scid)
+                                if _, exists := c.worker.dcidIndex[dk]; !exists {
+                                        c.worker.dcidIndex[dk] = c.id
+                                        errors.LogInfo(context.Background(), "DIAG W08 udpConn.Write registered server SCID in dcidIndex scid=", hex.EncodeToString(scid[:min(len(scid), 8)]))
+                                }
+                                c.worker.Unlock()
+                        }
+                }
+        }
         if len(buf) <= 1250 {
                 n, err := c.output(buf)
                 if c.downlink != nil {
@@ -474,6 +496,8 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 w.RUnlock()
                 return w.hub.WriteTo(b, srcCopy)
         }
+        conn.worker = w // v26.11.83-link: back-reference for dcidIndex registration
+        conn.id = id    // v26.11.83-link: this conn's id for dcidIndex registration
         w.activeConn[id] = conn
 
         conn.updateActivity()
