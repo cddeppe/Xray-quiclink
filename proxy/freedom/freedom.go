@@ -441,8 +441,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // UDP-only sticky restores v26.10.36's working behavior. The CLOSE-WAIT
         // fix (inputCloser) and tcpKeepAlive alias are kept; both are
         // independent of the sticky-TCP change.
+        // v26.11.59-link: for UDP/QUIC traffic, use ResolveFresh (no stale-while-revalidate).
+        // A stale IP sends the QUIC Initial to a dead CDN edge → handshake fails →
+        // Chrome falls back to TCP → stall. For TCP, stale-while-revalidate is fine
+        // because the next request gets the fresh IP.
         if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() && h.stickyResolver != nil {
-                if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil {
+                var stickyIP net.Address
+                var err error
+                if destination.Network == net.Network_UDP {
+                        stickyIP, err = h.stickyResolver.ResolveFresh(ctx, destination.Address.Domain())
+                } else {
+                        stickyIP, err = h.stickyResolver.Resolve(ctx, destination.Address.Domain())
+                }
+                if err == nil {
                         destination.Address = stickyIP
                         if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
                                 UDPOverride.Address = stickyIP

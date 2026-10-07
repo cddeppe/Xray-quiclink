@@ -156,6 +156,55 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
         return s.resolveAndCache(ctx, hostname)
 }
 
+// ResolveFresh resolves a hostname WITHOUT stale-while-revalidate.
+// If the cached entry is stale, it blocks until the fresh DNS resolution
+// completes, then returns the fresh IP. This is critical for QUIC/UDP
+// because a stale IP sends the QUIC Initial to a dead CDN edge, killing
+// the handshake and forcing Chrome to fall back to TCP.
+//
+// v26.11.59-link: added for UDP/QUIC traffic to prevent stale-IP handshake failures.
+func (s *StickyResolver) ResolveFresh(ctx context.Context, hostname string) (net.Address, error) {
+        // Check exact match first
+        s.mu.RLock()
+        if entry, ok := s.entries[hostname]; ok {
+                if entry.age() < s.ttl {
+                        s.mu.RUnlock()
+                        entry.touch()
+                        return entry.ip, nil
+                }
+                // Stale entry — don't return it. Fall through to fresh resolve.
+                s.mu.RUnlock()
+                errors.LogInfo(ctx, "sticky: ResolveFresh: stale entry for ", hostname, ", blocking on fresh DNS")
+                return s.resolveAndCache(ctx, hostname)
+        }
+
+        // Check wildcard match
+        remaining := hostname
+        for {
+                parent, ok := parentDomain(remaining)
+                if !ok {
+                        break
+                }
+                wildcardKey := "*." + parent
+                if entry, ok := s.entries[wildcardKey]; ok {
+                        if entry.age() < s.wildcardTTL {
+                                s.mu.RUnlock()
+                                entry.touch()
+                                return entry.ip, nil
+                        }
+                        // Stale wildcard — don't return it. Fall through to fresh resolve.
+                        s.mu.RUnlock()
+                        errors.LogInfo(ctx, "sticky: ResolveFresh: stale wildcard for ", hostname, ", blocking on fresh DNS")
+                        return s.resolveAndCache(ctx, hostname)
+                }
+                remaining = parent
+        }
+        s.mu.RUnlock()
+
+        // No cache hit — resolve fresh
+        return s.resolveAndCache(ctx, hostname)
+}
+
 // parentDomain returns the parent domain of hostname (everything after
 // the first dot). Returns ("", false) if hostname has no dot.
 // v26.10.15-link: replaces strings.SplitN(hostname, ".", 2)[1] which
