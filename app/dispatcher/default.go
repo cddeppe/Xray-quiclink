@@ -363,35 +363,76 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !sniffingRequest.Enabled {
                 d.routedDispatch(ctx, outbound, destination)
         } else {
-                cReader := &cachedReader{
-                        reader: outbound.Reader.(buf.TimeoutReader),
-                        cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange
-                }
-                outbound.Reader = cReader
-                result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-                if err == nil {
-                        content.Protocol = result.Protocol()
-                }
-                if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-                        domain := result.Domain()
-                        errors.LogInfo(ctx, "sniffed domain: ", domain)
-                        destination.Address = net.ParseAddress(domain)
-                        protocol := result.Protocol()
-                        if resComp, ok := result.(SnifferResultComposite); ok {
-                                protocol = resComp.ProtocolForDomainResult()
+                // v26.11.74-link: for UDP, run the sniffer in a goroutine so it
+                // doesn't block the worker. The sniffer needs multiple packets for
+                // Chrome's ECH ClientHello (split across 2 QUIC packets). Running
+                // synchronously deadlocks: the worker can't deliver the 2nd packet
+                // while DispatchLink is blocking on the sniffer.
+                //
+                // For TCP, keep synchronous (TCP sniffing is fast — single packet).
+                if destination.Network == net.Network_UDP {
+                        cReader := &cachedReader{
+                                reader: outbound.Reader.(buf.TimeoutReader),
+                                cache:  make(buf.MultiBuffer, 0, 8),
                         }
-                        isFakeIP := false
-                        if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
-                                isFakeIP = true
-                        }
-                        if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
-                                ob.RouteTarget = destination
-                        } else {
-                                ob.Target = destination
-                        }
+                        outbound.Reader = cReader
+                        go func() {
+                                result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+                                if err == nil {
+                                        content.Protocol = result.Protocol()
+                                }
+                                if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+                                        domain := result.Domain()
+                                        errors.LogInfo(ctx, "sniffed domain: ", domain)
+                                        destination.Address = net.ParseAddress(domain)
+                                        protocol := result.Protocol()
+                                        if resComp, ok := result.(SnifferResultComposite); ok {
+                                                protocol = resComp.ProtocolForDomainResult()
+                                        }
+                                        isFakeIP := false
+                                        if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
+                                                isFakeIP = true
+                                        }
+                                        if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
+                                                ob.RouteTarget = destination
+                                        } else {
+                                                ob.Target = destination
+                                        }
+                                } else {
+                                        errors.LogWarning(ctx, "UDP sniffer failed or timed out, using original dest=", destination)
+                                }
+                                d.routedDispatch(ctx, outbound, destination)
+                        }()
                 } else {
+                        cReader := &cachedReader{
+                                reader: outbound.Reader.(buf.TimeoutReader),
+                                cache:  make(buf.MultiBuffer, 0, 8),
+                        }
+                        outbound.Reader = cReader
+                        result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+                        if err == nil {
+                                content.Protocol = result.Protocol()
+                        }
+                        if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+                                domain := result.Domain()
+                                errors.LogInfo(ctx, "sniffed domain: ", domain)
+                                destination.Address = net.ParseAddress(domain)
+                                protocol := result.Protocol()
+                                if resComp, ok := result.(SnifferResultComposite); ok {
+                                        protocol = resComp.ProtocolForDomainResult()
+                                }
+                                isFakeIP := false
+                                if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
+                                        isFakeIP = true
+                                }
+                                if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
+                                        ob.RouteTarget = destination
+                                } else {
+                                        ob.Target = destination
+                                }
+                        }
+                        d.routedDispatch(ctx, outbound, destination)
                 }
-                d.routedDispatch(ctx, outbound, destination)
         }
 
         return nil

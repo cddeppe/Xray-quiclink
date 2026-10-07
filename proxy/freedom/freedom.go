@@ -416,30 +416,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // extraction code and the pool peek code can use it.
         var peekedPackets buf.MultiBuffer
 
-        // v26.11.73-link: REMOVED manual SNI extraction (caused deadlock).
-        // The manual SNI extraction blocked freedom.Process waiting for
-        // the 2nd QUIC packet. But the worker callback delivers packets
-        // to the pipe, and it can't deliver the 2nd packet until
-        // freedom.Process returns → DEADLOCK → 389ms delay → Chrome falls
-        // back to TCP.
-        //
-        // Instead: when the destination is an IP (sniffer failed), forward
-        // the packet immediately to that IP. The IP is HOP2's address (via
-        // DNS hijack). HOP2's dispatcher sniffer has a 200ms timeout built
-        // in — it can wait for the 2nd packet properly.
-        //
-        // The only exception: loopback (127.0.0.1 / 0.0.0.0) — these would
-        // cause an infinite loop. Drop those.
-        if destination.Network == net.Network_UDP && destination.Port == 443 {
-                destIP := destination.Address.IP()
-                if destIP.IsLoopback() || destIP.IsUnspecified() {
-                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP:443 (would loop)")
-                        return nil
-                }
-                // Destination is a real IP (HOP2's address via DNS hijack).
-                // Forward immediately — no SNI extraction needed.
-                errors.LogWarning(ctx, "DIAG P30 forwarding UDP:443 to IP=", destIP, " (sniffer failed, forwarding to next hop)")
-        }
+        // v26.11.74-link: REMOVED loopback drop and manual SNI extraction.
+        // The dispatcher now runs the UDP sniffer in a goroutine (v26.11.74),
+        // so it can wait for multiple packets without deadlocking the worker.
+        // If the sniffer fails, the destination stays as the IP — but the
+        // dispatcher handles that (routes to the IP as-is).
+        // No more loopback drops, no more manual SNI extraction in freedom.Process.
 
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
         // When the remote peer (e.g. YouTube) closes the outbound TCP, we
