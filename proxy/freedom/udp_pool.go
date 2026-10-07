@@ -235,13 +235,21 @@ func destKey(dest *stdnet.UDPAddr) string {
         return dest.String()
 }
 
+// Acquire gets or creates a pool socket for the given key.
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
-        key := destKey(dest)
+        return p.AcquireWithDest(dest, dest)
+}
+
+// v26.11.103: AcquireWithDest separates pool key from dest IP.
+// key = source port (unique per QUIC connection → one socket per conn)
+// dest = real destination IP (for WriteTo)
+func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn, error) {
+        k := destKey(key)
 
         p.mu.Lock()
-        sock, ok := p.sockets[key]
+        sock, ok := p.sockets[k]
         if ok && (sock.IsClosed() || sock.IsDead()) {
-                delete(p.sockets, key)
+                delete(p.sockets, k)
                 ok = false
         }
         if ok {
@@ -260,7 +268,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         // (release() checks s.dead but the conn was never
                         // closed because we bypassed MarkStale's close logic).
                         sock.MarkStale()
-                        delete(p.sockets, key)
+                        delete(p.sockets, k)
                         ok = false
                 } else {
                         // v26.10.26-link: only increment refCount if the socket
@@ -298,7 +306,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 }
 
                 p.mu.Lock()
-                if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
+                if existing, ok := p.sockets[k]; ok && !existing.IsClosed() && !existing.IsDead() {
                         pc.Close()
                         sock = existing
                         // v26.10.43-link (audit P5): init atomic timestamps
@@ -309,7 +317,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         sock.refCount++
                         sock.mu.Unlock()
                 } else {
-                        p.sockets[key] = sock
+                        p.sockets[k] = sock
                         // v26.10.43-link (audit P5): init atomic timestamps
                         nowNano := time.Now().UnixNano()
                         sock.lastUsed.Store(nowNano)
@@ -401,37 +409,37 @@ func (s *pooledSocket) readLoop() {
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
-			if !ok {
-				// v26.11.101: Deliver server Initial reply for 0-SCID Chrome
-				if len(dcid) == 0 && n > 0 && packet[0]&0x80 != 0 {
-					s.mu.RLock()
-					ch = s.lastActiveCh
-					s.mu.RUnlock()
-					if ch != nil {
-						ok = true
-						if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
-							scidKey := makeDCIDKey(scid)
-							s.mu.Lock()
-							if _, exists := s.demux[scidKey]; !exists {
-								s.demux[scidKey] = ch
-							}
-							s.mu.Unlock()
-						}
-					}
-				}
-				if !ok {
-					putPacket(packet)
-					continue
-				}
-			}
+                        if !ok {
+                                // v26.11.101: Deliver server Initial reply for 0-SCID Chrome
+                                if len(dcid) == 0 && n > 0 && packet[0]&0x80 != 0 {
+                                        s.mu.RLock()
+                                        ch = s.lastActiveCh
+                                        s.mu.RUnlock()
+                                        if ch != nil {
+                                                ok = true
+                                                if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
+                                                        scidKey := makeDCIDKey(scid)
+                                                        s.mu.Lock()
+                                                        if _, exists := s.demux[scidKey]; !exists {
+                                                                s.demux[scidKey] = ch
+                                                        }
+                                                        s.mu.Unlock()
+                                                }
+                                        }
+                                }
+                                if !ok {
+                                        putPacket(packet)
+                                        continue
+                                }
+                        }
 
-		packetToSend := packet[:n] // v26.11.101: slice to actual length
-		select {
-		case ch <- readResult{data: packetToSend, addr: addr}:
-		default:
-			s.droppedReplies.Add(1)
-			putPacket(packet)
-		}
+                packetToSend := packet[:n] // v26.11.101: slice to actual length
+                select {
+                case ch <- readResult{data: packetToSend, addr: addr}:
+                default:
+                        s.droppedReplies.Add(1)
+                        putPacket(packet)
+                }
         }
 }
 
@@ -589,16 +597,16 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 dest = udp
         }
         n, err := c.socket.conn.WriteTo(b, dest)
-	if err != nil {
-		if !isTransientWriteError(err) {
-			c.socket.MarkDead()
-		}
-	} else {
-		c.socket.mu.Lock()
-		c.socket.lastActiveCh = c.inbox
-		c.socket.mu.Unlock()
-	}
-	return n, err
+        if err != nil {
+                if !isTransientWriteError(err) {
+                        c.socket.MarkDead()
+                }
+        } else {
+                c.socket.mu.Lock()
+                c.socket.lastActiveCh = c.inbox
+                c.socket.mu.Unlock()
+        }
+        return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {

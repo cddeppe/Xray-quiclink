@@ -625,19 +625,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        // v26.11.103: Use inbound source port as pool key.
+                                        // Each QUIC connection (unique source port) gets its OWN pool socket.
+                                        // No sharing → no lastActiveCh stealing → server replies go to correct conn.
+                                        // The real dest IP is passed as the second arg for WriteTo.
+                                        var poolKey *net.UDPAddr = udpRemote
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                poolKey = &net.UDPAddr{
+                                                        IP:   inbound.Source.Address.IP(),
+                                                        Port: int(inbound.Source.Port),
+                                                }
+                                        }
+                                        pooledConn, err = h.socketPool.AcquireWithDest(poolKey, udpRemote)
                                         if err != nil {
-                                                // v26.10.34-link (C3 fix): release peeked packets
-                                                // before returning. Without this, every Acquire
-                                                // failure leaks one MultiBuffer (up to 8KB+ per
-                                                // failure) — unbounded growth under flapping dest.
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
                                         defer pooledConn.Close()
-                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
-                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
                                         errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
                                 }
