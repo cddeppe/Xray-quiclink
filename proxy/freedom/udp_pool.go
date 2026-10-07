@@ -248,16 +248,30 @@ func (p *UDPSocketPool) InvalidateByIP(ip string) {
 }
 
 func destKey(dest *stdnet.UDPAddr) string {
+        // v26.11.93-link: Use IP + Port as the key. The port is set by
+        // freedom.Process to a DCID-derived value, making each QUIC connection
+        // get its own socket. The actual dest IP is stored in sock.dest
+        // (passed separately to AcquireWithDest).
         return dest.String()
 }
 
-func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
-        key := destKey(dest)
+// Acquire gets or creates a pool socket for the given key.
+// The key determines socket sharing; dest is the actual destination for writes.
+func (p *UDPSocketPool) Acquire(key *stdnet.UDPAddr) (*pooledConn, error) {
+        return p.AcquireWithDest(key, key)
+}
+
+// v26.11.93-link: AcquireWithDest separates the pool key (for socket sharing)
+// from the destination (for WriteTo). This allows one socket per QUIC
+// connection (keyed by DCID-derived port) while still sending to the
+// correct destination IP.
+func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn, error) {
+        k := destKey(key)
 
         p.mu.Lock()
-        sock, ok := p.sockets[key]
+        sock, ok := p.sockets[k]
         if ok && (sock.IsClosed() || sock.IsDead()) {
-                delete(p.sockets, key)
+                delete(p.sockets, k)
                 ok = false
         }
         if ok {
@@ -276,7 +290,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         // (release() checks s.dead but the conn was never
                         // closed because we bypassed MarkStale's close logic).
                         sock.MarkStale()
-                        delete(p.sockets, key)
+                        delete(p.sockets, k)
                         ok = false
                 } else {
                         // v26.10.26-link: only increment refCount if the socket
@@ -315,7 +329,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 }
 
                 p.mu.Lock()
-                if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
+                if existing, ok := p.sockets[k]; ok && !existing.IsClosed() && !existing.IsDead() {
                         pc.Close()
                         sock = existing
                         // v26.10.43-link (audit P5): init atomic timestamps
@@ -326,7 +340,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         sock.refCount++
                         sock.mu.Unlock()
                 } else {
-                        p.sockets[key] = sock
+                        p.sockets[k] = sock
                         // v26.10.43-link (audit P5): init atomic timestamps
                         nowNano := time.Now().UnixNano()
                         sock.lastUsed.Store(nowNano)

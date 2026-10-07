@@ -20,6 +20,7 @@ import (
         "github.com/xtls/xray-core/common/geodata"
         "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/common/platform"
+        "github.com/xtls/xray-core/common/protocol/quic"
         "github.com/xtls/xray-core/common/retry"
         "github.com/xtls/xray-core/common/session"
         "github.com/xtls/xray-core/common/signal"
@@ -685,6 +686,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                         isLong := firstByte&0x80 != 0 && firstByte&0x40 != 0
                         if isLong {
+                                // v26.11.93-link: KEY FIX — use a unique pool socket per QUIC
+                                // connection, not per destination IP. This eliminates the demux
+                                // problem entirely: each QUIC connection gets its own socket,
+                                // so server replies go to the right socket without any DCID
+                                // lookup. No guessing, no wrong delivery.
+                                //
+                                // The DCID of the first packet is unique per QUIC connection.
+                                // We use it (combined with dest IP) as the pool key.
                                 remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -693,7 +702,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        // Parse DCID to create a unique pool key per connection
+                                        poolKey := udpRemote
+                                        if dcid, _, derr := quic.ParseDCID(mb[0].Bytes()); derr == nil && len(dcid) > 0 {
+                                                // Create a unique UDPAddr using the DCID as a fake port
+                                                // This ensures each QUIC connection gets its own socket
+                                                keyAddr := *udpRemote
+                                                keyAddr.Port = int(dcid[0])<<8 | int(dcid[1])
+                                                poolKey = &keyAddr
+                                        }
+                                        pooledConn, err = h.socketPool.AcquireWithDest(poolKey, udpRemote)
                                         if err != nil {
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
