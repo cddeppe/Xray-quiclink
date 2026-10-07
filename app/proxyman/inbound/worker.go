@@ -187,10 +187,24 @@ type udpConn struct {
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
+        // v26.11.111: direct write bypass for QUIC short headers.
+        // When freedom.Process creates a pooledConn, it sets this callback.
+        // The worker callback uses it to write 1-RTT packets DIRECTLY to the
+        // outbound socket, bypassing the pipe + buf.Copy + PooledPacketWriter.
+        // This eliminates latency and ensures ACKs reach Google immediately.
+        directWrite      func([]byte) (int, error)
 }
 
 func (c *udpConn) setInactive() {
         c.inactive = true
+}
+
+// v26.11.111: SetDirectWrite allows freedom.Process to register a
+// direct write callback on the udpConn. When set, the worker callback
+// uses it to write 1-RTT short headers DIRECTLY to the outbound socket,
+// bypassing the pipe + buf.Copy + PooledPacketWriter path.
+func (c *udpConn) SetDirectWrite(fn func([]byte) (int, error)) {
+        c.directWrite = fn
 }
 
 func (c *udpConn) updateActivity() {
@@ -443,25 +457,26 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // v26.11.110: Source-port-based conn cache.
         // Maps srcKey → *udpConn (direct pointer, not connID).
         //
-        // This replaces Solution A (which used srcIndex[srcKey] → connID →
-        // activeConn[connID] → *udpConn). Solution A failed because:
-        // - The Initial's conn has id.dest = synthetic dest (DCID[:4]:443)
-        // - srcIndex stores srcKey → connID (which includes the synthetic dest)
-        // - When a 1-RTT short header arrives, id.dest is zero (no DCID parse
-        //   for short headers), so the srcIndex lookup key is different
-        //
-        // This cache stores srcKey → *udpConn directly, bypassing the connID
-        // lookup entirely. Any packet from the same source port finds the
-        // existing conn and writes to its pipe — no new conn, no new sniffer,
-        // no new freedom.Process, no new pooled socket, no new demux.
-        //
-        // The packet flows through the EXISTING conn's freedom.Process →
-        // EXISTING pooled socket → EXISTING demux map (which has the
-        // Server CID registered from the Initial). This is the correct fix.
+        // v26.11.111: If the conn has a directWrite callback (set by
+        // freedom.Process when the pooledConn was created), write DIRECTLY
+        // to the outbound socket — bypass the pipe entirely. This ensures
+        // ACKs reach Google with zero latency, without going through
+        // buf.Copy → PooledPacketWriter → pooledConn.WriteTo.
         if len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
                 // Short header (1-RTT) — try the source-port conn cache
                 w.RLock()
                 if existingConn, found := w.connBySrc[id.srcKey]; found && !existingConn.done.Done() {
+                        // v26.11.111: Direct write bypass — if the conn has a
+                        // directWrite callback, write directly to the outbound
+                        // socket. This is the fastest path for ACKs.
+                        if existingConn.directWrite != nil {
+                                w.RUnlock()
+                                existingConn.directWrite(b.Bytes())
+                                existingConn.updateActivity()
+                                b.Release()
+                                return
+                        }
+                        // Fallback: write to pipe (for conns without directWrite)
                         w.RUnlock()
                         existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                         existingConn.updateActivity()
@@ -536,6 +551,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
                                 Gateway: net.UDPDestination(w.address, w.port),
                                 Tag:     w.tag,
+                                Conn:    conn, // v26.11.111: expose udpConn so freedom can set directWrite
                         })
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest

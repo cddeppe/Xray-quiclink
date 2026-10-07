@@ -654,6 +654,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                         defer pooledConn.Close()
                                         outGateway = nil
+                                        // v26.11.111: Set directWrite callback on the udpConn
+                                        // so the worker can bypass the pipe for 1-RTT short headers.
+                                        // This ensures ACKs reach Google with zero latency.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                if setter, ok := inbound.Conn.(interface{ SetDirectWrite(func([]byte) (int, error)) }); ok {
+                                                        pc := pooledConn
+                                                        dest := udpRemote
+                                                        setter.SetDirectWrite(func(b []byte) (int, error) {
+                                                                return pc.WriteTo(b, dest)
+                                                        })
+                                                }
+                                        }
                                         errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
                                 }
                         } else {
