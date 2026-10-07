@@ -756,6 +756,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
+                errors.LogWarning(ctx, "DIAG P09b buf.Copy returned nil (OK — all packets forwarded)")
 
                 return nil
         }
@@ -790,9 +791,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-        errors.LogWarning(ctx, "DIAG P13 responseDone buf.Copy returned")
+                        errors.LogWarning(ctx, "DIAG P13 responseDone buf.Copy returned err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(ctx, "DIAG P13a responseDone buf.Copy returned nil (OK — all replies forwarded to Chrome)")
                 return nil
         }
 

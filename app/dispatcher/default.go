@@ -84,10 +84,15 @@ func (r *cachedReader) readInternal() buf.MultiBuffer {
 func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         mb := r.readInternal()
         if mb != nil {
+                errors.LogWarning(context.Background(), "DIAG CR01 cachedReader.ReadMultiBuffer returned from CACHE len=", mb.Len())
                 return mb, nil
         }
 
-        return r.reader.ReadMultiBuffer()
+        mb2, err := r.reader.ReadMultiBuffer()
+        if err == nil {
+                errors.LogWarning(context.Background(), "DIAG CR02 cachedReader.ReadMultiBuffer read from PIPE len=", mb2.Len())
+        }
+        return mb2, err
 }
 
 func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
