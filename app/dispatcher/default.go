@@ -386,68 +386,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                 // With v26.11.75's truncated ClientHello fix, the sniffer extracts SNI
                 // from the 1st packet in <1ms. No deadlock, no need for a goroutine.
                 errors.LogWarning(ctx, "DIAG DL04 sniffing enabled — running SYNCHRONOUSLY (TCP+UDP same path) metadataOnly=", sniffingRequest.MetadataOnly)
-
-                // v26.11.88-link: CRITICAL PERF FIX — for UDP, peek the first packet
-                // and check if it's a QUIC Initial. Only Initials carry SNI.
-                // Non-Initial QUIC packets (Handshake, 0-RTT, 1-RTT) have NO SNI
-                // and running the sniffer on them wastes 200ms (timeout).
-                // For non-Initials, skip the sniffer entirely and forward to
-                // the cached QUIC dest IP (freedom's LB02 fallback).
-                if destination.Network == net.Network_UDP {
-                        // Peek the first packet without consuming it
-                        peekReader, ok := outbound.Reader.(buf.TimeoutReader)
-                        if ok {
-                                peekMb, peekErr := peekReader.ReadMultiBufferTimeout(50 * time.Millisecond)
-                                if peekErr == nil && len(peekMb) > 0 {
-                                        firstByte := byte(0)
-                                        if len(peekMb[0].Bytes()) > 0 {
-                                                firstByte = peekMb[0].Bytes()[0]
-                                        }
-                                        // Check if it's a QUIC long header (bit 7=1, bit 6=1)
-                                        isLongHeader := firstByte&0x80 != 0 && firstByte&0x40 != 0
-                                        if isLongHeader {
-                                                pktType := (firstByte & 0x30) >> 4
-                                                // QUIC v1: type 0=Initial, 1=0-RTT, 2=Handshake, 3=Retry
-                                                // Only Initial (type 0) carries SNI
-                                                if pktType != 0 {
-                                                        // Non-Initial long header — skip sniffer, forward immediately
-                                                        errors.LogWarning(ctx, "DIAG DL09 non-Initial QUIC (type=", pktType, ") — skipping sniffer, forwarding to cached dest")
-                                                        // Put the peeked packet back by creating a cachedReader
-                                                        cReader := &cachedReader{
-                                                                reader: outbound.Reader.(buf.TimeoutReader),
-                                                                cache:  peekMb,
-                                                                cacheLen: int32(peekMb.Len()),
-                                                        }
-                                                        outbound.Reader = cReader
-                                                        // Skip sniffing, go straight to routedDispatch
-                                                        d.routedDispatch(ctx, outbound, destination)
-                                                        errors.LogWarning(ctx, "DIAG DL08 routedDispatch returned (non-Initial skip)")
-                                                        return nil
-                                                }
-                                        } else if firstByte&0x80 == 0 {
-                                                // Short header (1-RTT) — skip sniffer, forward immediately
-                                                errors.LogWarning(ctx, "DIAG DL09 1-RTT short header — skipping sniffer, forwarding to cached dest")
-                                                cReader := &cachedReader{
-                                                        reader: outbound.Reader.(buf.TimeoutReader),
-                                                        cache:  peekMb,
-                                                        cacheLen: int32(peekMb.Len()),
-                                                }
-                                                outbound.Reader = cReader
-                                                d.routedDispatch(ctx, outbound, destination)
-                                                errors.LogWarning(ctx, "DIAG DL08 routedDispatch returned (1-RTT skip)")
-                                                return nil
-                                        }
-                                        // It IS an Initial — put the peeked packet back and run the sniffer
-                                        cReader := &cachedReader{
-                                                reader: outbound.Reader.(buf.TimeoutReader),
-                                                cache:  peekMb,
-                                                cacheLen: int32(peekMb.Len()),
-                                        }
-                                        outbound.Reader = cReader
-                                }
-                        }
-                }
-
                 cReader := &cachedReader{
                         reader: outbound.Reader.(buf.TimeoutReader),
                         cache:  make(buf.MultiBuffer, 0, 8),
