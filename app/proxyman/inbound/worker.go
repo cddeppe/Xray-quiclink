@@ -220,51 +220,57 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // Write implements io.Writer.
 // v26.11.101: SplitCoalesced + truncate fallback for EMSGSIZE.
 func (c *udpConn) Write(buf []byte) (int, error) {
-	if len(buf) <= 1250 {
-		n, err := c.output(buf)
-		if c.downlink != nil {
-			c.downlink.Add(int64(n))
-		}
-		if err == nil {
-			c.updateActivity()
-		}
-		return n, err
-	}
-	// Try SplitCoalesced for coalesced QUIC packets
-	offsets, splitErr := quic.SplitCoalesced(buf)
-	if splitErr == nil && len(offsets) > 1 {
-		total := 0
-		for _, off := range offsets {
-			n, werr := c.output(buf[off[0]:off[1]])
-			if c.downlink != nil {
-				c.downlink.Add(int64(n))
-			}
-			if werr != nil {
-				return total, werr
-			}
-			total += n
-		}
-		c.updateActivity()
-		return total, nil
-	}
-	// Split failed or 1 packet — try full send
-	n, err := c.output(buf)
-	if c.downlink != nil {
-		c.downlink.Add(int64(n))
-	}
-	if err == nil {
-		c.updateActivity()
-		return n, nil
-	}
-	// EMSGSIZE — truncate to 1250, QUIC retransmits
-	n, err = c.output(buf[:1250])
-	if c.downlink != nil {
-		c.downlink.Add(int64(n))
-	}
-	if err == nil {
-		c.updateActivity()
-	}
-	return n, err
+        if len(buf) <= 1250 {
+                // v26.11.105 DIAG: log small packet writes (replies to client)
+                errors.LogInfo(context.Background(), "DIAG U1 udpConn.Write: small packet n=", len(buf))
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
+        }
+        // Try SplitCoalesced for coalesced QUIC packets
+        // v26.11.105 DIAG: log large packet writes
+        errors.LogInfo(context.Background(), "DIAG U2 udpConn.Write: large packet n=", len(buf), " → SplitCoalesced")
+        offsets, splitErr := quic.SplitCoalesced(buf)
+        if splitErr == nil && len(offsets) > 1 {
+                total := 0
+                for _, off := range offsets {
+                        n, werr := c.output(buf[off[0]:off[1]])
+                        if c.downlink != nil {
+                                c.downlink.Add(int64(n))
+                        }
+                        if werr != nil {
+                                return total, werr
+                        }
+                        total += n
+                }
+                c.updateActivity()
+                return total, nil
+        }
+        // Split failed or 1 packet — try full send
+        n, err := c.output(buf)
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
+        }
+        if err == nil {
+                c.updateActivity()
+                return n, nil
+        }
+        // v26.11.105 DIAG: log EMSGSIZE fallback
+        errors.LogInfo(context.Background(), "DIAG U3 udpConn.Write: full send failed err=", err, " → truncate to 1250")
+        // EMSGSIZE — truncate to 1250, QUIC retransmits
+        n, err = c.output(buf[:1250])
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
+        }
+        if err == nil {
+                c.updateActivity()
+        }
+        return n, err
 }
 
 func (c *udpConn) Close() error {
@@ -447,11 +453,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         id.dest = originalDest
                 }
                 b.UDP = &originalDest
-	}
-	// v26.11.102-link: Do NOT create per-DCID synthetic dest.
-	// v26.11.54 did NOT have this — all packets from same source port → same conn.
-	// This is correct: first Initial sets up freedom.Process via SNI,
-	// and ALL subsequent packets (Initials, Handshakes, 1-RTT) flow through it.
+        }
+        // v26.11.102-link: Do NOT create per-DCID synthetic dest.
+        // v26.11.54 did NOT have this — all packets from same source port → same conn.
+        // This is correct: first Initial sets up freedom.Process via SNI,
+        // and ALL subsequent packets (Initials, Handshakes, 1-RTT) flow through it.
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})

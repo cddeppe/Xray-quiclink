@@ -381,8 +381,10 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                dcid, _, err := quic.ParseDCID(packet[:n])
+                dcid, isLong, err := quic.ParseDCID(packet[:n])
                 if err != nil {
+                        // v26.11.105 DIAG: log DCID parse failures
+                        xrayerrors.LogInfo(context.Background(), "DIAG P1 readLoop: ParseDCID failed n=", n, " err=", err)
                         putPacket(packet)
                         continue
                 }
@@ -409,35 +411,68 @@ func (s *pooledSocket) readLoop() {
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
-                        if !ok {
-                                // v26.11.101: Deliver server Initial reply for 0-SCID Chrome
-                                if len(dcid) == 0 && n > 0 && packet[0]&0x80 != 0 {
-                                        s.mu.RLock()
-                                        ch = s.lastActiveCh
-                                        s.mu.RUnlock()
-                                        if ch != nil {
-                                                ok = true
-                                                if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
-                                                        scidKey := makeDCIDKey(scid)
-                                                        s.mu.Lock()
-                                                        if _, exists := s.demux[scidKey]; !exists {
-                                                                s.demux[scidKey] = ch
-                                                        }
-                                                        s.mu.Unlock()
+                if !ok {
+                        // v26.11.105: CRITICAL FIX — extend lastActiveCh to ALL
+                        // demux misses, not just long headers with empty DCID.
+                        //
+                        // The v26.11.101 code only used lastActiveCh for long-header
+                        // packets with empty DCID (0-SCID Chrome Initials). This meant
+                        // that 1-RTT short-header replies with demux misses were
+                        // SILENTLY DROPPED. This happened in three scenarios:
+                        //
+                        // 1. Chrome uses 0-length SCID → server 1-RTT replies have
+                        //    DCID=∅, but parseShortHeaderDCID returns 8 bytes (garbage)
+                        //    → demux miss → NOT long header → DROP
+                        // 2. CID rotation (NEW_CONNECTION_ID) → new DCID not registered
+                        //    → demux miss → short header → DROP
+                        // 3. CID length mismatch → parsed DCID doesn't match registered
+                        //    → demux miss → short header → DROP
+                        //
+                        // With source-port pool keying (v26.11.103+), each pool socket
+                        // has exactly ONE conn, so lastActiveCh is always the correct
+                        // conn. This is safe and correct.
+                        s.mu.RLock()
+                        ch = s.lastActiveCh
+                        s.mu.RUnlock()
+                        if ch != nil {
+                                ok = true
+                                // v26.11.105 DIAG: log lastActiveCh fallback
+                                isShort := !isLong
+                                xrayerrors.LogInfo(context.Background(), "DIAG P2 readLoop: demux MISS → lastActiveCh fallback dcidLen=", len(dcid),
+                                        " isLong=", isLong, " isShort=", isShort, " n=", n)
+                                // For long headers: register server SCID so future
+                                // packets with that DCID are demuxed directly.
+                                if isLong {
+                                        if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
+                                                scidKey := makeDCIDKey(scid)
+                                                s.mu.Lock()
+                                                if _, exists := s.demux[scidKey]; !exists {
+                                                        s.demux[scidKey] = ch
+                                                        xrayerrors.LogInfo(context.Background(), "DIAG P3 readLoop: registered server SCID len=", len(scid))
                                                 }
+                                                s.mu.Unlock()
                                         }
                                 }
-                                if !ok {
-                                        putPacket(packet)
-                                        continue
-                                }
+                        } else {
+                                // v26.11.105 DIAG: log when lastActiveCh is nil (no conn has sent yet)
+                                xrayerrors.LogInfo(context.Background(), "DIAG P4 readLoop: demux MISS AND lastActiveCh=nil → DROP dcidLen=", len(dcid),
+                                        " isLong=", isLong, " n=", n)
                         }
+                        if !ok {
+                                putPacket(packet)
+                                continue
+                        }
+                }
 
                 packetToSend := packet[:n] // v26.11.101: slice to actual length
                 select {
                 case ch <- readResult{data: packetToSend, addr: addr}:
+                        // v26.11.105 DIAG: log successful delivery
+                        xrayerrors.LogInfo(context.Background(), "DIAG P5 readLoop: delivered reply n=", n, " isLong=", isLong)
                 default:
                         s.droppedReplies.Add(1)
+                        // v26.11.105 DIAG: log inbox full drops
+                        xrayerrors.LogInfo(context.Background(), "DIAG P6 readLoop: inbox FULL → drop n=", n)
                         putPacket(packet)
                 }
         }
@@ -573,6 +608,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
+                        // v26.11.105 DIAG: log SCID registration
+                        xrayerrors.LogInfo(context.Background(), "DIAG W1 WriteTo: registered client SCID len=", len(scid), " pktLen=", len(b))
                 }
                 // Also register the DCID. The client's Initial has DCID =
                 // initial_dcid and SCID = client_scid. The pool registers
@@ -585,6 +622,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // browser times out QUIC and falls back to H2/TCP.
                 if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
                         c.RegisterCID(dcid)
+                        // v26.11.105 DIAG: log DCID registration
+                        xrayerrors.LogInfo(context.Background(), "DIAG W2 WriteTo: registered client DCID len=", len(dcid), " pktLen=", len(b))
                 }
         }
 
@@ -601,6 +640,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 if !isTransientWriteError(err) {
                         c.socket.MarkDead()
                 }
+                // v26.11.105 DIAG: log write errors
+                xrayerrors.LogInfo(context.Background(), "DIAG W3 WriteTo: write error err=", err, " dest=", dest, " pktLen=", len(b))
         } else {
                 c.socket.mu.Lock()
                 c.socket.lastActiveCh = c.inbox
@@ -802,6 +843,8 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         n, addr, err := r.conn.ReadFrom(b.Bytes())
         if err != nil {
                 b.Release()
+                // v26.11.105 DIAG: log read errors/EOF
+                xrayerrors.LogInfo(context.Background(), "DIAG R1 PooledPacketReader: ReadFrom err=", err)
                 return nil, err
         }
         b.Resize(0, int32(n))
@@ -813,6 +856,8 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         Network: xraynet.Network_UDP,
                 }
         }
+        // v26.11.105 DIAG: log successful read from inbox
+        xrayerrors.LogInfo(context.Background(), "DIAG R2 PooledPacketReader: read from inbox n=", n)
         return buf.MultiBuffer{b}, nil
 }
 
