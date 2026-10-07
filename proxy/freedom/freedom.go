@@ -730,6 +730,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         writer = NewPooledPacketWriter(pooledConn, statWrite)
                 } else {
                         writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
+                        // v26.11.114: Set directWrite for per-session UDP path.
+                        // connBySrc routes short headers to this conn, and directWrite
+                        // writes them directly to the outbound socket (bypassing pipe).
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                if setter, ok := inbound.Conn.(interface{ SetDirectWrite(func([]byte) (int, error)) }); ok {
+                                        outConn := conn
+                                        setter.SetDirectWrite(func(b []byte) (int, error) {
+                                                return outConn.Write(b)
+                                        })
+                                }
+                        }
                         if h.config.Noises != nil {
                                 errors.LogDebug(ctx, "NOISE", h.config.Noises)
                                 writer = &NoisePacketWriter{

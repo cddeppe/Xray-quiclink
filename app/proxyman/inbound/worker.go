@@ -487,6 +487,17 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         return
                 }
                 w.RUnlock()
+
+                // v26.11.114: SILENT DROP for short headers with no existing conn.
+                // If connBySrc missed (conn doesn't exist or was closed), DON'T
+                // create a new conn — the sniffer can't extract SNI from short
+                // headers, so it would route to 127.0.0.1:443 → "dropping loopback".
+                // This pollutes connection state and creates spurious conns.
+                // Instead, silently drop the packet. QUIC retransmits dropped
+                // packets, so the client will retry. If the conn exists by then,
+                // connBySrc will catch it. If not, the packet is retransmitted again.
+                b.Release()
+                return
         }
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
