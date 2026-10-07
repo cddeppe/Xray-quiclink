@@ -663,20 +663,23 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
+        // v26.11.60-link: DO NOT remove the DCID from the demux map on Close.
+        // (Restored from v26.11.38, was reverted by v26.11.54's history rewrite.)
+        //
+        // Each UDP packet from the browser triggers a SEPARATE freedom.Process
+        // call, each creating a new pooledConn with its own inbox. The Initial's
+        // pooledConn registers the client's DCID (A) in the demux map. When
+        // freedom.Process returns (input pipe exhausted — the Initial was the
+        // only packet), pooledConn.Close() fires and REMOVES A from demux.
+        // Google's reply arrives ~50ms later with DCID=∅ (Chrome 0-length SCID)
+        // → SCID fallback looks up demux[serverSCID] = demux[clientDCID] = demux[A]
+        // → MISS (A was removed by Close) → reply DROPPED.
+        //
+        // Chrome never sees the handshake reply → times out → TCP fallback → stall.
+        //
+        // Fix: don't remove DCID from demux on Close. Let new pooledConns that
+        // register the same DCID overwrite the entry. The readLoop handles sends
+        // to closed inboxes gracefully (recover from panic, drop packet).
 
         c.socket.release()
         return nil
