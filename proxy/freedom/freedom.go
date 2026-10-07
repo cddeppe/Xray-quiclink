@@ -20,6 +20,7 @@ import (
         "github.com/xtls/xray-core/common/geodata"
         "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/common/platform"
+        "github.com/xtls/xray-core/common/protocol/quic"
         "github.com/xtls/xray-core/common/retry"
         "github.com/xtls/xray-core/common/session"
         "github.com/xtls/xray-core/common/signal"
@@ -383,19 +384,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         destination := ob.Target
 
-        // v26.11.67-link: drop UDP packets destined to loopback on port 443.
-        // Without TPROXY, when the QUIC sniffer fails to extract the SNI, the
-        // destination stays as the Gateway (inbound listen address = 0.0.0.0:443
-        // or 127.0.0.1:443). Sending to this creates an infinite loop.
-        // BUT: do NOT drop port 53 (DNS) — DNS queries to 127.0.0.1:53 are
-        // legitimate and must be allowed.
-        if destination.Network == net.Network_UDP && destination.Port == 443 {
-                destIP := destination.Address.IP()
-                if destIP.IsLoopback() || destIP.IsUnspecified() {
-                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP:443 dest=", destination, " (sniffer failed, preventing loop)")
-                        return nil
-                }
-        }
+        // v26.11.68-link: REMOVED the loopback drop from here — moved below
+        // after `input` is available, so we can peek the first packet and
+        // try manual SNI extraction before dropping.
         origTargetAddr := ob.OriginalTarget.Address
         if origTargetAddr == nil {
                 origTargetAddr = ob.Target.Address
@@ -421,6 +412,40 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         input := link.Reader
         output := link.Writer
+
+        // v26.11.68-link: manual SNI extraction fallback. When the sniffer
+        // fails (no TPROXY), the destination stays as the inbound's listen
+        // address (loopback:443). The pool bypassed this by peeking the
+        // packet directly. Without the pool, we do the same: peek the first
+        // packet, check if it's QUIC, and try quic.SniffQUIC to extract SNI.
+        var peekedPackets buf.MultiBuffer
+        if destination.Network == net.Network_UDP && destination.Port == 443 {
+                destIP := destination.Address.IP()
+                if destIP.IsLoopback() || destIP.IsUnspecified() {
+                        mb, peekErr := input.ReadMultiBuffer()
+                        if peekErr == nil && len(mb) > 0 {
+                                peekedPackets = mb
+                                pktBytes := mb[0].Bytes()
+                                if len(pktBytes) > 0 && pktBytes[0]&0x80 != 0 && pktBytes[0]&0x40 != 0 {
+                                        if sniffResult, sniffErr := quic.SniffQUIC(pktBytes); sniffErr == nil && sniffResult != nil {
+                                                domain := sniffResult.Domain()
+                                                if domain != "" {
+                                                        errors.LogWarning(ctx, "DIAG P20 manual SNI extraction SUCCEEDED domain=", domain)
+                                                        destination = net.UDPDestination(net.DomainAddress(domain), 443)
+                                                        goto skipLoopbackDrop
+                                                }
+                                        }
+                                        errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed for QUIC packet, dropping to prevent loop")
+                                        return nil
+                                }
+                                errors.LogWarning(ctx, "DIAG P22 not a QUIC long header, dropping to prevent loop")
+                                return nil
+                        }
+                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP:443 (peek failed)")
+                        return nil
+                }
+        skipLoopbackDrop:
+        }
 
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
         // When the remote peer (e.g. YouTube) closes the outbound TCP, we
@@ -630,7 +655,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
         // per-session socket path. This prevents the pool from breaking non-QUIC UDP.
         var pooledConn *pooledConn
-        var peekedPackets buf.MultiBuffer
+        // peekedPackets already declared above (v26.11.68-link)
         if destination.Network != net.Network_TCP && h.socketPool != nil {
                 mb, peekErr := input.ReadMultiBuffer()
                 if peekErr == nil && len(mb) > 0 {
