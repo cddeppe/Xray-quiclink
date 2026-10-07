@@ -20,7 +20,6 @@ import (
         "github.com/xtls/xray-core/common/geodata"
         "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/common/platform"
-        "github.com/xtls/xray-core/common/protocol/quic"
         "github.com/xtls/xray-core/common/retry"
         "github.com/xtls/xray-core/common/session"
         "github.com/xtls/xray-core/common/signal"
@@ -702,14 +701,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // Parse DCID to create a unique pool key per connection
-                                        poolKey := udpRemote
-                                        if dcid, _, derr := quic.ParseDCID(mb[0].Bytes()); derr == nil && len(dcid) > 0 {
-                                                // Create a unique UDPAddr using the DCID as a fake port
-                                                // This ensures each QUIC connection gets its own socket
-                                                keyAddr := *udpRemote
-                                                keyAddr.Port = int(dcid[0])<<8 | int(dcid[1])
-                                                poolKey = &keyAddr
+                                        // v26.11.95-link: Use the inbound source port as the pool key,
+                                        // NOT the DCID. The source port stays constant for the entire
+                                        // QUIC connection, even after CID rotation. Using DCID as the
+                                        // pool key caused CID rotation to create new pool sockets,
+                                        // killing the old socket (staleness timeout) and breaking the
+                                        // established QUIC connection.
+                                        //
+                                        // The inbound source is available in the session context.
+                                        var poolKey *stdnet.UDPAddr = udpRemote
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                poolKey = &stdnet.UDPAddr{
+                                                        IP:   inbound.Source.Address.IP(),
+                                                        Port: int(inbound.Source.Port),
+                                                }
                                         }
                                         pooledConn, err = h.socketPool.AcquireWithDest(poolKey, udpRemote)
                                         if err != nil {
