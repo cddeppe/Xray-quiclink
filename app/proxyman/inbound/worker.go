@@ -217,53 +217,13 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 }
 
 // Write implements io.Writer.
-// Write implements io.Writer.
-// v26.11.101: SplitCoalesced + truncate fallback for EMSGSIZE.
+// v26.11.107: REVERTED to original v26.11.0/v26.11.54 form.
+// SplitCoalesced + truncate to 1250 (v26.11.101) corrupted QUIC packets.
+// Chrome saw malformed data → connection degraded → stalled.
+// v26.11.54 worked for h3 test sites with this simple form.
+// If EMSGSIZE occurs, packet is dropped — QUIC retransmits (correct behavior).
 func (c *udpConn) Write(buf []byte) (int, error) {
-        if len(buf) <= 1250 {
-                // v26.11.105 DIAG: log small packet writes (replies to client)
-                errors.LogInfo(context.Background(), "DIAG U1 udpConn.Write: small packet n=", len(buf))
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
-        }
-        // Try SplitCoalesced for coalesced QUIC packets
-        // v26.11.105 DIAG: log large packet writes
-        errors.LogInfo(context.Background(), "DIAG U2 udpConn.Write: large packet n=", len(buf), " → SplitCoalesced")
-        offsets, splitErr := quic.SplitCoalesced(buf)
-        if splitErr == nil && len(offsets) > 1 {
-                total := 0
-                for _, off := range offsets {
-                        n, werr := c.output(buf[off[0]:off[1]])
-                        if c.downlink != nil {
-                                c.downlink.Add(int64(n))
-                        }
-                        if werr != nil {
-                                return total, werr
-                        }
-                        total += n
-                }
-                c.updateActivity()
-                return total, nil
-        }
-        // Split failed or 1 packet — try full send
         n, err := c.output(buf)
-        if c.downlink != nil {
-                c.downlink.Add(int64(n))
-        }
-        if err == nil {
-                c.updateActivity()
-                return n, nil
-        }
-        // v26.11.105 DIAG: log EMSGSIZE fallback
-        errors.LogInfo(context.Background(), "DIAG U3 udpConn.Write: full send failed err=", err, " → truncate to 1250")
-        // EMSGSIZE — truncate to 1250, QUIC retransmits
-        n, err = c.output(buf[:1250])
         if c.downlink != nil {
                 c.downlink.Add(int64(n))
         }
@@ -453,11 +413,52 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         id.dest = originalDest
                 }
                 b.UDP = &originalDest
+        } else {
+                // v26.10.78-link: when originalDest is invalid (no TPROXY),
+                // all UDP packets from the same source port map to the same
+                // connID {src, dest=zero}. This breaks when multiple QUIC
+                // connections (different DCIDs) arrive from the same source
+                // port — they all get mixed into one conn. Only the first
+                // QUIC Initial's SNI is used for routing; subsequent QUIC
+                // connections' data goes to the first connection's pipe,
+                // their handshake fails, and the client stalls.
+                //
+                // Fix: for QUIC long-header packets (Initials), parse the
+                // DCID and use it to create a unique id.dest. Different
+                // DCIDs produce different connIDs, so each QUIC connection
+                // gets its own conn + goroutine + sniffer + freedom dial.
+                //
+                // v26.11.107: RESTORED from v26.11.56. v26.11.102 removed
+                // this, which re-introduced the bug where parallel QUIC
+                // connections from the same source port collapse into one conn.
+                packetBytes := b.Bytes()
+                if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 {
+                        if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
+                                id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
+                        }
+                }
         }
-        // v26.11.102-link: Do NOT create per-DCID synthetic dest.
-        // v26.11.54 did NOT have this — all packets from same source port → same conn.
-        // This is correct: first Initial sets up freedom.Process via SNI,
-        // and ALL subsequent packets (Initials, Handshakes, 1-RTT) flow through it.
+        // v26.11.52-link: Solution A — for short headers with no id.dest,
+        // look up the existing conn by srcKey and reuse its pipe. This
+        // avoids creating a new conn → new DispatchLink → sniffing fails
+        // (no SNI in short headers) → 127.0.0.1:443 loop → freeze.
+        //
+        // v26.11.107: RESTORED from v26.11.56. Without this, 1-RTT short
+        // headers create a new conn, the sniffer can't extract SNI, and
+        // the packet is routed to 127.0.0.1:443 — a packet loop that kills
+        // the QUIC connection.
+        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                w.RLock()
+                if existingID, found := w.srcIndex[id.srcKey]; found {
+                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                w.RUnlock()
+                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                                existingConn.updateActivity()
+                                return
+                        }
+                }
+                w.RUnlock()
+        }
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
