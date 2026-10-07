@@ -47,7 +47,7 @@ type pooledSocket struct {
         lastUsed      atomic.Int64 // UnixNano
         lastReplyTime atomic.Int64  // UnixNano
         demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
-        lastActiveCh  chan<- readResult // v26.11.101: for 0-SCID server Initial delivery
+        demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -79,7 +79,7 @@ var packetPool = sync.Pool{
 
 func getPacket() []byte  {
         b := *packetPool.Get().(*[]byte)
-        return b[:cap(b)] // v26.11.101: reset len to full capacity
+        return b[:cap(b)] // v26.11.81 fix: reset len to full capacity
 }
 func putPacket(b []byte) { packetPool.Put(&b) }
 
@@ -107,6 +107,11 @@ type pooledConn struct {
         // can check it without acquiring mu. mu is still needed to
         // protect scids map mutations during Close.
         closed atomic.Bool
+        // v26.11.52-link (Solution B): source is the inbound client's
+        // source IP:port, captured at Acquire time in freedom.go so the
+        // pool can bind outbound packets to the originating client. nil
+        // for non-QUIC / per-session paths.
+        source *stdnet.UDPAddr
         // v26.10.16-link: scidsDCID stores the SCIDs we've registered
         // in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
         // so Close() can index demux directly without converting from
@@ -235,21 +240,13 @@ func destKey(dest *stdnet.UDPAddr) string {
         return dest.String()
 }
 
-// Acquire gets or creates a pool socket for the given key.
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
-        return p.AcquireWithDest(dest, dest)
-}
-
-// v26.11.103: AcquireWithDest separates pool key from dest IP.
-// key = source port (unique per QUIC connection → one socket per conn)
-// dest = real destination IP (for WriteTo)
-func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn, error) {
-        k := destKey(key)
+        key := destKey(dest)
 
         p.mu.Lock()
-        sock, ok := p.sockets[k]
+        sock, ok := p.sockets[key]
         if ok && (sock.IsClosed() || sock.IsDead()) {
-                delete(p.sockets, k)
+                delete(p.sockets, key)
                 ok = false
         }
         if ok {
@@ -268,7 +265,7 @@ func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn,
                         // (release() checks s.dead but the conn was never
                         // closed because we bypassed MarkStale's close logic).
                         sock.MarkStale()
-                        delete(p.sockets, k)
+                        delete(p.sockets, key)
                         ok = false
                 } else {
                         // v26.10.26-link: only increment refCount if the socket
@@ -300,13 +297,14 @@ func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn,
                         conn:          pc,
                         dest:          dest,
                         demux:         make(map[dcidKey]chan<- readResult),
+                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
                 }
 
                 p.mu.Lock()
-                if existing, ok := p.sockets[k]; ok && !existing.IsClosed() && !existing.IsDead() {
+                if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
                         pc.Close()
                         sock = existing
                         // v26.10.43-link (audit P5): init atomic timestamps
@@ -317,7 +315,7 @@ func (p *UDPSocketPool) AcquireWithDest(key, dest *stdnet.UDPAddr) (*pooledConn,
                         sock.refCount++
                         sock.mu.Unlock()
                 } else {
-                        p.sockets[k] = sock
+                        p.sockets[key] = sock
                         // v26.10.43-link (audit P5): init atomic timestamps
                         nowNano := time.Now().UnixNano()
                         sock.lastUsed.Store(nowNano)
@@ -381,10 +379,8 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                dcid, isLong, err := quic.ParseDCID(packet[:n])
+                dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
-                        // v26.11.105 DIAG: log DCID parse failures
-                        xrayerrors.LogInfo(context.Background(), "DIAG P1 readLoop: ParseDCID failed n=", n, " err=", err)
                         putPacket(packet)
                         continue
                 }
@@ -399,6 +395,7 @@ func (s *pooledSocket) readLoop() {
                 // and Close (which use Lock), so RLock is correct here.
                 s.mu.RLock()
                 ch, ok := s.demux[dk]
+                src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
                 // Update timestamps under Lock. This is a short critical
@@ -412,51 +409,21 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.105: CRITICAL FIX — extend lastActiveCh to ALL
-                        // demux misses, not just long headers with empty DCID.
-                        //
-                        // The v26.11.101 code only used lastActiveCh for long-header
-                        // packets with empty DCID (0-SCID Chrome Initials). This meant
-                        // that 1-RTT short-header replies with demux misses were
-                        // SILENTLY DROPPED. This happened in three scenarios:
-                        //
-                        // 1. Chrome uses 0-length SCID → server 1-RTT replies have
-                        //    DCID=∅, but parseShortHeaderDCID returns 8 bytes (garbage)
-                        //    → demux miss → NOT long header → DROP
-                        // 2. CID rotation (NEW_CONNECTION_ID) → new DCID not registered
-                        //    → demux miss → short header → DROP
-                        // 3. CID length mismatch → parsed DCID doesn't match registered
-                        //    → demux miss → short header → DROP
-                        //
-                        // With source-port pool keying (v26.11.103+), each pool socket
-                        // has exactly ONE conn, so lastActiveCh is always the correct
-                        // conn. This is safe and correct.
-                        s.mu.RLock()
-                        ch = s.lastActiveCh
-                        s.mu.RUnlock()
-                        if ch != nil {
-                                ok = true
-                                // v26.11.105 DIAG: log lastActiveCh fallback
-                                isShort := !isLong
-                                xrayerrors.LogInfo(context.Background(), "DIAG P2 readLoop: demux MISS → lastActiveCh fallback dcidLen=", len(dcid),
-                                        " isLong=", isLong, " isShort=", isShort, " n=", n)
-                                // For long headers: register server SCID so future
-                                // packets with that DCID are demuxed directly.
-                                if isLong {
-                                        if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
-                                                scidKey := makeDCIDKey(scid)
-                                                s.mu.Lock()
-                                                if _, exists := s.demux[scidKey]; !exists {
-                                                        s.demux[scidKey] = ch
-                                                        xrayerrors.LogInfo(context.Background(), "DIAG P3 readLoop: registered server SCID len=", len(scid))
-                                                }
-                                                s.mu.Unlock()
-                                        }
+                        // FIX: SCID-based fallback for 0-length SCID clients
+                        // (Chrome/Edge). The server's reply DCID = client's SCID
+                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
+                        // 0-length). But per RFC 9000 §7.3, the server's reply
+                        // SCID = client's Initial DCID, which WAS registered in
+                        // WriteTo. Parse the SCID and try demux[scid] as a
+                        // fallback before dropping.
+                        if n > 0 && packet[0]&0x80 != 0 {
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidKey := makeDCIDKey(scid)
+                                        s.mu.RLock()
+                                        ch, ok = s.demux[scidKey]
+                                        src = s.demuxSource[scidKey]
+                                        s.mu.RUnlock()
                                 }
-                        } else {
-                                // v26.11.105 DIAG: log when lastActiveCh is nil (no conn has sent yet)
-                                xrayerrors.LogInfo(context.Background(), "DIAG P4 readLoop: demux MISS AND lastActiveCh=nil → DROP dcidLen=", len(dcid),
-                                        " isLong=", isLong, " n=", n)
                         }
                         if !ok {
                                 putPacket(packet)
@@ -464,16 +431,38 @@ func (s *pooledSocket) readLoop() {
                         }
                 }
 
-                packetToSend := packet[:n] // v26.11.101: slice to actual length
+                // v26.10.21-link: non-blocking send with large channel (256).
+                //
+                // The blocking send (v26.10.20) was WRONG for the shared-socket
+                // model: one slow/stale session's full channel would block the
+                // entire readLoop, starving ALL other sessions sharing the same
+                // socket. This made YouTube stalls WORSE when swiping quickly
+                // between videos (many sessions, one stale session blocks all).
+                //
+                // The correct approach for a shared readLoop:
+                // 1. Large channel (256) so drops are rare during bursts
+                // 2. Non-blocking send so one slow session doesn't starve others
+                // 3. Track drops for observability
+                sentOk := false
+                packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
                 select {
                 case ch <- readResult{data: packetToSend, addr: addr}:
-                        // v26.11.105 DIAG: log successful delivery
-                        xrayerrors.LogInfo(context.Background(), "DIAG P5 readLoop: delivered reply n=", n, " isLong=", isLong)
+                        sentOk = true
                 default:
                         s.droppedReplies.Add(1)
-                        // v26.11.105 DIAG: log inbox full drops
-                        xrayerrors.LogInfo(context.Background(), "DIAG P6 readLoop: inbox FULL → drop n=", n)
+                        // v26.10.42-link (audit P3): return the pooled buffer
+                        // when the inbox is full and we drop the packet.
                         putPacket(packet)
+                }
+
+                if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        pktType := (packet[0] >> 4) & 0x03
+                        if pktType == 0x00 {
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidCopy := append([]byte(nil), scid...)
+                                        quic.NotifyServerSCID(scidCopy, src)
+                                }
+                        }
                 }
         }
 }
@@ -587,6 +576,9 @@ func (c *pooledConn) RegisterCID(cid []byte) {
                 }
                 c.socket.mu.Lock()
                 c.socket.demux[dk] = c.inbox
+                if c.source != nil {
+                        c.socket.demuxSource[dk] = c.source
+                }
                 c.socket.mu.Unlock()
                 c.mu.Unlock()
         }
@@ -608,22 +600,17 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
-                        // v26.11.105 DIAG: log SCID registration
-                        xrayerrors.LogInfo(context.Background(), "DIAG W1 WriteTo: registered client SCID len=", len(scid), " pktLen=", len(b))
                 }
-                // Also register the DCID. The client's Initial has DCID =
-                // initial_dcid and SCID = client_scid. The pool registers
-                // client_scid (above) so the server's Initial reply (DCID =
-                // client_scid) is demuxed correctly. BUT the server's Retry
-                // packet has DCID = initial_dcid (the client's DCID from the
-                // Initial, NOT the SCID). Without registering initial_dcid,
-                // Retry packets are silently dropped by readLoop's demux
-                // lookup, and the QUIC handshake never completes — the
-                // browser times out QUIC and falls back to H2/TCP.
+                // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
+                // the server's reply SCID = client's Initial DCID. For
+                // 0-length SCID clients (Chrome/Edge), RegisterCID(scid)
+                // is skipped (len==0), so demux has no entry for the
+                // connection and the server's reply (DCID=∅) is silently
+                // dropped. By registering the DCID, the readLoop's
+                // SCID-based fallback can route the reply by looking up
+                // demux[serverSCID] = demux[clientDCID].
                 if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
                         c.RegisterCID(dcid)
-                        // v26.11.105 DIAG: log DCID registration
-                        xrayerrors.LogInfo(context.Background(), "DIAG W2 WriteTo: registered client DCID len=", len(dcid), " pktLen=", len(b))
                 }
         }
 
@@ -637,15 +624,16 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
+                // v26.10.15-link: only mark the socket dead on persistent
+                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
+                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
+                // will retry or the route will come back. Killing the socket
+                // on a transient error would kill all 50+ QUIC sessions
+                // sharing this socket, which is much worse than dropping one
+                // packet.
                 if !isTransientWriteError(err) {
                         c.socket.MarkDead()
                 }
-                // v26.11.105 DIAG: log write errors
-                xrayerrors.LogInfo(context.Background(), "DIAG W3 WriteTo: write error err=", err, " dest=", dest, " pktLen=", len(b))
-        } else {
-                c.socket.mu.Lock()
-                c.socket.lastActiveCh = c.inbox
-                c.socket.mu.Unlock()
         }
         return n, err
 }
@@ -677,8 +665,6 @@ func (c *pooledConn) Close() error {
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
-        // v26.11.106 DIAG: log pooledConn closure
-        xrayerrors.LogWarning(context.Background(), "DIAG C1 pooledConn.Close: closing conn, dest=", c.socket.dest)
         close(c.done)
 
         c.mu.Lock()
@@ -690,6 +676,7 @@ func (c *pooledConn) Close() error {
         for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
                         delete(c.socket.demux, dk)
+                        delete(c.socket.demuxSource, dk)
                 }
         }
         c.socket.mu.Unlock()
@@ -845,8 +832,6 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         n, addr, err := r.conn.ReadFrom(b.Bytes())
         if err != nil {
                 b.Release()
-                // v26.11.105 DIAG: log read errors/EOF
-                xrayerrors.LogInfo(context.Background(), "DIAG R1 PooledPacketReader: ReadFrom err=", err)
                 return nil, err
         }
         b.Resize(0, int32(n))
@@ -858,8 +843,6 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         Network: xraynet.Network_UDP,
                 }
         }
-        // v26.11.105 DIAG: log successful read from inbox
-        xrayerrors.LogInfo(context.Background(), "DIAG R2 PooledPacketReader: read from inbox n=", n)
         return buf.MultiBuffer{b}, nil
 }
 
@@ -880,25 +863,15 @@ func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                         break
                 }
 
-                // v26.10.74-link: always use socket.dest (the pool's fixed
-                // destination IP that freedom already resolved and dialed).
-                //
-                // The previous code called `b.UDP.Address.IP()` to construct
-                // the destAddr. This was unsafe because the dispatcher's QUIC
-                // sniffing override (default.go:378,390) and the handler's
-                // EndpointOverrideReader (override.go:13-23) rewrite b.UDP.Address
-                // from the original IP to the sniffed SNI domain (a domainAddress).
-                // Calling IP() on a domainAddress panics
-                // (common/net/address.go:171-173: `panic("Calling IP() on a DomainAddress.")`),
-                // killing the goroutine without recover() and causing Chrome
-                // to fall back to HTTP/2.
-                //
-                // Always using socket.dest is both safer (no panic) and more
-                // correct: the pool's entire DCID-demux model assumes one
-                // destination per socket. All packets sent through this writer
-                // should go to socket.dest — the address the pooled socket
-                // was acquired for at freedom.go:619 (h.socketPool.Acquire).
-                destAddr := w.conn.socket.dest
+                var destAddr stdnet.Addr
+                if b.UDP != nil {
+                        destAddr = &stdnet.UDPAddr{
+                                IP:   b.UDP.Address.IP(),
+                                Port: int(b.UDP.Port),
+                        }
+                } else {
+                        destAddr = w.conn.socket.dest
+                }
 
                 n, err := w.conn.WriteTo(b.Bytes(), destAddr)
                 b.Release()
