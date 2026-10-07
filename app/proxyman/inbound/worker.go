@@ -217,15 +217,47 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 }
 
 // Write implements io.Writer.
+// v26.11.100-link: SplitCoalesced — split server's coalesced QUIC replies
+// (Initial+Handshake, ~2400 bytes) into individual packets (~1250 each)
+// to avoid EMSGSIZE (message too long) on the path back to the client.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        n, err := c.output(buf)
-        if c.downlink != nil {
-                c.downlink.Add(int64(n))
+        if len(buf) <= 1250 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        if err == nil {
-                c.updateActivity()
+        offsets, splitErr := quic.SplitCoalesced(buf)
+        if splitErr != nil || len(offsets) <= 1 {
+                // SplitCoalesced failed — try sending the full packet.
+                // The kernel may handle IP fragmentation.
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        return n, err
+        total := 0
+        for _, off := range offsets {
+                packet := buf[off[0]:off[1]]
+                n, werr := c.output(packet)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if werr != nil {
+                        return total, werr
+                }
+                total += n
+        }
+        c.updateActivity()
+        return total, nil
 }
 
 func (c *udpConn) Close() error {
