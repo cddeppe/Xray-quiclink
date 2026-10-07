@@ -435,6 +435,17 @@ type udpWorker struct {
         dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
         srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
 
+        // v26.11.86-link: caches the most recently successful QUIC destination
+        // (resolved IP from SNI extraction). When SNI extraction fails for a
+        // new QUIC connection (Chrome sends only 1 Initial, sniffer times out),
+        // we forward to this cached destination instead of dropping the packet.
+        // This breaks the chicken-and-egg deadlock: the proxy can't extract SNI
+        // without forwarding the first Initial, but can't forward without SNI.
+        // By using the cached destination (which is HOP2's IP in the user's
+        // DNS hijack setup), we forward immediately, and HOP2 extracts SNI.
+        lastQUICDest   net.Destination
+        lastQUICDestIP net.Address
+
         ctx  context.Context
         cone bool
 }

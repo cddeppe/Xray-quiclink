@@ -40,6 +40,12 @@ var (
         allNetworks             [8]bool
         defaultBlockPrivateRule *FinalRule
         defaultBlockAllRule     *FinalRule
+
+        // v26.11.86-link: caches the most recently successful QUIC destination IP.
+        // When SNI extraction fails for a new QUIC connection (Chrome sends only
+        // 1 Initial, sniffer times out), we forward to this cached IP instead of
+        // dropping the packet. This breaks the chicken-and-egg deadlock.
+        lastQUICDestIP atomic.Pointer[net.Address]
 )
 
 func secondsOrDefault(v, def uint32) uint32 {
@@ -423,19 +429,26 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // → the packet loops back to the dokodemo listener → new DispatchLink
         // → new sniffer (fails again) → dials 127.0.0.1:443 → infinite loop.
         //
-        // This loop also corrupts the pool's lastActiveCh tracking because
-        // the loopback dial succeeds (it's the local xray) and updates
-        // lastActiveCh, causing 1-RTT replies from legitimate QUIC connections
-        // to be misdelivered to the loopback conn.
-        //
-        // TCP is NOT affected — TCP goes through a different code path and
-        // the sniffer always succeeds for TCP (single ClientHello packet).
-        // DNS (port 53) is exempted — it legitimately uses loopback.
+        // v26.11.86-link: Instead of dropping, forward to the most recently
+        // successful QUIC destination IP (cached from earlier connections where
+        // SNI WAS extracted). This breaks the chicken-and-egg deadlock:
+        // Chrome sends 1 Initial → sniffer can't extract SNI → forward to
+        // cached HOP2 IP → HOP2 gets both packets → extracts SNI → server
+        // responds → Chrome sends 2nd Initial → HOP1 now gets both → extracts
+        // SNI → updates cache.
         if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
-                errors.LogWarning(ctx, "DIAG LB01 dropping loopback UDP:443 to prevent infinite loop (SNI extraction failed) dest=", destination)
-                common.Interrupt(input)
-                common.Close(output)
-                return errors.New("dropping loopback UDP:443 to prevent infinite loop")
+                cachedIP := lastQUICDestIP.Load()
+                if cachedIP != nil && *cachedIP != nil {
+                        errors.LogWarning(ctx, "DIAG LB02 QUIC SNI failed — forwarding to cached QUIC dest IP=", *cachedIP, " (instead of dropping)")
+                        destination.Address = *cachedIP
+                        destination.Network = net.Network_UDP
+                        destination.Port = 443
+                } else {
+                        errors.LogWarning(ctx, "DIAG LB01 dropping loopback UDP:443 (no cached QUIC dest yet) dest=", destination)
+                        common.Interrupt(input)
+                        common.Close(output)
+                        return errors.New("dropping loopback UDP:443 — no cached QUIC destination")
+                }
         }
 
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
@@ -488,6 +501,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         destination.Address = stickyIP
                         if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
                                 UDPOverride.Address = stickyIP
+                        }
+                        // v26.11.86-link: cache the resolved IP for QUIC fallback.
+                        // When a future QUIC connection's SNI extraction fails, we
+                        // forward to this cached IP instead of dropping.
+                        if destination.Network == net.Network_UDP {
+                                ipCopy := stickyIP
+                                lastQUICDestIP.Store(&ipCopy)
+                                errors.LogWarning(ctx, "DIAG CQ01 cached QUIC dest IP=", stickyIP, " for fallback (domain=", destination.Address, ")")
                         }
                 } else {
                         errors.LogInfoInner(ctx, err, "sticky: pre-resolve failed, falling back to normal resolution")
