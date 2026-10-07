@@ -100,9 +100,10 @@ setup() {
     iptables -t mangle -C PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
         iptables -t mangle -A PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN"
     
-    # Hook into OUTPUT (locally generated traffic — for testing)
-    iptables -t mangle -C OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
-        iptables -t mangle -A OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN"
+    # NOTE: We do NOT hook into OUTPUT — locally generated UDP :443 from the VPS
+    # itself should not be TPROXY'd (causes "RULE_APPEND failed" on nf_tables
+    # and would break the VPS's own outbound QUIC connections). Only forwarded
+    # traffic (from the tunnel) needs TPROXY.
     
     # === IPv6 setup (if ip6tables exists) ===
     if command -v ip6tables &>/dev/null; then
@@ -114,8 +115,7 @@ setup() {
             --tproxy-mark "$TPROXY_MARK"
         ip6tables -t mangle -C PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
             ip6tables -t mangle -A PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN"
-        ip6tables -t mangle -C OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
-            ip6tables -t mangle -A OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN"
+        # No OUTPUT hook for IPv6 (same reason as IPv4)
     fi
     
     # ip rule + route for TPROXY
