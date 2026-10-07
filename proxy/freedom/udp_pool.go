@@ -47,13 +47,16 @@ type pooledSocket struct {
         lastUsed      atomic.Int64 // UnixNano
         lastReplyTime atomic.Int64  // UnixNano
         demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
+        // v26.11.99-link: lastActiveCh for delivering server Initial replies
+        // when Chrome uses 0-length SCID. Server's Initial reply has DCID=∅,
+        // which can't be demuxed. We deliver to the most recently active conn,
+        // then register the server's SCID from the reply so future packets
+        // (Handshake, 1-RTT) hit demux normally via the DCID (= server's SCID).
+        lastActiveCh  chan<- readResult
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
         // v26.10.15-link: dropped reply packets counter for observability.
-        // Incremented when the inbox channel (cap 32) is full and the
-        // readLoop drops a reply packet. QUIC will retransmit, but
-        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
 }
 
@@ -398,24 +401,34 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.10.29-link: silent drop on demux miss.
-                        //
-                        // v26.10.27 tried broadcast-on-miss (sending to ALL
-                        // sessions on the socket) but this caused cascading
-                        // stalls — flooding wrong sessions' inbox channels
-                        // with non-matching packets, filling the 256-cap
-                        // channels with garbage so the real reply was dropped.
-                        //
-                        // The silent drop is correct: NEW_CONNECTION_ID
-                        // rotation is handled by the inbound worker's
-                        // tryQUICMigration (source IP:port → connection mapping).
-                        // The pool's demux is only for the reply path. If a
-                        // reply arrives with an unknown DCID, it's either a
-                        // NEW_CONNECTION_ID reply (rare) or a stray packet
-                        // from a different connection sharing the CDN edge.
-                        // Dropping is safer than broadcasting.
-                        putPacket(packet)
-                        continue
+                        // v26.11.99-link: Deliver server's Initial reply when Chrome uses 0-SCID.
+                        // Server's Initial has DCID=∅ (Chrome's SCID). demux can't route it.
+                        // Deliver to lastActiveCh (the most recently active conn), then
+                        // register the server's SCID from the reply so future packets
+                        // (Handshake, 1-RTT with DCID=server's SCID) hit demux normally.
+                        if len(dcid) == 0 && n > 0 && packet[0]&0x80 != 0 {
+                                // Long header with 0-length DCID = server's reply to 0-SCID client
+                                s.mu.RLock()
+                                ch = s.lastActiveCh
+                                s.mu.RUnlock()
+                                if ch != nil {
+                                        ok = true
+                                        // Register the server's SCID from this reply so future
+                                        // packets with DCID=serverSCID hit demux directly.
+                                        if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
+                                                scidKey := makeDCIDKey(scid)
+                                                s.mu.Lock()
+                                                if _, exists := s.demux[scidKey]; !exists {
+                                                        s.demux[scidKey] = ch
+                                                }
+                                                s.mu.Unlock()
+                                        }
+                                }
+                        }
+                        if !ok {
+                                putPacket(packet)
+                                continue
+                        }
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
@@ -596,16 +609,15 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
-                // v26.10.15-link: only mark the socket dead on persistent
-                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
-                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
-                // will retry or the route will come back. Killing the socket
-                // on a transient error would kill all 50+ QUIC sessions
-                // sharing this socket, which is much worse than dropping one
-                // packet.
                 if !isTransientWriteError(err) {
                         c.socket.MarkDead()
                 }
+        } else {
+                // v26.11.99-link: Update lastActiveCh so the server's Initial reply
+                // (which has DCID=∅ for 0-SCID Chrome) can be delivered.
+                c.socket.mu.Lock()
+                c.socket.lastActiveCh = c.inbox
+                c.socket.mu.Unlock()
         }
         return n, err
 }
