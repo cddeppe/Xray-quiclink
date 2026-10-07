@@ -26,6 +26,25 @@ import (
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
 
+// v26.11.109: Source-based SNI cache for QUIC.
+// When the sniffer extracts SNI from a QUIC Initial, we cache source→domain.
+// When a 1-RTT short header arrives from the same source, the sniffer can't
+// extract SNI (short headers are encrypted). Instead of failing and routing
+// to 127.0.0.1, we check this cache and return the cached domain.
+//
+// This fixes the root cause of YouTube stalling: 1-RTT packets created new
+// conns → sniffer failed (no SNI in short headers) → routed to 127.0.0.1:443
+// → dropped as loopback. With the cache, the sniffer returns the cached SNI
+// and the dispatcher routes to the correct domain.
+type sniCacheEntry struct {
+        domain   string
+        expiresAt int64 // unix nano
+}
+
+var sniCache sync.Map // source string → sniCacheEntry
+
+const sniCacheTTL = 120 * time.Second // QUIC connections live longer than 2 min; refresh on each Initial
+
 type cachedReader struct {
         sync.Mutex
         reader   buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
@@ -363,6 +382,30 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !sniffingRequest.Enabled {
                 d.routedDispatch(ctx, outbound, destination)
         } else {
+                // v26.11.109: Check SNI cache for UDP (QUIC short headers).
+                // If we've already sniffed SNI for this source from a prior
+                // QUIC Initial, reuse it instead of running the sniffer (which
+                // will fail on short headers — they're encrypted and carry no SNI).
+                if destination.Network == net.Network_UDP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                srcKey := inbound.Source.String()
+                                if cached, ok := sniCache.Load(srcKey); ok {
+                                        entry := cached.(sniCacheEntry)
+                                        if time.Now().UnixNano() < entry.expiresAt {
+                                                // Cache hit! Override destination with cached domain.
+                                                errors.LogInfo(ctx, "SNI cache HIT: source=", srcKey, " domain=", entry.domain)
+                                                destination.Address = net.ParseAddress(entry.domain)
+                                                ob.Target = destination
+                                                // Skip sniffing entirely — route directly.
+                                                d.routedDispatch(ctx, outbound, destination)
+                                                return nil
+                                        } else {
+                                                sniCache.Delete(srcKey)
+                                        }
+                                }
+                        }
+                }
+
                 cReader := &cachedReader{
                         reader: outbound.Reader.(buf.TimeoutReader),
                         cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange
@@ -388,6 +431,20 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                                 ob.RouteTarget = destination
                         } else {
                                 ob.Target = destination
+                        }
+
+                        // v26.11.109: Cache SNI by source address for UDP.
+                        // Future 1-RTT short headers from the same source will
+                        // use this cached domain instead of failing the sniffer.
+                        if destination.Network == net.Network_UDP && domain != "" {
+                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                        srcKey := inbound.Source.String()
+                                        sniCache.Store(srcKey, sniCacheEntry{
+                                                domain:    domain,
+                                                expiresAt: time.Now().Add(sniCacheTTL).UnixNano(),
+                                        })
+                                        errors.LogInfo(ctx, "SNI cache STORE: source=", srcKey, " domain=", domain)
+                                }
                         }
                 }
                 d.routedDispatch(ctx, outbound, destination)
