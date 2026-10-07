@@ -244,7 +244,6 @@ func (c *udpConn) Write(buf []byte) (int, error) {
                                 dk := makeDCIDKey(scid)
                                 if _, exists := c.worker.dcidIndex[dk]; !exists {
                                         c.worker.dcidIndex[dk] = c.id
-                                        errors.LogInfo(context.Background(), "DIAG W08 udpConn.Write registered server SCID in dcidIndex scid=", hex.EncodeToString(scid[:min(len(scid), 8)]))
                                 }
                                 c.worker.Unlock()
                         }
@@ -515,86 +514,84 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
-        id := connID{
-                src:    source,
-                srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
-        }
-        if originalDest.IsValid() {
-                if !w.cone {
-                        id.dest = originalDest
-                }
-                b.UDP = &originalDest
-        }
+	id := connID{
+		src:    source,
+		srcKey: makeSrcKey(source),
+	}
+	if originalDest.IsValid() {
+		if !w.cone {
+			id.dest = originalDest
+		}
+		b.UDP = &originalDest
+	}
 
-        // v26.11.89-link: COMPREHENSIVE FIX — only QUIC Initials create new conns.
-        // Non-Initial packets (Handshake, 0-RTT, 1-RTT) ALWAYS go to existing conns.
-        isQUICInitial := false
-        if !originalDest.IsValid() {
-                packetBytes := b.Bytes()
-                if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 && packetBytes[0]&0x40 != 0 {
-                        pktType := (packetBytes[0] & 0x30) >> 4
-                        if pktType == 0 {
-                                isQUICInitial = true
-                                if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
-                                        id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
-                                }
-                        }
-                }
-        }
+	// v26.11.90-link: ROOT FIX — one conn per source port.
+	// ALL packets from the same source port go to the SAME conn.
+	// No per-DCID routing, no per-Initial new conns.
+	// The conn's freedom.Process forwards everything transparently.
+	if !originalDest.IsValid() {
+		packetBytes := b.Bytes()
+		if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 && packetBytes[0]&0x40 != 0 {
+			if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
+				id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
+			}
+		}
+	}
 
-        // For non-Initial QUIC packets, NEVER create a new conn.
-        if !isQUICInitial && !originalDest.IsValid() {
-                // 1. Try dcidIndex (DCID -> connID lookup)
-                if len(b.Bytes()) > 0 {
-                        if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
-                                dk := makeDCIDKey(dcid)
-                                w.RLock()
-                                if existingID, found := w.dcidIndex[dk]; found {
-                                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                                w.RUnlock()
-                                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                                existingConn.updateActivity()
-                                                return
-                                        }
-                                }
-                                w.RUnlock()
-                        }
-                }
+	// Check if there's an existing conn for this source port.
+	// If yes, deliver to it — no new conn, no sniffing.
+	if !originalDest.IsValid() {
+		// 1. Try srcIndex (same source port — most common path)
+		w.RLock()
+		if existingID, found := w.srcIndex[id.srcKey]; found {
+			if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+				w.RUnlock()
+				existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+				existingConn.updateActivity()
+				return
+			}
+		}
+		w.RUnlock()
 
-                // 2. Try srcIndex (same source port)
-                w.RLock()
-                if existingID, found := w.srcIndex[id.srcKey]; found {
-                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                w.RUnlock()
-                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                existingConn.updateActivity()
-                                return
-                        }
-                }
-                w.RUnlock()
+		// 2. Try dcidIndex (DCID lookup, handles migration)
+		if len(b.Bytes()) > 0 {
+			if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
+				dk := makeDCIDKey(dcid)
+				w.RLock()
+				if existingID, found := w.dcidIndex[dk]; found {
+					if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+						w.RUnlock()
+						existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+						existingConn.updateActivity()
+						return
+					}
+				}
+				w.RUnlock()
+			}
+		}
 
-                // 3. Try most recently active conn (migration fallback)
-                w.RLock()
-                var lastActiveConn *udpConn
-                var lastActiveTime int64
-                for _, c := range w.activeConn {
-                        if c.done.Done() {
-                                continue
-                        }
-                        t := atomic.LoadInt64(&c.lastActivityTime)
-                        if t > lastActiveTime {
-                                lastActiveTime = t
-                                lastActiveConn = c
-                        }
-                }
-                w.RUnlock()
-                if lastActiveConn != nil {
-                        lastActiveConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                        lastActiveConn.updateActivity()
-                        return
-                }
-                // No active conns — fall through to create new conn (rare)
-        }
+		// 3. Try most recently active conn (last resort)
+		w.RLock()
+		var lastActiveConn *udpConn
+		var lastActiveTime int64
+		for _, c := range w.activeConn {
+			if c.done.Done() {
+				continue
+			}
+			t := atomic.LoadInt64(&c.lastActivityTime)
+			if t > lastActiveTime {
+				lastActiveTime = t
+				lastActiveConn = c
+			}
+		}
+		w.RUnlock()
+		if lastActiveConn != nil {
+			lastActiveConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+			lastActiveConn.updateActivity()
+			return
+		}
+		// No active conns — fall through to create new conn
+	}
 
         conn, existing := w.getConnection(id)
 
@@ -660,20 +657,15 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
-                        errors.LogWarning(ctx, "DIAG W03 worker goroutine calling proxy.Process target=", outbounds[0].Target, " ctxErr=", ctx.Err())
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogWarning(ctx, "DIAG W04 proxy.Process returned err=", err)
                         } else {
-                                errors.LogWarning(ctx, "DIAG W05 proxy.Process returned nil (OK)")
                         }
-                        errors.LogWarning(ctx, "DIAG W06 worker goroutine calling conn.Close()")
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better
                         if !conn.inactive {
                                 conn.setInactive()
                                 w.removeConn(id)
                         }
-                        errors.LogWarning(ctx, "DIAG W07 worker goroutine EXIT")
                 }()
         }
 }
