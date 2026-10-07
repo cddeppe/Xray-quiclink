@@ -5,7 +5,6 @@ import (
         "crypto/rand"
         stderrors "errors"
         "io"
-        stdnet "net"
         "strings"
         "sync/atomic"
         "syscall"
@@ -40,12 +39,6 @@ var (
         allNetworks             [8]bool
         defaultBlockPrivateRule *FinalRule
         defaultBlockAllRule     *FinalRule
-
-        // v26.11.86-link: caches the most recently successful QUIC destination IP.
-        // When SNI extraction fails for a new QUIC connection (Chrome sends only
-        // 1 Initial, sniffer times out), we forward to this cached IP instead of
-        // dropping the packet. This breaks the chicken-and-egg deadlock.
-        lastQUICDestIP atomic.Pointer[net.Address]
 )
 
 func secondsOrDefault(v, def uint32) uint32 {
@@ -387,10 +380,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         destination := ob.Target
-
-        // v26.11.68-link: REMOVED the loopback drop from here — moved below
-        // after `input` is available, so we can peek the first packet and
-        // try manual SNI extraction before dropping.
         origTargetAddr := ob.OriginalTarget.Address
         if origTargetAddr == nil {
                 origTargetAddr = ob.Target.Address
@@ -416,40 +405,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         input := link.Reader
         output := link.Writer
-
-        // v26.11.71-link: declare peekedPackets early so both the manual SNI
-        // extraction code and the pool peek code can use it.
-        var peekedPackets buf.MultiBuffer
-
-        // v26.11.82-link: CRITICAL FIX — drop UDP packets destined to
-        // loopback:443. These are QUIC connections where SNI extraction
-        // failed (the destination stayed as 127.0.0.1:443 from the dokodemo
-        // listener). Without this drop, freedom.Process dials 127.0.0.1:443
-        // → the packet loops back to the dokodemo listener → new DispatchLink
-        // → new sniffer (fails again) → dials 127.0.0.1:443 → infinite loop.
-        //
-        // v26.11.86-link: Instead of dropping, forward to the most recently
-        // successful QUIC destination IP (cached from earlier connections where
-        // SNI WAS extracted). This breaks the chicken-and-egg deadlock:
-        // Chrome sends 1 Initial → sniffer can't extract SNI → forward to
-        // cached HOP2 IP → HOP2 gets both packets → extracts SNI → server
-        // responds → Chrome sends 2nd Initial → HOP1 now gets both → extracts
-        // SNI → updates cache.
-        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
-                cachedIP := lastQUICDestIP.Load()
-                // v26.11.92-link: NEVER use a loopback IP as the cached dest.
-                // If the cache was polluted with 127.0.0.1 (from a previous
-                // failed connection), treat it as "no cache" and drop.
-                if cachedIP != nil && *cachedIP != nil && !(*cachedIP).IP().IsLoopback() {
-                        destination.Address = *cachedIP
-                        destination.Network = net.Network_UDP
-                        destination.Port = 443
-                } else {
-                        common.Interrupt(input)
-                        common.Close(output)
-                        return errors.New("dropping loopback UDP:443 — no valid cached QUIC destination")
-                }
-        }
 
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
         // When the remote peer (e.g. YouTube) closes the outbound TCP, we
@@ -485,30 +440,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // UDP-only sticky restores v26.10.36's working behavior. The CLOSE-WAIT
         // fix (inputCloser) and tcpKeepAlive alias are kept; both are
         // independent of the sticky-TCP change.
-        // v26.11.59-link: for UDP/QUIC traffic, use ResolveFresh (no stale-while-revalidate).
-        // A stale IP sends the QUIC Initial to a dead CDN edge → handshake fails →
-        // Chrome falls back to TCP → stall. For TCP, stale-while-revalidate is fine
-        // because the next request gets the fresh IP.
         if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() && h.stickyResolver != nil {
-                var stickyIP net.Address
-                var err error
-                if destination.Network == net.Network_UDP {
-                        stickyIP, err = h.stickyResolver.ResolveFresh(ctx, destination.Address.Domain())
-                } else {
-                        stickyIP, err = h.stickyResolver.Resolve(ctx, destination.Address.Domain())
-                }
-                if err == nil {
+                if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil {
                         destination.Address = stickyIP
                         if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
                                 UDPOverride.Address = stickyIP
-                        }
-                        // v26.11.86-link: cache the resolved IP for QUIC fallback.
-                        // When a future QUIC connection's SNI extraction fails, we
-                        // forward to this cached IP instead of dropping.
-                        // v26.11.92-link: NEVER cache loopback IPs.
-                        if destination.Network == net.Network_UDP && !stickyIP.IP().IsLoopback() {
-                                ipCopy := stickyIP
-                                lastQUICDestIP.Store(&ipCopy)
                         }
                 } else {
                         errors.LogInfoInner(ctx, err, "sticky: pre-resolve failed, falling back to normal resolution")
@@ -660,64 +596,66 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
-        // v26.11.87-link: Populate lastQUICDestIP cache from ANY successful UDP dial.
-        // This ensures the cache is always populated, even when the sticky resolver
-        // is not configured or the destination was already an IP. The cached IP is
-        // used as a fallback when SNI extraction fails (chicken-and-egg deadlock).
-        // v26.11.92-link: NEVER cache loopback IPs — they create infinite loops.
-        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && !destination.Address.IP().IsLoopback() {
-                ipCopy := destination.Address
-                lastQUICDestIP.Store(&ipCopy)
-        }
+        // v26.10.71-link: log the downstream path explicitly so the log
+        // alone tells us whether QUIC survived end-to-end. The destination
+        // string already shows tcp:/udp: but does not tell us whether the
+        // QUIC pool took the connection (DCID demux) or whether the
+        // per-session path was used (0-length SCID fallback or non-QUIC UDP).
+        // v26.10.72-link: upgraded to LogWarning because LogInfo is silent
+        // at the default 'warning' log level — which made the v26.10.71
+        // lines invisible. LogWarning shows at all log levels >= warning.
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
         // per-session socket path. This prevents the pool from breaking non-QUIC UDP.
         var pooledConn *pooledConn
+        var peekedPackets buf.MultiBuffer
         if destination.Network != net.Network_TCP && h.socketPool != nil {
+                // Peek at the first packet(s) to check if this is QUIC traffic.
                 mb, peekErr := input.ReadMultiBuffer()
                 if peekErr == nil && len(mb) > 0 {
                         peekedPackets = mb
-                        firstByte := byte(0)
-                        if len(mb[0].Bytes()) > 0 {
-                                firstByte = mb[0].Bytes()[0]
-                        }
-                        isLong := firstByte&0x80 != 0 && firstByte&0x40 != 0
-                        if isLong {
-					// v26.11.97-link: Use dest IP as pool key (original approach).
-					// The demux handles multiple QUIC connections sharing the socket
-					// via DCID registration (v26.11.79) and lastActiveCh fallback
-					// with DCID registration after delivery (v26.11.84).
-					remoteAddr := conn.RemoteAddr()
-					var udpRemote *net.UDPAddr
-					if u, ok := remoteAddr.(*net.UDPAddr); ok {
-						udpRemote = u
-					} else {
-						udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
-					}
-					if udpRemote != nil {
-						pooledConn, err = h.socketPool.Acquire(udpRemote)
+                        if isQUICLongHeader(mb[0].Bytes()) {
+                                remoteAddr := conn.RemoteAddr()
+                                var udpRemote *net.UDPAddr
+                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
+                                        udpRemote = u
+                                } else {
+                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
+                                }
+                                if udpRemote != nil {
+                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
                                         if err != nil {
+                                                // v26.10.34-link (C3 fix): release peeked packets
+                                                // before returning. Without this, every Acquire
+                                                // failure leaks one MultiBuffer (up to 8KB+ per
+                                                // failure) — unbounded growth under flapping dest.
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                pooledConn.source = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
-                                                }
-                                        }
                                         defer pooledConn.Close()
+                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
+                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
+                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
                                 }
                         } else {
+                                // Non-QUIC UDP first byte — per-session path.
+                                errors.LogWarning(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
                         }
+                        // If not QUIC, pooledConn stays nil — existing per-session path is used.
                 } else {
+                        // Peek failed (empty input pipe / EOF) — per-session fallback.
+                        errors.LogWarning(ctx, "freedom: UDP path=per-session (peek empty) dest=", destination, " peekErr=", peekErr)
                 }
+                // If peek failed, proceed with existing path (pooledConn stays nil).
         } else if destination.Network != net.Network_TCP {
+                // socketPool not configured — per-session UDP path.
+                errors.LogWarning(ctx, "freedom: UDP path=per-session (no pool configured) dest=", destination)
         } else {
+                errors.LogWarning(ctx, "freedom: TCP path dest=", destination)
         }
 
         var newCtx context.Context
@@ -796,6 +734,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         default:
                                 return errors.New("failed to process request").Base(err)
                         }
+                }
+
+                // v26.10.69-link: For UDP, buf.Copy returns when the input
+                // pipe is exhausted (cachedReader EOF). The UDP connection
+                // is still alive — block on inputCloser to keep the session
+                // alive while responseDone reads YouTube's response.
+                if destination.Network != net.Network_TCP {
+                        // Override the DownlinkOnly timer with ConnectionIdle
+                        // so the session stays alive long enough for the
+                        // response to arrive. DownlinkOnly (default 1s) is
+                        // too short for UDP — the response may take longer.
+                        timer.SetTimeout(plcy.Timeouts.ConnectionIdle)
+                        <-inputCloser
                 }
 
                 return nil
@@ -974,7 +925,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                 }
                 var n int
                 var err error
-                        if b.UDP != nil {
+                if b.UDP != nil {
                         if w.UDPOverride.Address != nil {
                                 b.UDP.Address = w.UDPOverride.Address
                         }
@@ -1022,7 +973,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 b.Release()
                                 continue
                         }
-                                n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+                        n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
                 }

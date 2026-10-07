@@ -86,10 +86,7 @@ func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                 return mb, nil
         }
 
-        mb2, err := r.reader.ReadMultiBuffer()
-        if err == nil {
-        }
-        return mb2, err
+        return r.reader.ReadMultiBuffer()
 }
 
 func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
@@ -316,7 +313,8 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
                         }
                         outbound.Reader = cReader
                         result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-                        if err == nil && result != nil {
+                        if err == nil {
+                                content.Protocol = result.Protocol()
                         }
                         if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
                                 domain := result.Domain()
@@ -335,7 +333,6 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
                                 } else {
                                         ob.Target = destination
                                 }
-                        } else {
                         }
                         d.routedDispatch(ctx, outbound, destination)
                 }()
@@ -366,24 +363,9 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !sniffingRequest.Enabled {
                 d.routedDispatch(ctx, outbound, destination)
         } else {
-                // v26.11.77-link: REVERTED the v26.11.74 goroutine change.
-                //
-                // v26.11.74 ran the UDP sniffer in a goroutine to avoid a "deadlock"
-                // that never existed. The worker callback writes packets to the pipe
-                // (256KB buffer) and is NOT blocked by DispatchLink. DispatchLink is
-                // called from a SEPARATE goroutine (the worker's Process goroutine).
-                //
-                // The goroutine broke DispatchLink's blocking contract: dokodemo.Process
-                // expects DispatchLink to block until the outbound finishes. With the
-                // goroutine, DispatchLink returned immediately → dokodemo.Process
-                // returned → the worker called conn.Close() → the pipe was closed →
-                // the sniffer's context was cancelled before it could read ANY packet.
-                //
-                // With v26.11.75's truncated ClientHello fix, the sniffer extracts SNI
-                // from the 1st packet in <1ms. No deadlock, no need for a goroutine.
                 cReader := &cachedReader{
                         reader: outbound.Reader.(buf.TimeoutReader),
-                        cache:  make(buf.MultiBuffer, 0, 8),
+                        cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange
                 }
                 outbound.Reader = cReader
                 result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
@@ -407,7 +389,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
                         } else {
                                 ob.Target = destination
                         }
-                } else {
                 }
                 d.routedDispatch(ctx, outbound, destination)
         }
@@ -443,13 +424,13 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                                 cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
                                 cacheDeadline -= cachingTimeElapsed
 
-
                                 if !payload.IsEmpty() {
                                         result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
                                         switch err {
-                                        case common.ErrNoClue:
+                                        case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
                                                 totalAttempt++
-                                        case protocol.ErrProtoNeedMoreData:
+                                        case protocol.ErrProtoNeedMoreData: // Protocol Need More Data: protocol matches, but need more data to complete sniffing
+                                                // in this case, do not add totalAttempt(allow to read until timeout)
                                         default:
                                                 return result, err
                                         }

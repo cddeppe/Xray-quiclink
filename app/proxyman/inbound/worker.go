@@ -3,8 +3,6 @@ package inbound
 import (
         "context"
         "encoding/hex"
-        stdnet "net"
-        "strings"
         "sync"
 
         "github.com/xtls/xray-core/common/protocol/quic"
@@ -189,8 +187,6 @@ type udpConn struct {
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
-        worker           *udpWorker       // v26.11.83-link: back-reference for dcidIndex registration
-        id               connID           // v26.11.83-link: this conn's id for dcidIndex registration
 }
 
 func (c *udpConn) setInactive() {
@@ -221,91 +217,15 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 }
 
 // Write implements io.Writer.
-//
-// v26.11.64-link: SplitCoalesced with send-full-first fallback.
-// Server replies (Initial + Handshake coalesced via GSO) can be
-// ~2400 bytes. SplitCoalesced splits them into individual QUIC
-// packets (~1250 each). If SplitCoalesced fails to parse, try
-// sending the full packet first (kernel may fragment it). Only
-// truncate to 1250 as an absolute last resort if the full send
-// fails with EMSGSIZE.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        // v26.11.83-link: Register server's SCID in dcidIndex when we see
-        // the server's Initial reply. Chrome's 1-RTT packets use DCID=
-        // serverSCID. Without registering it here, connection migration
-        // (new source port) fails — tryQUICMigration can't find the DCID
-        // in dcidIndex, creates a new conn, runs the sniffer (which fails
-        // on short headers), and drops the packet.
-        if len(buf) > 0 && buf[0]&0x80 != 0 && c.worker != nil {
-                pktType := (buf[0] >> 4) & 0x03
-                if pktType == 0x00 { // Initial
-                        if scid, _, err := quic.ParseSCID(buf); err == nil && len(scid) > 0 {
-                                c.worker.Lock()
-                                dk := makeDCIDKey(scid)
-                                if _, exists := c.worker.dcidIndex[dk]; !exists {
-                                        c.worker.dcidIndex[dk] = c.id
-                                }
-                                c.worker.Unlock()
-                        }
-                }
+        n, err := c.output(buf)
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
         }
-        if len(buf) <= 1250 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        if err == nil {
+                c.updateActivity()
         }
-        offsets, splitErr := quic.SplitCoalesced(buf)
-        if splitErr != nil || len(offsets) <= 1 {
-                // v26.11.64-link: SplitCoalesced failed. Try sending the full
-                // packet first — the kernel may handle IP fragmentation.
-                // Only truncate if the send fails with EMSGSIZE.
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                        return n, nil
-                }
-                // Check if it's EMSGSIZE
-                errStr := err.Error()
-                if strings.Contains(errStr, "message too long") || strings.Contains(errStr, "EMSGSIZE") {
-                        // Last resort: truncate to 1250
-                        truncated := buf[:1250]
-                        n2, err2 := c.output(truncated)
-                        if c.downlink != nil {
-                                c.downlink.Add(int64(n2))
-                        }
-                        if err2 == nil {
-                                c.updateActivity()
-                        }
-                        return n2, err2
-                }
-                // Other error — return as-is
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
-        }
-        total := 0
-        for _, off := range offsets {
-                packet := buf[off[0]:off[1]]
-                n, werr := c.output(packet)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if werr != nil {
-                        return total, werr
-                }
-                total += n
-        }
-        c.updateActivity()
-        return total, nil
+        return n, err
 }
 
 func (c *udpConn) Close() error {
@@ -376,28 +296,6 @@ func makeSrcKey(d net.Destination) srcKey {
         return k
 }
 
-// makeSrcKeyFromUDPAddr computes a srcKey from a stdnet.UDPAddr.
-// Used by OnServerSCID to map a *stdnet.UDPAddr (handed in by the
-// SCID hook) onto the same srcKey form produced by makeSrcKey, so
-// that lookups in w.srcIndex succeed regardless of whether the
-// source address came from a net.Destination (inbound packet
-// path) or a *stdnet.UDPAddr (outbound SCID notification path).
-func makeSrcKeyFromUDPAddr(addr *stdnet.UDPAddr) srcKey {
-        var k srcKey
-        if addr == nil || addr.IP == nil {
-                return k
-        }
-        if ip4 := addr.IP.To4(); ip4 != nil {
-                copy(k.ip[12:], ip4)
-                k.ip[10] = 0xff
-                k.ip[11] = 0xff
-        } else {
-                copy(k.ip[:], addr.IP.To16())
-        }
-        k.port = uint16(addr.Port)
-        return k
-}
-
 // v26.10.16-link: dcidKey is a zero-allocation map key for
 // QUIC DCID lookups. Replaces hex.EncodeToString(dcid) which
 // allocated a 16-char string per call. The struct is 24 bytes
@@ -432,17 +330,6 @@ type udpWorker struct {
         activeConn map[connID]*udpConn
         dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
         srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
-
-        // v26.11.86-link: caches the most recently successful QUIC destination
-        // (resolved IP from SNI extraction). When SNI extraction fails for a
-        // new QUIC connection (Chrome sends only 1 Initial, sniffer times out),
-        // we forward to this cached destination instead of dropping the packet.
-        // This breaks the chicken-and-egg deadlock: the proxy can't extract SNI
-        // without forwarding the first Initial, but can't forward without SNI.
-        // By using the cached destination (which is HOP2's IP in the user's
-        // DNS hijack setup), we forward immediately, and HOP2 extracts SNI.
-        lastQUICDest   net.Destination
-        lastQUICDestIP net.Address
 
         ctx  context.Context
         cone bool
@@ -505,8 +392,6 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 w.RUnlock()
                 return w.hub.WriteTo(b, srcCopy)
         }
-        conn.worker = w // v26.11.83-link: back-reference for dcidIndex registration
-        conn.id = id    // v26.11.83-link: this conn's id for dcidIndex registration
         w.activeConn[id] = conn
 
         conn.updateActivity()
@@ -518,130 +403,63 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
         }
-	if originalDest.IsValid() {
-		if !w.cone {
-			id.dest = originalDest
-		}
-		b.UDP = &originalDest
-	} else {
-		// v26.11.91-link: COMPREHENSIVE FIX based on lessons from v26.11.75-90.
-		//
-		// Only QUIC Initials create new conns (for SNI extraction).
-		// Non-Initial packets ALWAYS go to existing conns.
-		// If no existing conn is found, DROP the packet.
-		// Chrome retransmits the Initial, which creates the conn properly.
-		//
-		// This is the KEY insight from 50+ builds:
-		// Creating a new conn for a non-Initial is ALWAYS wrong because:
-		//   - The sniffer can't extract SNI from non-Initials
-		//   - The packet goes to 127.0.0.1:443 (loopback) or wrong cached IP
-		//   - This corrupts the pool's demux and causes video stalls
-		//
-		// By dropping non-Initials without a conn, Chrome retransmits the
-		// Initial, which creates the conn with proper SNI extraction.
-		// Once the conn exists, all subsequent packets (including non-Initials)
-		// are delivered to it naturally.
-		packetBytes := b.Bytes()
-		isQUICInitial := false
-		if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 && packetBytes[0]&0x40 != 0 {
-			// Long header — check if it's an Initial (type=0)
-			pktType := (packetBytes[0] & 0x30) >> 4
-			if pktType == 0 {
-				isQUICInitial = true
-				// Set id.dest from DCID for Initials (unique connID per connection)
-				if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
-					id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
-				}
-			}
-		}
-
-		// For non-Initial QUIC packets, find an existing conn.
-		// NEVER create a new conn for non-Initials.
-		if !isQUICInitial {
-			// 1. Try dcidIndex (DCID -> connID, handles migration/CID rotation)
-			if len(packetBytes) > 0 {
-				if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) > 0 {
-					dk := makeDCIDKey(dcid)
-					w.RLock()
-					if existingID, found := w.dcidIndex[dk]; found {
-						if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-							w.RUnlock()
-							existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-							existingConn.updateActivity()
-							return
-						}
-					}
-					w.RUnlock()
-				}
-			}
-
-			// 2. Try srcIndex (same source port — most common path)
-			w.RLock()
-			if existingID, found := w.srcIndex[id.srcKey]; found {
-				if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-					w.RUnlock()
-					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-					existingConn.updateActivity()
-					return
-				}
-			}
-			w.RUnlock()
-
-			// 3. Try most recently active conn (migration fallback)
-			w.RLock()
-			var lastActiveConn *udpConn
-			var lastActiveTime int64
-			for _, c := range w.activeConn {
-				if c.done.Done() {
-					continue
-				}
-				t := atomic.LoadInt64(&c.lastActivityTime)
-				if t > lastActiveTime {
-					lastActiveTime = t
-					lastActiveConn = c
-				}
-			}
-			w.RUnlock()
-			if lastActiveConn != nil {
-				lastActiveConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-				lastActiveConn.updateActivity()
-				return
-			}
-
-			// No existing conn found — DROP the packet.
-			// Chrome will retransmit the Initial, which creates the conn properly.
-			// This is correct behavior: we can't route a non-Initial without
-			// knowing which QUIC connection it belongs to.
-			b.Release()
-			return
-		}
-	}
-
-	// For Initials (and TCP), fall through to getConnection which creates
-	// a new conn and runs the sniffer for SNI extraction.
-	migratedConn := w.tryQUICMigration(b.Bytes(), id)
-	if migratedConn != nil {
-		migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-		migratedConn.updateActivity()
-		return
-	}
+        if originalDest.IsValid() {
+                if !w.cone {
+                        id.dest = originalDest
+                }
+                b.UDP = &originalDest
+        } else {
+                // v26.10.78-link: when originalDest is invalid (no TPROXY /
+                // receiveOriginalDestAddress in the inbound sockopt), all UDP
+                // packets from the same source port map to the same connID
+                // {src, dest=zero}. This breaks when multiple QUIC connections
+                // (different DCIDs) arrive from the same source port — they all
+                // get mixed into one conn. Only the first QUIC Initial's SNI is
+                // used for routing; subsequent QUIC connections' data goes to
+                // the first connection's pipe, their handshake fails, and the
+                // client falls back to TCP.
+                //
+                // Fix: for QUIC long-header packets (Initials), parse the DCID
+                // and use it to create a unique id.dest. Different DCIDs produce
+                // different connIDs, so each QUIC connection gets its own conn +
+                // goroutine + sniffer + freedom dial.
+                //
+                // The synthetic dest is only used for connID comparison and
+                // pipe routing — the actual routing destination comes from the
+                // sniffer's SNI extraction in the dispatcher.
+                //
+                // For short-header (1-RTT) packets, the DCID is already
+                // registered in dcidIndex by the Initial, so tryQUICMigration
+                // handles routing. We only need the synthetic dest for Initials.
+                packetBytes := b.Bytes()
+                if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 {
+                        if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
+                                id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
+                        }
+                }
+        }
+        // Try QUIC DCID-based migration lookup before creating a new conn
+        if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
+                migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                migratedConn.updateActivity()
+                return
+        }
 
         conn, existing := w.getConnection(id)
 
-        // v26.11.57-link: REMOVED the C3 race re-check. It was re-added by
-        // v26.11.54's history rewrite but it was already known to be broken
-        // (see v26.10.53-link REVERT). The re-check ALWAYS finds the conn that
-        // getConnection just created (because getConnection stores the new conn
-        // in w.activeConn[id] under the same lock before returning), so it
-        // sets existing=true and SKIPS the goroutine that processes the
-        // connection. The packet sits in the pipe forever — the sniffer never
-        // runs, freedom.Process never runs, the QUIC handshake never completes,
-        // and the browser falls back to TCP. This is the root cause of
-        // "YouTube goes straight to TCP" in v26.11.55/56.
+        // v26.10.53-link REVERT (re-applied v26.10.78): the v26.10.43 C3
+        // "fix" broke ALL new UDP connections. The re-check under lock
+        // ALWAYS found the conn that getConnection just created (because
+        // getConnection stores the new conn in w.activeConn[id] before
+        // returning), so it set existing=true and skipped the goroutine
+        // that processes the connection. The packet sat in the pipe
+        // forever — client timed out. This broke ALL UDP: QUIC, DNS,
+        // masque, shadowsocks UDP relay.
         //
-        // getConnection already holds w.Lock() during creation, so two
-        // goroutines cannot create duplicate conns — the race is already
-        // prevented. The re-check is unnecessary AND broken.
+        // The C3 fix was intended to catch a race between two goroutines
+        // creating duplicate conns. But getConnection already holds the
+        // lock during creation, so the race is already prevented.
+        // The C3 re-check is unnecessary AND broken — reverted.
 
         // Record DCID and src for new QUIC connections
         if !existing {
@@ -649,6 +467,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 w.recordSrc(id, conn)
         }
 
+        // payload will be discarded in pipe is full.
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
         if !existing {
@@ -663,13 +482,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         outbounds := []*session.Outbound{{}}
                         if originalDest.IsValid() {
                                 outbounds[0].Target = originalDest
-                        } else {
-                                // v26.11.65-link: when there's no TPROXY (originalDest invalid),
-                                // set the target to a UDP destination so the sniffer knows to run
-                                // the QUIC sniffer. Without this, the target stays as zero-value
-                                // (Network=TCP), and the QUIC sniffer never runs — so no SNI is
-                                // extracted, and packets loop to 127.0.0.1:443.
-                                outbounds[0].Target = net.UDPDestination(w.address, w.port)
                         }
                         ctx = session.ContextWithOutbounds(ctx, outbounds)
                         local := net.DestinationFromAddr(w.hub.Addr())
@@ -691,7 +503,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                        } else {
+                                errors.LogInfoInner(ctx, err, "connection ends")
                         }
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better
@@ -995,45 +807,6 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
         }
 }
 
-// OnServerSCID is invoked by the quic worker-hook dispatcher when a
-// server-side Initial (or other long-header) packet is observed
-// carrying serverSCID. The browserSrc is the *stdnet.UDPAddr of the
-// downstream browser that the server-side dispatcher saw the packet
-// from. We translate that into a srcKey and, if a connection already
-// exists for that srcKey, additionally record the server SCID → connID
-// association in w.dcidIndex so that subsequent 1-RTT packets with the
-// rotated DCID can be demuxed to the correct udpConn.
-//
-// This implements the browser-side half of Solution B: the browser
-// never has to wait for a CID rotation — we record the server-chosen
-// SCID as soon as we observe it and treat it as an alternate DCID for
-// the same udpConn.
-func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) {
-        if len(serverSCID) == 0 || browserSrc == nil {
-                return
-        }
-        sk := makeSrcKeyFromUDPAddr(browserSrc)
-        if sk.port == 0 && sk.ip == ([16]byte{}) {
-                return
-        }
-        w.Lock()
-        defer w.Unlock()
-        existingID, found := w.srcIndex[sk]
-        if !found {
-                return
-        }
-        existingConn, ok := w.activeConn[existingID]
-        if !ok || existingConn.done.Done() {
-                delete(w.srcIndex, sk)
-                return
-        }
-        _ = existingConn
-        dk := makeDCIDKey(serverSCID)
-        if _, exists := w.dcidIndex[dk]; !exists {
-                w.dcidIndex[dk] = existingID
-        }
-}
-
 func (w *udpWorker) handlePackets() {
         receive := w.hub.Receive()
         for payload := range receive {
@@ -1100,13 +873,11 @@ func (w *udpWorker) Start() error {
         }
 
         w.hub = h
-        quic.RegisterWorkerSCIDHook(w)
         go w.handlePackets()
         return nil
 }
 
 func (w *udpWorker) Close() error {
-        quic.UnregisterWorkerSCIDHook(w)
         w.Lock()
         defer w.Unlock()
 
