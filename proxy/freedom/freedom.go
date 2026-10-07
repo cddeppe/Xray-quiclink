@@ -416,12 +416,27 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // extraction code and the pool peek code can use it.
         var peekedPackets buf.MultiBuffer
 
-        // v26.11.74-link: REMOVED loopback drop and manual SNI extraction.
-        // The dispatcher now runs the UDP sniffer in a goroutine (v26.11.74),
-        // so it can wait for multiple packets without deadlocking the worker.
-        // If the sniffer fails, the destination stays as the IP — but the
-        // dispatcher handles that (routes to the IP as-is).
-        // No more loopback drops, no more manual SNI extraction in freedom.Process.
+        // v26.11.82-link: CRITICAL FIX — drop UDP packets destined to
+        // loopback:443. These are QUIC connections where SNI extraction
+        // failed (the destination stayed as 127.0.0.1:443 from the dokodemo
+        // listener). Without this drop, freedom.Process dials 127.0.0.1:443
+        // → the packet loops back to the dokodemo listener → new DispatchLink
+        // → new sniffer (fails again) → dials 127.0.0.1:443 → infinite loop.
+        //
+        // This loop also corrupts the pool's lastActiveCh tracking because
+        // the loopback dial succeeds (it's the local xray) and updates
+        // lastActiveCh, causing 1-RTT replies from legitimate QUIC connections
+        // to be misdelivered to the loopback conn.
+        //
+        // TCP is NOT affected — TCP goes through a different code path and
+        // the sniffer always succeeds for TCP (single ClientHello packet).
+        // DNS (port 53) is exempted — it legitimately uses loopback.
+        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
+                errors.LogWarning(ctx, "DIAG LB01 dropping loopback UDP:443 to prevent infinite loop (SNI extraction failed) dest=", destination)
+                common.Interrupt(input)
+                common.Close(output)
+                return errors.New("dropping loopback UDP:443 to prevent infinite loop")
+        }
 
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
         // When the remote peer (e.g. YouTube) closes the outbound TCP, we
