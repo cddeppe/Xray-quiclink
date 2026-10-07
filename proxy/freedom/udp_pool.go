@@ -114,6 +114,11 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+
+        // v26.11.63-link: delayed close support
+        closing   atomic.Bool
+        idleTimer *time.Timer
+        idleMu    sync.Mutex
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -654,20 +659,49 @@ func (c *pooledConn) IsClosed() bool {
         return c.closed.Load()
 }
 
+// Close implements io.Closer.
+//
+// v26.11.63-link: DELAYED CLOSE. Instead of immediately closing the conn
+// and removing DCID from demux (which drops Google's ~50ms-late reply),
+// we start a 5-second timer. During this window:
+// - The inbox stays open (ReadFrom can still receive replies)
+// - The DCID stays in demux (readLoop can route replies to this inbox)
+// - The conn is marked as "closing" so no new WriteTo calls are accepted
+//
+// After 5 seconds of no activity, actualClose() fires and does the real
+// cleanup. If a reply arrives during the window, the readLoop sends it
+// to the inbox, but nobody reads it (responseDone already returned).
+// The inbox has cap 256, so a few replies won't overflow. If many
+// replies arrive, the select/default in readLoop drops them safely.
+//
+// This is simpler than Option B (persistent conn reuse) and avoids the
+// multi-reader problem where multiple Process calls compete for the
+// same inbox.
 func (c *pooledConn) Close() error {
-        // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
-        if !c.closed.CompareAndSwap(false, true) {
+        // v26.11.63-link: start delayed close timer
+        c.idleMu.Lock()
+        if c.closing.Load() {
+                // Already closing — ignore
+                c.idleMu.Unlock()
                 return nil
+        }
+        c.closing.Store(true)
+        c.idleTimer = time.AfterFunc(5*time.Second, func() {
+                c.actualClose()
+        })
+        c.idleMu.Unlock()
+        return nil
+}
+
+// actualClose does the real cleanup — called by the idle timer 5 seconds
+// after Close() was called. Removes DCID from demux and closes the inbox.
+func (c *pooledConn) actualClose() {
+        if !c.closed.CompareAndSwap(false, true) {
+                return
         }
         close(c.done)
 
         c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
         c.socket.mu.Lock()
         for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
@@ -679,7 +713,6 @@ func (c *pooledConn) Close() error {
         c.mu.Unlock()
 
         c.socket.release()
-        return nil
 }
 
 func (c *pooledConn) LocalAddr() stdnet.Addr {
