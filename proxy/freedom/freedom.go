@@ -383,17 +383,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         destination := ob.Target
 
-        // v26.11.66-link: drop UDP packets destined to loopback. Without
-        // TPROXY, when the QUIC sniffer fails to extract the SNI, the
-        // destination stays as the Gateway (inbound listen address, usually
-        // 0.0.0.0 or 127.0.0.1). Sending to this creates an infinite loop
-        // (xray → xray → xray...) that prevents anything from loading.
-        // Dropping the packet lets QUIC retransmit; if the sniffer succeeds
-        // on the retransmit, the packet routes correctly.
-        if destination.Network == net.Network_UDP {
+        // v26.11.67-link: drop UDP packets destined to loopback on port 443.
+        // Without TPROXY, when the QUIC sniffer fails to extract the SNI, the
+        // destination stays as the Gateway (inbound listen address = 0.0.0.0:443
+        // or 127.0.0.1:443). Sending to this creates an infinite loop.
+        // BUT: do NOT drop port 53 (DNS) — DNS queries to 127.0.0.1:53 are
+        // legitimate and must be allowed.
+        if destination.Network == net.Network_UDP && destination.Port == 443 {
                 destIP := destination.Address.IP()
                 if destIP.IsLoopback() || destIP.IsUnspecified() {
-                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP dest=", destination, " (sniffer failed, preventing loop)")
+                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP:443 dest=", destination, " (sniffer failed, preventing loop)")
                         return nil
                 }
         }
