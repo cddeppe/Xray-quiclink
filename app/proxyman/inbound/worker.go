@@ -454,48 +454,45 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 }
         }
 
-        // v26.11.110: Source-port-based conn cache.
-        // Maps srcKey → *udpConn (direct pointer, not connID).
+        // v26.11.115: Route ALL packets (long AND short headers) through the
+        // existing conn if one exists for this source port.
         //
-        // v26.11.111: If the conn has a directWrite callback (set by
-        // freedom.Process when the pooledConn was created), write DIRECTLY
-        // to the outbound socket — bypass the pipe entirely. This ensures
-        // ACKs reach Google with zero latency, without going through
-        // buf.Copy → PooledPacketWriter → pooledConn.WriteTo.
-        if len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                // Short header (1-RTT) — try the source-port conn cache
-                w.RLock()
-                if existingConn, found := w.connBySrc[id.srcKey]; found && !existingConn.done.Done() {
-                        // v26.11.111: Direct write bypass — if the conn has a
-                        // directWrite callback, write directly to the outbound
-                        // socket. This is the fastest path for ACKs.
-                        if existingConn.directWrite != nil {
-                                w.RUnlock()
-                                n, err := existingConn.directWrite(b.Bytes())
-                                existingConn.updateActivity()
-                                b.Release()
-                                // v26.11.112 DIAG: log directWrite usage
-                                if err != nil {
-                                        errors.LogWarning(context.Background(), "DIAG DW1 directWrite ERROR: n=", n, " err=", err, " src=", source)
-                                }
-                                return
-                        }
-                        // Fallback: write to pipe (for conns without directWrite)
+        // The v26.11.114 code only caught short headers. Long headers
+        // (retransmitted Initials, Handshake completions, 0-RTT) still
+        // created new conns → new sniffer → 127.0.0.1 → "dropping loopback".
+        //
+        // Fix: if connBySrc has an entry for this source port, write ANY
+        // packet to the existing conn's pipe. This means:
+        // - The existing conn's freedom.Process handles it
+        // - The existing outbound socket sends it to Google
+        // - No new conn, no new sniffer, no 127.0.0.1 loop
+        //
+        // For short headers with directWrite set, bypass the pipe entirely.
+        w.RLock()
+        if existingConn, found := w.connBySrc[id.srcKey]; found && !existingConn.done.Done() {
+                pktBytes := b.Bytes()
+                isShort := len(pktBytes) > 0 && pktBytes[0]&0x80 == 0
+                // v26.11.111: Direct write bypass for short headers.
+                if isShort && existingConn.directWrite != nil {
                         w.RUnlock()
-                        existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                        n, err := existingConn.directWrite(pktBytes)
                         existingConn.updateActivity()
+                        b.Release()
+                        if err != nil {
+                                errors.LogWarning(context.Background(), "DIAG DW1 directWrite ERROR: n=", n, " err=", err, " src=", source)
+                        }
                         return
                 }
+                // Long header or no directWrite — write to pipe
                 w.RUnlock()
+                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                existingConn.updateActivity()
+                return
+        }
+        w.RUnlock()
 
-                // v26.11.114: SILENT DROP for short headers with no existing conn.
-                // If connBySrc missed (conn doesn't exist or was closed), DON'T
-                // create a new conn — the sniffer can't extract SNI from short
-                // headers, so it would route to 127.0.0.1:443 → "dropping loopback".
-                // This pollutes connection state and creates spurious conns.
-                // Instead, silently drop the packet. QUIC retransmits dropped
-                // packets, so the client will retry. If the conn exists by then,
-                // connBySrc will catch it. If not, the packet is retransmitted again.
+        // v26.11.114: SILENT DROP for short headers with no existing conn.
+        if len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
                 b.Release()
                 return
         }
