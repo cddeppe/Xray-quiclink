@@ -3,7 +3,6 @@ package freedom
 import (
         "context"
         "errors"
-        "fmt"
         "io"
         stdnet "net"
         "strconv"
@@ -358,12 +357,10 @@ func (s *pooledSocket) readLoop() {
         // see malformed packets and demux replies to sessions that
         // couldn't read them. Memory cost: 64KB per pooled socket
         // (dozens of sockets total = ~1MB).
-        xrayerrors.LogWarning(context.Background(), "DIAG RL01 pooledSocket.readLoop START")
         b := make([]byte, 65535)
         for {
                 select {
                 case <-s.closed:
-                        xrayerrors.LogWarning(context.Background(), "DIAG RL02 readLoop EXIT (socket closed)")
                         return
                 default:
                 }
@@ -371,7 +368,6 @@ func (s *pooledSocket) readLoop() {
                 n, addr, err := s.conn.ReadFrom(b)
                 if err != nil {
                         if s.IsClosed() {
-                                xrayerrors.LogWarning(context.Background(), "DIAG RL02 readLoop EXIT (socket closed)")
                                 return
                         }
                         // v26.10.26-link: don't kill the shared socket on
@@ -381,10 +377,8 @@ func (s *pooledSocket) readLoop() {
                         // A single ICMP unreachable would kill all 50+ sessions
                         // sharing this socket.
                         if isTransientReadError(err) {
-                                xrayerrors.LogInfo(context.Background(), "DIAG RL03 readLoop transient read error, continuing: ", err)
                                 continue
                         }
-                        xrayerrors.LogInfo(context.Background(), "DIAG RL04 readLoop read error, marking socket dead: ", err)
                         s.MarkDead()
                         return
                 }
@@ -396,7 +390,6 @@ func (s *pooledSocket) readLoop() {
 
                 dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
-                        xrayerrors.LogWarning(context.Background(), "DIAG RL05 readLoop ParseDCID err=", err, " n=", n)
                         putPacket(packet)
                         continue
                 }
@@ -425,7 +418,6 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        xrayerrors.LogWarning(context.Background(), "DIAG RL06 readLoop demux MISS dcid=", fmt.Sprintf("%x", dcid[:min(len(dcid), 8)]), " n=", n)
                         // FIX: SCID-based fallback for 0-length SCID clients
                         // (Chrome/Edge). The server's reply DCID = client's SCID
                         // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
@@ -441,7 +433,6 @@ func (s *pooledSocket) readLoop() {
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
                                         if ok {
-                                                xrayerrors.LogWarning(context.Background(), "DIAG RL07 readLoop SCID fallback HIT scid=", fmt.Sprintf("%x", scid[:min(len(scid), 8)]))
                                         }
                                 }
                         }
@@ -460,17 +451,14 @@ func (s *pooledSocket) readLoop() {
                                         ch = s.lastActiveCh
                                         src = s.lastActiveSrc
                                         ok = true
-                                        xrayerrors.LogWarning(context.Background(), "DIAG RL12 readLoop LAST-ACTIVE fallback — delivering to most recent conn n=", n)
                                 }
                                 s.mu.RUnlock()
                         }
                         if !ok {
-                                xrayerrors.LogWarning(context.Background(), "DIAG RL08 readLoop demux MISS (all fallbacks missed) — DROPPING packet n=", n)
                                 putPacket(packet)
                                 continue
                         }
                 } else {
-                        xrayerrors.LogWarning(context.Background(), "DIAG RL09 readLoop demux HIT dcid=", fmt.Sprintf("%x", dcid[:min(len(dcid), 8)]), " n=", n)
                 }
 
                 // v26.11.84-link: CRITICAL FIX — after delivering via lastActiveCh
@@ -493,7 +481,6 @@ func (s *pooledSocket) readLoop() {
                                 if src != nil {
                                         s.demuxSource[dk] = src
                                 }
-                                xrayerrors.LogWarning(context.Background(), "DIAG RL13 readLoop REGISTERED DCID after fallback dcid=", fmt.Sprintf("%x", dcid[:min(len(dcid), 8)]))
                         }
                         s.mu.Unlock()
                 }
@@ -523,7 +510,6 @@ func (s *pooledSocket) readLoop() {
                         sentOk = true
                 default:
                         s.droppedReplies.Add(1)
-                        xrayerrors.LogWarning(context.Background(), "DIAG RL10 readLoop inbox FULL — DROPPING reply (session too slow)")
                         // v26.10.42-link (audit P3): return the pooled buffer
                         // when the inbox is full and we drop the packet.
                         putPacket(packet)
@@ -555,7 +541,6 @@ func (s *pooledSocket) readLoop() {
                                                 if src != nil {
                                                         s.demuxSource[scidKey] = src
                                                 }
-                                                xrayerrors.LogWarning(context.Background(), "DIAG RL11 readLoop REGISTERED server SCID in demux scid=", fmt.Sprintf("%x", scid[:min(len(scid), 8)]))
                                         }
                                         s.mu.Unlock()
                                 }
@@ -678,7 +663,6 @@ func (c *pooledConn) RegisterCID(cid []byte) {
                 }
                 c.socket.mu.Unlock()
                 c.mu.Unlock()
-                xrayerrors.LogWarning(context.Background(), "DIAG RC01 RegisterCID registered cid=", fmt.Sprintf("%x", cid[:min(len(cid), 8)]))
         }
 }
 
@@ -688,12 +672,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if c.closed.Load() {
                 return 0, io.EOF
         }
-
-        firstByte := byte(0)
-        if len(b) > 0 {
-                firstByte = b[0]
-        }
-        xrayerrors.LogWarning(context.Background(), "DIAG PC01 pooledConn.WriteTo ENTER len=", len(b), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " addr=", addr)
 
         // v26.10.15-link: only parse SCID for long headers (Initial,
         // 0-RTT, Handshake). Short headers (1-RTT, bit 7 = 0) don't
@@ -728,7 +706,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
-                xrayerrors.LogWarning(context.Background(), "DIAG PC02 pooledConn.WriteTo err=", err, " dest=", dest)
                 // v26.10.15-link: only mark the socket dead on persistent
                 // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
                 // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
@@ -740,7 +717,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.MarkDead()
                 }
         } else {
-                xrayerrors.LogWarning(context.Background(), "DIAG PC03 pooledConn.WriteTo OK n=", n, " dest=", dest)
                 // v26.11.80-link: track most recently active conn for 0-SCID fallback
                 c.socket.mu.Lock()
                 c.socket.lastActiveCh = c.inbox
@@ -753,21 +729,17 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
-        xrayerrors.LogWarning(context.Background(), "DIAG PC04 pooledConn.ReadFrom ENTER (waiting for reply)")
         select {
         case rr, ok := <-c.inbox:
                 if !ok {
-                        xrayerrors.LogWarning(context.Background(), "DIAG PC05 pooledConn.ReadFrom inbox closed (EOF)")
                         return 0, nil, io.EOF
                 }
                 n := copy(p, rr.data)
                 // v26.10.42-link (audit P3): return the pooled buffer
                 // after copying the data out.
                 putPacket(rr.data)
-                xrayerrors.LogWarning(context.Background(), "DIAG PC06 pooledConn.ReadFrom got reply n=", n, " from=", rr.addr)
                 return n, rr.addr, nil
         case <-c.done:
-                xrayerrors.LogWarning(context.Background(), "DIAG PC07 pooledConn.ReadFrom done channel closed (EOF)")
                 return 0, nil, io.EOF
         }
 }
@@ -972,18 +944,15 @@ func (r *PooledPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         // GRO-coalesced QUIC packets and coalesced Initial+Handshake+0-RTT
         // bundles that exceed 8KB, causing the QUIC parser to see malformed
         // packets and demux replies to sessions that couldn't read them.
-        xrayerrors.LogWarning(context.Background(), "DIAG PR01 PooledPacketReader.ReadMultiBuffer ENTER")
         b := buf.NewWithSize(65535)
         b.Resize(0, 65535)
 
         n, addr, err := r.conn.ReadFrom(b.Bytes())
         if err != nil {
                 b.Release()
-                xrayerrors.LogWarning(context.Background(), "DIAG PR02 PooledPacketReader.ReadFrom err=", err)
                 return nil, err
         }
         b.Resize(0, int32(n))
-        xrayerrors.LogWarning(context.Background(), "DIAG PR03 PooledPacketReader got reply n=", n, " from=", addr)
 
         if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
                 b.UDP = &xraynet.Destination{
@@ -1005,7 +974,6 @@ func NewPooledPacketWriter(conn *pooledConn, statWrite stats.Counter) *PooledPac
 }
 
 func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-        xrayerrors.LogWarning(context.Background(), "DIAG PW01 PooledPacketWriter.WriteMultiBuffer ENTER count=", len(mb))
         for {
                 mb2, b := buf.SplitFirst(mb)
                 mb = mb2
@@ -1023,19 +991,12 @@ func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                         destAddr = w.conn.socket.dest
                 }
 
-                firstByte := byte(0)
-                if len(b.Bytes()) > 0 {
-                        firstByte = b.Bytes()[0]
-                }
-                xrayerrors.LogWarning(context.Background(), "DIAG PW02 PooledPacketWriter calling WriteTo len=", len(b.Bytes()), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " dest=", destAddr)
                 n, err := w.conn.WriteTo(b.Bytes(), destAddr)
                 b.Release()
                 if err != nil {
-                        xrayerrors.LogWarning(context.Background(), "DIAG PW03 PooledPacketWriter WriteTo err=", err)
                         buf.ReleaseMulti(mb)
                         return err
                 }
-                xrayerrors.LogWarning(context.Background(), "DIAG PW04 PooledPacketWriter WriteTo OK n=", n)
                 if w.statWrite != nil {
                         w.statWrite.Add(int64(n))
                 }

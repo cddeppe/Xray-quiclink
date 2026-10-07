@@ -662,6 +662,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
                 errors.LogWarning(ctx, "DIAG P02 dialed conn dest=", destination, " network=", destination.Network, " pool=", h.socketPool != nil)
 
+        // v26.11.87-link: Populate lastQUICDestIP cache from ANY successful UDP dial.
+        // This ensures the cache is always populated, even when the sticky resolver
+        // is not configured or the destination was already an IP. The cached IP is
+        // used as a fallback when SNI extraction fails (chicken-and-egg deadlock).
+        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() {
+                ipCopy := destination.Address
+                lastQUICDestIP.Store(&ipCopy)
+                errors.LogWarning(ctx, "DIAG CQ02 cached QUIC dest IP from dial=", destination.Address)
+        }
+
         // For UDP pool: peek at the first packet to determine if it's QUIC.
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
@@ -886,26 +896,20 @@ type PacketReader struct {
 }
 
 func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
-        errors.LogWarning(context.Background(), "DIAG R01 PacketReader ENTER")
         b := buf.New()
         b.Resize(0, buf.Size)
         for {
                 n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
-            errors.LogWarning(context.Background(), "DIAG R02 ReadFrom returned")
                 if err != nil {
                         b.Release()
-                        errors.LogWarning(context.Background(), "DIAG R01 PacketReader.ReadFrom err=", err)
                         return nil, err
                 }
-                errors.LogWarning(context.Background(), "DIAG R02 PacketReader got reply n=", n, " from=", d)
                 udpAddr := d.(*net.UDPAddr)
-            errors.LogWarning(context.Background(), "DIAG R04 reply from=", udpAddr)
                 sourceAddr := net.IPAddress(udpAddr.IP)
                 if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
                         continue
                 }
                 b.Resize(0, int32(n))
-                        errors.LogWarning(context.Background(), "DIAG R07 reply resized n=", n)
 
                 // if udp dest addr is changed, we are unable to get the correct src addr
                 // so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
@@ -973,7 +977,6 @@ type PacketWriter struct {
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-        errors.LogWarning(context.Background(), "DIAG W01 PacketWriter ENTER count=", len(mb))
         for {
                 mb2, b := buf.SplitFirst(mb)
             errors.LogWarning(context.Background(), "DIAG W03 processing buffer")

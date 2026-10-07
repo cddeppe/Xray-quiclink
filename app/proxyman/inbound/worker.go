@@ -3,7 +3,6 @@ package inbound
 import (
         "context"
         "encoding/hex"
-        "fmt"
         stdnet "net"
         "strings"
         "sync"
@@ -654,9 +653,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 w.recordSrc(id, conn)
         }
 
-        errors.LogWarning(context.Background(), "DIAG W01 worker callback writing packet to pipe connID=", id.srcKey, " pktLen=", len(b.Bytes()), " firstByte=", fmt.Sprintf("%02x", b.Bytes()[0]))
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-        errors.LogWarning(context.Background(), "DIAG W02 worker callback wrote packet to pipe")
 
         if !existing {
                 common.Must(w.checker.Start())
