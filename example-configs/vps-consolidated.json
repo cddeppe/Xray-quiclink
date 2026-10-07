@@ -84,11 +84,15 @@
           "poolStalenessTimeout": 300,
           "poolIdleTimeout": 600,
           "poolUnusedTimeout": 300,
-          "stickyResolverTtl": 60,
+          "stickyResolverTtl": 300,
           "enableTcpWarmPool": true,
           "tcpWarmPoolTimeout": 30,
-          "preWarmFirstN": 5,
-          "preWarmLearnVisits": 3
+          "preWarmFirstN": 10,
+          "preWarmLearnVisits": 3,
+          "enableTcpWarmPoolHealthCheck": true,
+          "tcpWarmPoolMaxIdle": 120,
+          "tcpConnectTimeout": 10,
+          "edgeHealthCooldown": 30
         }
       }
     },
