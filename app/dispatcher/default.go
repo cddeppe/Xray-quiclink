@@ -343,6 +343,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 
 // DispatchLink implements routing.Dispatcher.
 func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
+        errors.LogWarning(ctx, "DIAG DL01 DispatchLink ENTER dest=", destination, " network=", destination.Network)
         if !destination.IsValid() {
                 return errors.New("Dispatcher: Invalid destination.")
         }
@@ -362,82 +363,59 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         outbound = WrapLink(ctx, d.policy, d.stats, outbound)
         sniffingRequest := content.SniffingRequest
         if !sniffingRequest.Enabled {
+                errors.LogWarning(ctx, "DIAG DL02 sniffing disabled — routedDispatch direct")
                 d.routedDispatch(ctx, outbound, destination)
+                errors.LogWarning(ctx, "DIAG DL03 routedDispatch returned (no sniffing)")
         } else {
-                // v26.11.74-link: for UDP, run the sniffer in a goroutine so it
-                // doesn't block the worker. The sniffer needs multiple packets for
-                // Chrome's ECH ClientHello (split across 2 QUIC packets). Running
-                // synchronously deadlocks: the worker can't deliver the 2nd packet
-                // while DispatchLink is blocking on the sniffer.
+                // v26.11.77-link: REVERTED the v26.11.74 goroutine change.
                 //
-                // For TCP, keep synchronous (TCP sniffing is fast — single packet).
-                if destination.Network == net.Network_UDP {
-                        errors.LogWarning(ctx, "DIAG D01 DispatchLink UDP dest=", destination, " sniffingEnabled=", sniffingRequest.Enabled, " metadataOnly=", sniffingRequest.MetadataOnly)
-                        cReader := &cachedReader{
-                                reader: outbound.Reader.(buf.TimeoutReader),
-                                cache:  make(buf.MultiBuffer, 0, 8),
-                        }
-                        outbound.Reader = cReader
-                        go func() {
-                                errors.LogWarning(ctx, "DIAG D02 UDP sniffer goroutine STARTED")
-                                result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-                                errors.LogWarning(ctx, "DIAG D03 UDP sniffer returned err=", err, " result=", result != nil)
-                                if err == nil {
-                                        content.Protocol = result.Protocol()
-                                }
-                                if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-                                        domain := result.Domain()
-                                        errors.LogInfo(ctx, "sniffed domain: ", domain)
-                                        errors.LogWarning(ctx, "DIAG D04 UDP SNI OVERRIDDEN domain=", domain)
-                                        destination.Address = net.ParseAddress(domain)
-                                        protocol := result.Protocol()
-                                        if resComp, ok := result.(SnifferResultComposite); ok {
-                                                protocol = resComp.ProtocolForDomainResult()
-                                        }
-                                        isFakeIP := false
-                                        if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
-                                                isFakeIP = true
-                                        }
-                                        if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
-                                                ob.RouteTarget = destination
-                                        } else {
-                                                ob.Target = destination
-                                        }
-                                } else {
-                                        errors.LogWarning(ctx, "UDP sniffer failed or timed out, using original dest=", destination)
-                                }
-                                d.routedDispatch(ctx, outbound, destination)
-                        }()
-                } else {
-                        cReader := &cachedReader{
-                                reader: outbound.Reader.(buf.TimeoutReader),
-                                cache:  make(buf.MultiBuffer, 0, 8),
-                        }
-                        outbound.Reader = cReader
-                        result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-                        if err == nil {
-                                content.Protocol = result.Protocol()
-                        }
-                        if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-                                domain := result.Domain()
-                                errors.LogInfo(ctx, "sniffed domain: ", domain)
-                                destination.Address = net.ParseAddress(domain)
-                                protocol := result.Protocol()
-                                if resComp, ok := result.(SnifferResultComposite); ok {
-                                        protocol = resComp.ProtocolForDomainResult()
-                                }
-                                isFakeIP := false
-                                if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
-                                        isFakeIP = true
-                                }
-                                if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
-                                        ob.RouteTarget = destination
-                                } else {
-                                        ob.Target = destination
-                                }
-                        }
-                        d.routedDispatch(ctx, outbound, destination)
+                // v26.11.74 ran the UDP sniffer in a goroutine to avoid a "deadlock"
+                // that never existed. The worker callback writes packets to the pipe
+                // (256KB buffer) and is NOT blocked by DispatchLink. DispatchLink is
+                // called from a SEPARATE goroutine (the worker's Process goroutine).
+                //
+                // The goroutine broke DispatchLink's blocking contract: dokodemo.Process
+                // expects DispatchLink to block until the outbound finishes. With the
+                // goroutine, DispatchLink returned immediately → dokodemo.Process
+                // returned → the worker called conn.Close() → the pipe was closed →
+                // the sniffer's context was cancelled before it could read ANY packet.
+                //
+                // With v26.11.75's truncated ClientHello fix, the sniffer extracts SNI
+                // from the 1st packet in <1ms. No deadlock, no need for a goroutine.
+                errors.LogWarning(ctx, "DIAG DL04 sniffing enabled — running SYNCHRONOUSLY (TCP+UDP same path) metadataOnly=", sniffingRequest.MetadataOnly)
+                cReader := &cachedReader{
+                        reader: outbound.Reader.(buf.TimeoutReader),
+                        cache:  make(buf.MultiBuffer, 0, 8),
                 }
+                outbound.Reader = cReader
+                result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+                errors.LogWarning(ctx, "DIAG DL05 sniffer returned err=", err, " result=", result != nil)
+                if err == nil {
+                        content.Protocol = result.Protocol()
+                }
+                if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+                        domain := result.Domain()
+                        errors.LogInfo(ctx, "sniffed domain: ", domain)
+                        errors.LogWarning(ctx, "DIAG DL06 SNI OVERRIDDEN domain=", domain, " dest was=", destination)
+                        destination.Address = net.ParseAddress(domain)
+                        protocol := result.Protocol()
+                        if resComp, ok := result.(SnifferResultComposite); ok {
+                                protocol = resComp.ProtocolForDomainResult()
+                        }
+                        isFakeIP := false
+                        if fkr0, ok := d.fdns.(dns.FakeDNSEngineRev0); ok && fkr0.IsIPInIPPool(ob.Target.Address) {
+                                isFakeIP = true
+                        }
+                        if sniffingRequest.RouteOnly && protocol != "fakedns" && protocol != "fakedns+others" && !isFakeIP {
+                                ob.RouteTarget = destination
+                        } else {
+                                ob.Target = destination
+                        }
+                } else {
+                        errors.LogWarning(ctx, "DIAG DL07 sniffer failed/timeout — using original dest=", destination)
+                }
+                d.routedDispatch(ctx, outbound, destination)
+                errors.LogWarning(ctx, "DIAG DL08 routedDispatch returned")
         }
 
         return nil

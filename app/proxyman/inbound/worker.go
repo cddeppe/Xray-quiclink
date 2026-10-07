@@ -3,6 +3,7 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        "fmt"
         stdnet "net"
         "strings"
         "sync"
@@ -581,7 +582,9 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 w.recordSrc(id, conn)
         }
 
+        errors.LogWarning(context.Background(), "DIAG W01 worker callback writing packet to pipe connID=", id.srcKey, " pktLen=", len(b.Bytes()), " firstByte=", fmt.Sprintf("%02x", b.Bytes()[0]))
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+        errors.LogWarning(context.Background(), "DIAG W02 worker callback wrote packet to pipe")
 
         if !existing {
                 common.Must(w.checker.Start())
@@ -622,15 +625,20 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
+                        errors.LogWarning(ctx, "DIAG W03 worker goroutine calling proxy.Process target=", outbounds[0].Target, " ctxErr=", ctx.Err())
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+                                errors.LogWarning(ctx, "DIAG W04 proxy.Process returned err=", err)
                         } else {
+                                errors.LogWarning(ctx, "DIAG W05 proxy.Process returned nil (OK)")
                         }
+                        errors.LogWarning(ctx, "DIAG W06 worker goroutine calling conn.Close()")
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better
                         if !conn.inactive {
                                 conn.setInactive()
                                 w.removeConn(id)
                         }
+                        errors.LogWarning(ctx, "DIAG W07 worker goroutine EXIT")
                 }()
         }
 }
