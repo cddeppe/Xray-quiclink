@@ -1,0 +1,14 @@
+[Unit]
+Description=Xray TPROXY Setup (iptables + routes)
+Before=xray.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/tproxy-setup.sh setup
+ExecStop=/usr/local/bin/tproxy-setup.sh cleanup
+
+[Install]
+WantedBy=multi-user.target
