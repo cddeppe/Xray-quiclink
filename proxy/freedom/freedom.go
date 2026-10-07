@@ -414,17 +414,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         input := link.Reader
         output := link.Writer
 
-        // v26.11.68-link: manual SNI extraction fallback. When the sniffer
-        // fails (no TPROXY), the destination stays as the inbound's listen
-        // address (loopback:443). The pool bypassed this by peeking the
-        // packet directly. Without the pool, we do the same: peek the first
-        // packet, check if it's QUIC, and try quic.SniffQUIC to extract SNI.
-        // If SniffQUIC returns ErrProtoNeedMoreData (ClientHello split across
-        // multiple packets), accumulate more packets and retry.
+        // v26.11.71-link: declare peekedPackets early so both the manual SNI
+        // extraction code and the pool peek code can use it.
         var peekedPackets buf.MultiBuffer
+
+        // v26.11.71-link: when the sniffer fails (no TPROXY), the destination
+        // stays as the inbound's listen address. On HOP1 this is loopback
+        // (0.0.0.0/127.0.0.1). On HOP2 this is HOP2's own IP (85.155.228.208).
+        // Both cause loops. Check if the destination IP is loopback OR if the
+        // destination is an IP (not a domain) — if the sniffer had succeeded,
+        // the destination would be a domain, not an IP.
         if destination.Network == net.Network_UDP && destination.Port == 443 {
-                destIP := destination.Address.IP()
-                if destIP.IsLoopback() || destIP.IsUnspecified() {
+                isLoopback := destination.Address.Family().IsIP() &&
+                        (destination.Address.IP().IsLoopback() || destination.Address.IP().IsUnspecified())
+                // Also check if it's an IP address (sniffer failed to override to domain)
+                isIPNotDomain := destination.Address.Family().IsIP()
+                if isLoopback || isIPNotDomain {
                         // Read packets and accumulate for SNI extraction
                         var accumulated []byte
                         for attempt := 0; attempt < 10; attempt++ {
@@ -681,7 +686,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
         // per-session socket path. This prevents the pool from breaking non-QUIC UDP.
         var pooledConn *pooledConn
-        // peekedPackets already declared above (v26.11.68-link)
         if destination.Network != net.Network_TCP && h.socketPool != nil {
                 mb, peekErr := input.ReadMultiBuffer()
                 if peekErr == nil && len(mb) > 0 {
