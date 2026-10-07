@@ -447,36 +447,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         id.dest = originalDest
                 }
                 b.UDP = &originalDest
-        } else {
-                // v26.10.78-link: when originalDest is invalid (no TPROXY /
-                // receiveOriginalDestAddress in the inbound sockopt), all UDP
-                // packets from the same source port map to the same connID
-                // {src, dest=zero}. This breaks when multiple QUIC connections
-                // (different DCIDs) arrive from the same source port — they all
-                // get mixed into one conn. Only the first QUIC Initial's SNI is
-                // used for routing; subsequent QUIC connections' data goes to
-                // the first connection's pipe, their handshake fails, and the
-                // client falls back to TCP.
-                //
-                // Fix: for QUIC long-header packets (Initials), parse the DCID
-                // and use it to create a unique id.dest. Different DCIDs produce
-                // different connIDs, so each QUIC connection gets its own conn +
-                // goroutine + sniffer + freedom dial.
-                //
-                // The synthetic dest is only used for connID comparison and
-                // pipe routing — the actual routing destination comes from the
-                // sniffer's SNI extraction in the dispatcher.
-                //
-                // For short-header (1-RTT) packets, the DCID is already
-                // registered in dcidIndex by the Initial, so tryQUICMigration
-                // handles routing. We only need the synthetic dest for Initials.
-                packetBytes := b.Bytes()
-                if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 {
-                        if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
-                                id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
-                        }
-                }
-        }
+	}
+	// v26.11.102-link: Do NOT create per-DCID synthetic dest.
+	// v26.11.54 did NOT have this — all packets from same source port → same conn.
+	// This is correct: first Initial sets up freedom.Process via SNI,
+	// and ALL subsequent packets (Initials, Handshakes, 1-RTT) flow through it.
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
