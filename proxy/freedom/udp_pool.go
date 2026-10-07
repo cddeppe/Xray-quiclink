@@ -49,6 +49,12 @@ type pooledSocket struct {
         lastReplyTime atomic.Int64  // UnixNano
         demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
         demuxSource   map[dcidKey]*stdnet.UDPAddr
+        // v26.11.80-link: tracks the most recently active conn's inbox and source.
+        // Used as a fallback when the server's Initial reply arrives with
+        // 0-length DCID (Chrome 0-SCID). The server's Initial DCID = Chrome's
+        // SCID = ∅, so demux misses. We deliver to the most recent conn instead.
+        lastActiveCh    chan<- readResult
+        lastActiveSrc   *stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -437,7 +443,26 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if !ok {
-                                xrayerrors.LogWarning(context.Background(), "DIAG RL08 readLoop demux MISS (SCID fallback also missed) — DROPPING packet n=", n)
+                                // v26.11.80-link: LAST-RESORT fallback for Chrome's
+                                // 0-length SCID. The server's Initial reply has
+                                // DCID = Chrome's SCID = ∅ (0 bytes). ParseDCID
+                                // returns empty, SCID fallback also misses (server's
+                                // SCID is new, not registered yet). We deliver to the
+                                // most recently active conn on this socket — the one
+                                // that just sent an Initial. QUIC will reject the
+                                // packet if the DCID doesn't match, so misdelivery
+                                // is harmless.
+                                s.mu.RLock()
+                                if s.lastActiveCh != nil {
+                                        ch = s.lastActiveCh
+                                        src = s.lastActiveSrc
+                                        ok = true
+                                        xrayerrors.LogWarning(context.Background(), "DIAG RL12 readLoop LAST-ACTIVE fallback — delivering to most recent conn n=", n)
+                                }
+                                s.mu.RUnlock()
+                        }
+                        if !ok {
+                                xrayerrors.LogWarning(context.Background(), "DIAG RL08 readLoop demux MISS (all fallbacks missed) — DROPPING packet n=", n)
                                 putPacket(packet)
                                 continue
                         }
@@ -681,6 +706,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 }
         } else {
                 xrayerrors.LogWarning(context.Background(), "DIAG PC03 pooledConn.WriteTo OK n=", n, " dest=", dest)
+                // v26.11.80-link: track most recently active conn for 0-SCID fallback
+                c.socket.mu.Lock()
+                c.socket.lastActiveCh = c.inbox
+                if c.source != nil {
+                        c.socket.lastActiveSrc = c.source
+                }
+                c.socket.mu.Unlock()
         }
         return n, err
 }
