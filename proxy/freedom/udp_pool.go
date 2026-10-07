@@ -473,6 +473,31 @@ func (s *pooledSocket) readLoop() {
                         xrayerrors.LogWarning(context.Background(), "DIAG RL09 readLoop demux HIT dcid=", fmt.Sprintf("%x", dcid[:min(len(dcid), 8)]), " n=", n)
                 }
 
+                // v26.11.84-link: CRITICAL FIX — after delivering via lastActiveCh
+                // fallback, register the DCID so future packets with the same DCID
+                // hit demux directly. Without this, EVERY 1-RTT packet from the server
+                // goes through lastActiveCh (a GUESS). With multiple QUIC connections
+                // sharing a socket, the guess is often wrong → packet delivered to
+                // wrong conn → QUIC silently drops it → right conn stalls → video freeze.
+                //
+                // By registering the DCID after delivery, only the FIRST packet with
+                // a new DCID goes through the lastActiveCh guess. All subsequent packets
+                // with the same DCID hit demux directly → correct delivery.
+                //
+                // This handles DCIDs issued via NEW_CONNECTION_ID frames (which the
+                // proxy can't see because they're encrypted in 1-RTT).
+                if len(dcid) > 0 {
+                        s.mu.Lock()
+                        if _, exists := s.demux[dk]; !exists {
+                                s.demux[dk] = ch
+                                if src != nil {
+                                        s.demuxSource[dk] = src
+                                }
+                                xrayerrors.LogWarning(context.Background(), "DIAG RL13 readLoop REGISTERED DCID after fallback dcid=", fmt.Sprintf("%x", dcid[:min(len(dcid), 8)]))
+                        }
+                        s.mu.Unlock()
+                }
+
                 // v26.10.21-link: non-blocking send with large channel (256).
                 //
                 // The blocking send (v26.10.20) was WRONG for the shared-socket
