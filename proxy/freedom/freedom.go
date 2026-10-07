@@ -437,14 +437,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // SNI → updates cache.
         if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
                 cachedIP := lastQUICDestIP.Load()
-                if cachedIP != nil && *cachedIP != nil {
+                // v26.11.92-link: NEVER use a loopback IP as the cached dest.
+                // If the cache was polluted with 127.0.0.1 (from a previous
+                // failed connection), treat it as "no cache" and drop.
+                if cachedIP != nil && *cachedIP != nil && !(*cachedIP).IP().IsLoopback() {
                         destination.Address = *cachedIP
                         destination.Network = net.Network_UDP
                         destination.Port = 443
                 } else {
                         common.Interrupt(input)
                         common.Close(output)
-                        return errors.New("dropping loopback UDP:443 — no cached QUIC destination")
+                        return errors.New("dropping loopback UDP:443 — no valid cached QUIC destination")
                 }
         }
 
@@ -502,7 +505,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // v26.11.86-link: cache the resolved IP for QUIC fallback.
                         // When a future QUIC connection's SNI extraction fails, we
                         // forward to this cached IP instead of dropping.
-                        if destination.Network == net.Network_UDP {
+                        // v26.11.92-link: NEVER cache loopback IPs.
+                        if destination.Network == net.Network_UDP && !stickyIP.IP().IsLoopback() {
                                 ipCopy := stickyIP
                                 lastQUICDestIP.Store(&ipCopy)
                         }
@@ -660,7 +664,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // This ensures the cache is always populated, even when the sticky resolver
         // is not configured or the destination was already an IP. The cached IP is
         // used as a fallback when SNI extraction fails (chicken-and-egg deadlock).
-        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() {
+        // v26.11.92-link: NEVER cache loopback IPs — they create infinite loops.
+        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && !destination.Address.IP().IsLoopback() {
                 ipCopy := destination.Address
                 lastQUICDestIP.Store(&ipCopy)
         }
