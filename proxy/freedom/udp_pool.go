@@ -677,6 +677,8 @@ func (c *pooledConn) Close() error {
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
+        // v26.11.106 DIAG: log pooledConn closure
+        xrayerrors.LogWarning(context.Background(), "DIAG C1 pooledConn.Close: closing conn, dest=", c.socket.dest)
         close(c.done)
 
         c.mu.Lock()

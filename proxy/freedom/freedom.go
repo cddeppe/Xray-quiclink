@@ -682,11 +682,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         plcy := h.policy()
         ctx, cancel := context.WithCancel(ctx)
         timer := signal.CancelAfterInactivity(ctx, func() {
+                // v26.11.106 DIAG: log when inactivity timer fires
+                if destination.Network != net.Network_TCP {
+                        errors.LogWarning(context.Background(), "DIAG D6 TIMER FIRED: ConnectionIdle=", plcy.Timeouts.ConnectionIdle, " dest=", destination)
+                }
                 cancel()
                 if newCancel != nil {
                         newCancel()
                 }
         }, plcy.Timeouts.ConnectionIdle)
+        if destination.Network != net.Network_TCP {
+                errors.LogWarning(context.Background(), "DIAG D1 freedom.Process UDP START: dest=", destination, " ConnectionIdle=", plcy.Timeouts.ConnectionIdle, " DownlinkOnly=", plcy.Timeouts.DownlinkOnly, " UplinkOnly=", plcy.Timeouts.UplinkOnly)
+        }
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
@@ -752,7 +759,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
 
                 // v26.10.69-link: For UDP, buf.Copy returns when the input
-                // pipe is exhausted (cachedReader EOF). The UDP connection
+                // is exhausted (cachedReader EOF). The UDP connection
                 // is still alive — block on inputCloser to keep the session
                 // alive while responseDone reads YouTube's response.
                 if destination.Network != net.Network_TCP {
@@ -761,7 +768,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // response to arrive. DownlinkOnly (default 1s) is
                         // too short for UDP — the response may take longer.
                         timer.SetTimeout(plcy.Timeouts.ConnectionIdle)
+                        // v26.11.106 DIAG: log when requestDone blocks on inputCloser
+                        errors.LogWarning(context.Background(), "DIAG D2 requestDone: buf.Copy done, blocking on inputCloser dest=", destination)
                         <-inputCloser
+                        // v26.11.106 DIAG: log when inputCloser fires
+                        errors.LogWarning(context.Background(), "DIAG D3 requestDone: inputCloser fired dest=", destination)
                 }
 
                 return nil
@@ -795,7 +806,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+                        // v26.11.106 DIAG: log response copy error
+                        if destination.Network != net.Network_TCP {
+                                errors.LogWarning(context.Background(), "DIAG D4 responseDone: buf.Copy error=", err, " dest=", destination)
+                        }
                         return errors.New("failed to process response").Base(err)
+                }
+                // v26.11.106 DIAG: log when responseDone finishes normally
+                if destination.Network != net.Network_TCP {
+                        errors.LogWarning(context.Background(), "DIAG D5 responseDone: buf.Copy finished normally dest=", destination)
                 }
                 return nil
         }
@@ -805,7 +824,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
+                // v26.11.106 DIAG: log when task.Run returns with error
+                if destination.Network != net.Network_TCP {
+                        errors.LogWarning(context.Background(), "DIAG D7 freedom.Process UDP END (error): dest=", destination, " err=", err)
+                }
                 return errors.New("connection ends").Base(err)
+        }
+        // v26.11.106 DIAG: log when task.Run returns normally
+        if destination.Network != net.Network_TCP {
+                errors.LogWarning(context.Background(), "DIAG D8 freedom.Process UDP END (normal): dest=", destination)
         }
 
         return nil
