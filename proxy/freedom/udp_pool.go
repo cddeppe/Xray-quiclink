@@ -47,16 +47,14 @@ type pooledSocket struct {
         lastUsed      atomic.Int64 // UnixNano
         lastReplyTime atomic.Int64  // UnixNano
         demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
-        // v26.11.99-link: lastActiveCh for delivering server Initial replies
-        // when Chrome uses 0-length SCID. Server's Initial reply has DCID=∅,
-        // which can't be demuxed. We deliver to the most recently active conn,
-        // then register the server's SCID from the reply so future packets
-        // (Handshake, 1-RTT) hit demux normally via the DCID (= server's SCID).
-        lastActiveCh  chan<- readResult
+        lastActiveCh  chan<- readResult // v26.11.101: for 0-SCID server Initial delivery
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
         // v26.10.15-link: dropped reply packets counter for observability.
+        // Incremented when the inbox channel (cap 32) is full and the
+        // readLoop drops a reply packet. QUIC will retransmit, but
+        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
 }
 
@@ -79,7 +77,10 @@ var packetPool = sync.Pool{
         },
 }
 
-func getPacket() []byte  { return *packetPool.Get().(*[]byte) }
+func getPacket() []byte  {
+        b := *packetPool.Get().(*[]byte)
+        return b[:cap(b)] // v26.11.101: reset len to full capacity
+}
 func putPacket(b []byte) { packetPool.Put(&b) }
 
 func makeDCIDKey(dcid []byte) dcidKey {
@@ -400,57 +401,37 @@ func (s *pooledSocket) readLoop() {
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
-                if !ok {
-                        // v26.11.99-link: Deliver server's Initial reply when Chrome uses 0-SCID.
-                        // Server's Initial has DCID=∅ (Chrome's SCID). demux can't route it.
-                        // Deliver to lastActiveCh (the most recently active conn), then
-                        // register the server's SCID from the reply so future packets
-                        // (Handshake, 1-RTT with DCID=server's SCID) hit demux normally.
-                        if len(dcid) == 0 && n > 0 && packet[0]&0x80 != 0 {
-                                // Long header with 0-length DCID = server's reply to 0-SCID client
-                                s.mu.RLock()
-                                ch = s.lastActiveCh
-                                s.mu.RUnlock()
-                                if ch != nil {
-                                        ok = true
-                                        // Register the server's SCID from this reply so future
-                                        // packets with DCID=serverSCID hit demux directly.
-                                        if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
-                                                scidKey := makeDCIDKey(scid)
-                                                s.mu.Lock()
-                                                if _, exists := s.demux[scidKey]; !exists {
-                                                        s.demux[scidKey] = ch
-                                                }
-                                                s.mu.Unlock()
-                                        }
-                                }
-                        }
-                        if !ok {
-                                putPacket(packet)
-                                continue
-                        }
-                }
+			if !ok {
+				// v26.11.101: Deliver server Initial reply for 0-SCID Chrome
+				if len(dcid) == 0 && n > 0 && packet[0]&0x80 != 0 {
+					s.mu.RLock()
+					ch = s.lastActiveCh
+					s.mu.RUnlock()
+					if ch != nil {
+						ok = true
+						if scid, _, serr := quic.ParseSCID(packet[:n]); serr == nil && len(scid) > 0 {
+							scidKey := makeDCIDKey(scid)
+							s.mu.Lock()
+							if _, exists := s.demux[scidKey]; !exists {
+								s.demux[scidKey] = ch
+							}
+							s.mu.Unlock()
+						}
+					}
+				}
+				if !ok {
+					putPacket(packet)
+					continue
+				}
+			}
 
-                // v26.10.21-link: non-blocking send with large channel (256).
-                //
-                // The blocking send (v26.10.20) was WRONG for the shared-socket
-                // model: one slow/stale session's full channel would block the
-                // entire readLoop, starving ALL other sessions sharing the same
-                // socket. This made YouTube stalls WORSE when swiping quickly
-                // between videos (many sessions, one stale session blocks all).
-                //
-                // The correct approach for a shared readLoop:
-                // 1. Large channel (256) so drops are rare during bursts
-                // 2. Non-blocking send so one slow session doesn't starve others
-                // 3. Track drops for observability
-                select {
-                case ch <- readResult{data: packet, addr: addr}:
-                default:
-                        s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
-                        putPacket(packet)
-                }
+		packetToSend := packet[:n] // v26.11.101: slice to actual length
+		select {
+		case ch <- readResult{data: packetToSend, addr: addr}:
+		default:
+			s.droppedReplies.Add(1)
+			putPacket(packet)
+		}
         }
 }
 
@@ -608,18 +589,16 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 dest = udp
         }
         n, err := c.socket.conn.WriteTo(b, dest)
-        if err != nil {
-                if !isTransientWriteError(err) {
-                        c.socket.MarkDead()
-                }
-        } else {
-                // v26.11.99-link: Update lastActiveCh so the server's Initial reply
-                // (which has DCID=∅ for 0-SCID Chrome) can be delivered.
-                c.socket.mu.Lock()
-                c.socket.lastActiveCh = c.inbox
-                c.socket.mu.Unlock()
-        }
-        return n, err
+	if err != nil {
+		if !isTransientWriteError(err) {
+			c.socket.MarkDead()
+		}
+	} else {
+		c.socket.mu.Lock()
+		c.socket.lastActiveCh = c.inbox
+		c.socket.mu.Unlock()
+	}
+	return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
