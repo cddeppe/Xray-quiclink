@@ -4,6 +4,7 @@ import (
         "context"
         "encoding/hex"
         stdnet "net"
+        "strings"
         "sync"
 
         "github.com/xtls/xray-core/common/protocol/quic"
@@ -219,13 +220,13 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 //
-// v26.11.58-link: SplitCoalesced + truncate fallback. Server replies
-// (Initial + Handshake coalesced via GSO) can be ~2400 bytes, which
-// exceeds path MTU on tunnels/PPPoE. SplitCoalesced splits into
-// individual QUIC packets (~1250 each). If SplitCoalesced fails to
-// parse (e.g. 0-RTT edge case), truncate to 1250 as a safety fallback
-// so the kernel never sees EMSGSIZE. The browser's QUIC stack will
-// retransmit the lost portion.
+// v26.11.64-link: SplitCoalesced with send-full-first fallback.
+// Server replies (Initial + Handshake coalesced via GSO) can be
+// ~2400 bytes. SplitCoalesced splits them into individual QUIC
+// packets (~1250 each). If SplitCoalesced fails to parse, try
+// sending the full packet first (kernel may fragment it). Only
+// truncate to 1250 as an absolute last resort if the full send
+// fails with EMSGSIZE.
 func (c *udpConn) Write(buf []byte) (int, error) {
         if len(buf) <= 1250 {
                 n, err := c.output(buf)
@@ -239,15 +240,32 @@ func (c *udpConn) Write(buf []byte) (int, error) {
         }
         offsets, splitErr := quic.SplitCoalesced(buf)
         if splitErr != nil || len(offsets) <= 1 {
-                // v26.11.58-link: SplitCoalesced failed. Truncate to 1250 bytes
-                // (RFC 9000 §14.1 minimum Initial size) instead of sending the
-                // full coalesced datagram. Prevents EMSGSIZE on paths with
-                // MTU < 2400. Browser's QUIC stack will retransmit.
-                truncated := buf[:1250]
-                n, err := c.output(truncated)
+                // v26.11.64-link: SplitCoalesced failed. Try sending the full
+                // packet first — the kernel may handle IP fragmentation.
+                // Only truncate if the send fails with EMSGSIZE.
+                n, err := c.output(buf)
                 if c.downlink != nil {
                         c.downlink.Add(int64(n))
                 }
+                if err == nil {
+                        c.updateActivity()
+                        return n, nil
+                }
+                // Check if it's EMSGSIZE
+                errStr := err.Error()
+                if strings.Contains(errStr, "message too long") || strings.Contains(errStr, "EMSGSIZE") {
+                        // Last resort: truncate to 1250
+                        truncated := buf[:1250]
+                        n2, err2 := c.output(truncated)
+                        if c.downlink != nil {
+                                c.downlink.Add(int64(n2))
+                        }
+                        if err2 == nil {
+                                c.updateActivity()
+                        }
+                        return n2, err2
+                }
+                // Other error — return as-is
                 if err == nil {
                         c.updateActivity()
                 }
