@@ -373,7 +373,6 @@ func isNetworkUnreachable(err error) bool {
 
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
-        errors.LogWarning(ctx, "DIAG P01 Process ENTER")
         outbounds := session.OutboundsFromContext(ctx)
         ob := outbounds[len(outbounds)-1]
         if !ob.Target.IsValid() {
@@ -439,12 +438,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
                 cachedIP := lastQUICDestIP.Load()
                 if cachedIP != nil && *cachedIP != nil {
-                        errors.LogWarning(ctx, "DIAG LB02 QUIC SNI failed — forwarding to cached QUIC dest IP=", *cachedIP, " (instead of dropping)")
                         destination.Address = *cachedIP
                         destination.Network = net.Network_UDP
                         destination.Port = 443
                 } else {
-                        errors.LogWarning(ctx, "DIAG LB01 dropping loopback UDP:443 (no cached QUIC dest yet) dest=", destination)
                         common.Interrupt(input)
                         common.Close(output)
                         return errors.New("dropping loopback UDP:443 — no cached QUIC destination")
@@ -508,7 +505,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         if destination.Network == net.Network_UDP {
                                 ipCopy := stickyIP
                                 lastQUICDestIP.Store(&ipCopy)
-                                errors.LogWarning(ctx, "DIAG CQ01 cached QUIC dest IP=", stickyIP, " for fallback (domain=", destination.Address, ")")
                         }
                 } else {
                         errors.LogInfoInner(ctx, err, "sticky: pre-resolve failed, falling back to normal resolution")
@@ -658,9 +654,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         } else {
                 defer conn.Close()
         }
-        errors.LogWarning(ctx, "DIAG P02 dialed dest=", destination, " pool=", h.socketPool != nil)
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
-                errors.LogWarning(ctx, "DIAG P02 dialed conn dest=", destination, " network=", destination.Network, " pool=", h.socketPool != nil)
 
         // v26.11.87-link: Populate lastQUICDestIP cache from ANY successful UDP dial.
         // This ensures the cache is always populated, even when the sticky resolver
@@ -669,7 +663,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() {
                 ipCopy := destination.Address
                 lastQUICDestIP.Store(&ipCopy)
-                errors.LogWarning(ctx, "DIAG CQ02 cached QUIC dest IP from dial=", destination.Address)
         }
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
@@ -715,9 +708,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 } else {
                 }
         } else if destination.Network != net.Network_TCP {
-                errors.LogWarning(ctx, "DIAG P03 PER-SESSION UDP (pool OFF) (pool OFF) dest=", destination)
         } else {
-                errors.LogWarning(ctx, "DIAG P04 TCP path dest=", destination)
         }
 
         var newCtx context.Context
@@ -736,7 +727,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }, plcy.Timeouts.ConnectionIdle)
 
         requestDone := func() error {
-        errors.LogWarning(ctx, "DIAG P07 requestDone START")
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
 
                 var writer buf.Writer
@@ -758,7 +748,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                         writer = NewPooledPacketWriter(pooledConn, statWrite)
                 } else {
-                        errors.LogWarning(ctx, "DIAG P05 per-session PacketWriter created")
                         writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
                         if h.config.Noises != nil {
                                 errors.LogDebug(ctx, "NOISE", h.config.Noises)
@@ -779,10 +768,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
-                errors.LogWarning(ctx, "DIAG P09 buf.Copy input->writer START")
                 if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-        errors.LogWarning(ctx, "DIAG P09 buf.Copy input->writer returned")
-                        errors.LogWarning(ctx, "DIAG P10 requestDone buf.Copy returned err=", err)
                         // v26.10.38-link: swallow ErrClosedPipe when inputCloser has
                         // fired (responseDone returned, so YouTube closed the outbound).
                         // Without this guard, the ErrClosedPipe propagates out of
@@ -802,13 +788,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
-                errors.LogWarning(ctx, "DIAG P09b buf.Copy returned nil (OK — all packets forwarded)")
 
                 return nil
         }
 
         responseDone := func() error {
-        errors.LogWarning(ctx, "DIAG P11 responseDone START (blocking on reply)")
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
@@ -833,14 +817,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 } else if pooledConn != nil {
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
-                        errors.LogWarning(ctx, "DIAG P06 per-session PacketReader created")
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-                        errors.LogWarning(ctx, "DIAG P13 responseDone buf.Copy returned err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
-                errors.LogWarning(ctx, "DIAG P13a responseDone buf.Copy returned nil (OK — all replies forwarded to Chrome)")
                 return nil
         }
 
@@ -849,7 +830,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
-        errors.LogWarning(ctx, "DIAG P16 task.Run returned")
                 return errors.New("connection ends").Base(err)
         }
 
@@ -979,14 +959,12 @@ type PacketWriter struct {
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
         for {
                 mb2, b := buf.SplitFirst(mb)
-            errors.LogWarning(context.Background(), "DIAG W03 processing buffer")
                 mb = mb2
                 if b == nil {
                         break
                 }
                 var n int
                 var err error
-                errors.LogWarning(context.Background(), "DIAG W04 b.UDP=", b.UDP, " override=", w.UDPOverride)
                         if b.UDP != nil {
                         if w.UDPOverride.Address != nil {
                                 b.UDP.Address = w.UDPOverride.Address
@@ -1035,10 +1013,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 b.Release()
                                 continue
                         }
-                        errors.LogWarning(context.Background(), "DIAG W07 calling WriteTo len=", len(b.Bytes()))
                                 n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
-            errors.LogWarning(context.Background(), "DIAG W07 WriteTo returned")
-                                errors.LogWarning(context.Background(), "DIAG W08 WriteTo n=", n, " err=", err)
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
                 }

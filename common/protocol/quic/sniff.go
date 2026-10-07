@@ -2,12 +2,10 @@ package quic
 
 import (
         "bytes"
-        "context"
         "crypto"
         "crypto/aes"
         "crypto/cipher"
         "encoding/binary"
-        "fmt"
         "io"
         "sync"
         "sync/atomic"
@@ -515,7 +513,6 @@ func (c *cursor) shortVarint() (int32, bool) {
 // ============================================================
 
 func SniffQUIC(b []byte) (*SniffHeader, error) {
-        errors.LogWarning(context.Background(), "DIAG Q01 SniffQUIC ENTER len=", len(b))
         if len(b) == 0 {
                 return nil, common.ErrNoClue
         }
@@ -537,15 +534,12 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
         // and string alloc on every 1-RTT packet. v26.10.35 skips all of
         // it — the cheap byte test below is the entire hot path for 1-RTT.
         if b[0]&0x80 == 0 {
-                errors.LogWarning(context.Background(), "DIAG Q02 short header (not Initial)")
                 return nil, errNotQUICInitial
         }
 
         // Long-header path: extract DCID, check cache, fall through to body.
         if key, ok := dcidKey(b); ok {
-                errors.LogWarning(context.Background(), "DIAG Q03 dcidKey extracted key=", key[:min(len(key), 16)])
                 state := globalSniffCache.get(key)
-                                errors.LogWarning(context.Background(), "DIAG Q04 cache check")
                 if sni, alpn, hasECH, ok := state.cachedResult(); ok {
                         return &SniffHeader{domain: sni, alpn: alpn, hasECH: hasECH}, nil
                 }
@@ -570,7 +564,6 @@ func SniffQUIC(b []byte) (*SniffHeader, error) {
 //   - switch-based version lookup (no map hash)
 //   - short-circuit CONNECTION_CLOSE (break out of frame loop)
 func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
-        errors.LogWarning(context.Background(), "DIAG Q06 sniffQUICBody ENTER len=", len(b), " firstByte=0x", fmt.Sprintf("%02x", b[0]))
         // v26.10.34-link (H2 fix): fast path — reject non-long-header packets
         // WITHOUT cloning. The sniffer only cares about long-header Initials;
         // short headers (1-RTT) and non-QUIC UDP fail here with 0 allocations.
@@ -630,7 +623,6 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                 case quicDraft29.ver:
                         spec = &quicDraft29
                 case quicV1.ver:
-                        errors.LogWarning(context.Background(), "DIAG Q08 version=QUICv1")
                         spec = &quicV1
                 case quicV2.ver:
                         spec = &quicV2
@@ -657,7 +649,6 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                         return nil, errNotQUIC
                 }
 
-                errors.LogWarning(context.Background(), "DIAG Q09 DCID=", fmt.Sprintf("%x", destConnID), " SCIDlen=", scidLen)
                 // Coalesced DCID consistency check (RFC 9000 §12.2).
                 if datagramDCID == nil {
                         datagramDCID = destConnID
@@ -894,7 +885,6 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                                                 tlsHdr := &ptls.SniffHeader{}
                                                 err := ptls.ReadClientHello(frameData, tlsHdr)
                                                 if err == nil {
-                                                        errors.LogWarning(context.Background(), "DIAG Q10 FAST PATH SNI extracted: domain=", tlsHdr.Domain(), " alpn=", tlsHdr.ALPN(), " hasECH=", tlsHdr.HasECH(), " cryptoLen=", length)
                                                         if state != nil {
                                                                 state.setResult(tlsHdr.Domain(), tlsHdr.ALPN(), tlsHdr.HasECH())
                                                         }
@@ -904,7 +894,6 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                                                                 hasECH: tlsHdr.HasECH(),
                                                         }, nil
                                                 }
-                                                errors.LogWarning(context.Background(), "DIAG Q10a fast path ReadClientHello err=", err, " cryptoLen=", length, " (v26.11.75: truncated ClientHello now extracts SNI from partial data)")
                                                 // Parse failed (incomplete ClientHello split
                                                 // across packets?) — fall through to the
                                                 // accumulation path and try again after
@@ -926,7 +915,6 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                         case 0x1c: // CONNECTION_CLOSE — connection is dying, no more useful CRYPTO
                                 break frameLoop
                         default:
-                                errors.LogWarning(context.Background(), "DIAG Q07 unknown version=0x", fmt.Sprintf("%08x", versionNumber))
                                 return nil, errNotQUICInitial
                         }
                 }
@@ -937,7 +925,6 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                         tlsHdr := &ptls.SniffHeader{}
                         err := ptls.ReadClientHello(cryptoDataBuf.BytesRange(0, cryptoLen), tlsHdr)
                         if err == nil {
-                                errors.LogWarning(context.Background(), "DIAG Q11 ACCUM PATH SNI extracted: domain=", tlsHdr.Domain(), " alpn=", tlsHdr.ALPN(), " hasECH=", tlsHdr.HasECH(), " cryptoLen=", cryptoLen)
                                 if state != nil {
                                         state.setResult(tlsHdr.Domain(), tlsHdr.ALPN(), tlsHdr.HasECH())
                                 }
@@ -947,13 +934,11 @@ func sniffQUICBody(b []byte, state *quicSniffState) (*SniffHeader, error) {
                                         hasECH: tlsHdr.HasECH(),
                                 }, nil
                         }
-                        errors.LogWarning(context.Background(), "DIAG Q11a accum path ReadClientHello err=", err, " cryptoLen=", cryptoLen)
                 }
 
                 b = restPayload
         }
 
-        errors.LogWarning(context.Background(), "DIAG Q12 SniffQUIC returning ErrProtoNeedMoreData (no SNI extracted from available packets)")
         return nil, protocol.ErrProtoNeedMoreData
 }
 

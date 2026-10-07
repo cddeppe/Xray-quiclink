@@ -244,7 +244,6 @@ func (c *udpConn) Write(buf []byte) (int, error) {
                                 dk := makeDCIDKey(scid)
                                 if _, exists := c.worker.dcidIndex[dk]; !exists {
                                         c.worker.dcidIndex[dk] = c.id
-                                        errors.LogInfo(context.Background(), "DIAG W08 udpConn.Write registered server SCID in dcidIndex scid=", hex.EncodeToString(scid[:min(len(scid), 8)]))
                                 }
                                 c.worker.Unlock()
                         }
@@ -519,116 +518,113 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
         }
-        if originalDest.IsValid() {
-                if !w.cone {
-                        id.dest = originalDest
-                }
-                b.UDP = &originalDest
-        } else {
-                // v26.10.78-link: when originalDest is invalid (no TPROXY /
-                // receiveOriginalDestAddress in the inbound sockopt), all UDP
-                // packets from the same source port map to the same connID
-                // {src, dest=zero}. This breaks when multiple QUIC connections
-                // (different DCIDs) arrive from the same source port — they all
-                // get mixed into one conn. Only the first QUIC Initial's SNI is
-                // used for routing; subsequent QUIC connections' data goes to the
-                // first connection's pipe, their handshake fails, and the client
-                // falls back to TCP.
-                //
-                // Fix: for QUIC long-header packets (Initials), parse the DCID
-                // and use it to create a unique id.dest. Different DCIDs produce
-                // different connIDs, so each QUIC connection gets its own conn +
-                // goroutine + sniffer + freedom dial.
-                //
-                // The synthetic dest is only used for connID comparison and
-                // pipe routing — the actual routing destination comes from the
-                // sniffer's SNI extraction in the dispatcher.
-                //
-                // For short-header (1-RTT) packets, the DCID is already
-                // registered in dcidIndex by the Initial, so tryQUICMigration
-                // handles routing. We only need the synthetic dest for Initials.
-                //
-                // v26.11.56-link: this block was removed in v26.11.54's history
-                // rewrite and restored here. Without it, parallel QUIC
-                // connections from the same source port (YouTube's DASH
-                // streaming) collapse into one conn and the handshake fails.
-                packetBytes := b.Bytes()
-                if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 {
-                        if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
-                                id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
-                        } else {
-                        }
-                } else {
-                }
-        }
-        // v26.11.52-link: Solution A — for short headers with no id.dest,
-        // look up the existing conn by srcKey and reuse its id.dest so
-        // getConnection finds the same conn. This avoids creating a new
-        // conn → new DispatchLink → sniffing fails (no SNI) → 127.0.0.1
-        // loop → freeze.
-        //
-        // v26.11.56-link: restored (was removed in v26.11.54's rewrite).
-        // Without this, 1-RTT short headers create a new conn, the sniffer
-        // can't extract SNI (short headers don't carry it), and the packet
-        // is routed to 127.0.0.1:443 — a packet loop that kills the QUIC
-        // connection and forces TCP fallback.
-        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                w.RLock()
-                if existingID, found := w.srcIndex[id.srcKey]; found {
-                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                w.RUnlock()
-                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                existingConn.updateActivity()
-                                return
-                        } else {
-                        }
-                } else {
-                }
-                w.RUnlock()
-        }
+	if originalDest.IsValid() {
+		if !w.cone {
+			id.dest = originalDest
+		}
+		b.UDP = &originalDest
+	} else {
+		// v26.11.91-link: COMPREHENSIVE FIX based on lessons from v26.11.75-90.
+		//
+		// Only QUIC Initials create new conns (for SNI extraction).
+		// Non-Initial packets ALWAYS go to existing conns.
+		// If no existing conn is found, DROP the packet.
+		// Chrome retransmits the Initial, which creates the conn properly.
+		//
+		// This is the KEY insight from 50+ builds:
+		// Creating a new conn for a non-Initial is ALWAYS wrong because:
+		//   - The sniffer can't extract SNI from non-Initials
+		//   - The packet goes to 127.0.0.1:443 (loopback) or wrong cached IP
+		//   - This corrupts the pool's demux and causes video stalls
+		//
+		// By dropping non-Initials without a conn, Chrome retransmits the
+		// Initial, which creates the conn with proper SNI extraction.
+		// Once the conn exists, all subsequent packets (including non-Initials)
+		// are delivered to it naturally.
+		packetBytes := b.Bytes()
+		isQUICInitial := false
+		if len(packetBytes) > 0 && packetBytes[0]&0x80 != 0 && packetBytes[0]&0x40 != 0 {
+			// Long header — check if it's an Initial (type=0)
+			pktType := (packetBytes[0] & 0x30) >> 4
+			if pktType == 0 {
+				isQUICInitial = true
+				// Set id.dest from DCID for Initials (unique connID per connection)
+				if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) >= 4 {
+					id.dest = net.UDPDestination(net.IPAddress(dcid[:4]), 443)
+				}
+			}
+		}
 
-        // v26.11.85-link: CRITICAL FIX — for 1-RTT short-header packets from
-        // unknown source ports (Chrome connection migration), tryQUICMigration
-        // and srcIndex both miss. Instead of creating a new conn (which runs
-        // the sniffer, which always fails on short headers, and drops the
-        // packet), deliver to the most recently active conn on this worker.
-        //
-        // The most recently active conn is the one that just sent/received
-        // data — it's the most likely owner of this 1-RTT packet. QUIC will
-        // silently drop the packet if the DCID doesn't match, so misdelivery
-        // is harmless. But correct delivery keeps the video flowing.
-        //
-        // Without this, Chrome's connection migration (new source port) causes
-        // 1-RTT data packets to be dropped → video stalls.
-        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                w.RLock()
-                var lastActiveConn *udpConn
-                var lastActiveTime int64
-                for _, c := range w.activeConn {
-                        if c.done.Done() {
-                                continue
-                        }
-                        t := atomic.LoadInt64(&c.lastActivityTime)
-                        if t > lastActiveTime {
-                                lastActiveTime = t
-                                lastActiveConn = c
-                        }
-                }
-                w.RUnlock()
-                if lastActiveConn != nil {
-                        errors.LogWarning(context.Background(), "DIAG W08a worker delivering 1-RTT to most recently active conn (migration fallback)")
-                        lastActiveConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                        lastActiveConn.updateActivity()
-                        return
-                }
-        }
+		// For non-Initial QUIC packets, find an existing conn.
+		// NEVER create a new conn for non-Initials.
+		if !isQUICInitial {
+			// 1. Try dcidIndex (DCID -> connID, handles migration/CID rotation)
+			if len(packetBytes) > 0 {
+				if dcid, _, err := quic.ParseDCID(packetBytes); err == nil && len(dcid) > 0 {
+					dk := makeDCIDKey(dcid)
+					w.RLock()
+					if existingID, found := w.dcidIndex[dk]; found {
+						if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+							w.RUnlock()
+							existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+							existingConn.updateActivity()
+							return
+						}
+					}
+					w.RUnlock()
+				}
+			}
 
-        migratedConn := w.tryQUICMigration(b.Bytes(), id)
-        if migratedConn != nil {
-                migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                migratedConn.updateActivity()
-                return
-        }
+			// 2. Try srcIndex (same source port — most common path)
+			w.RLock()
+			if existingID, found := w.srcIndex[id.srcKey]; found {
+				if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+					w.RUnlock()
+					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+					existingConn.updateActivity()
+					return
+				}
+			}
+			w.RUnlock()
+
+			// 3. Try most recently active conn (migration fallback)
+			w.RLock()
+			var lastActiveConn *udpConn
+			var lastActiveTime int64
+			for _, c := range w.activeConn {
+				if c.done.Done() {
+					continue
+				}
+				t := atomic.LoadInt64(&c.lastActivityTime)
+				if t > lastActiveTime {
+					lastActiveTime = t
+					lastActiveConn = c
+				}
+			}
+			w.RUnlock()
+			if lastActiveConn != nil {
+				lastActiveConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+				lastActiveConn.updateActivity()
+				return
+			}
+
+			// No existing conn found — DROP the packet.
+			// Chrome will retransmit the Initial, which creates the conn properly.
+			// This is correct behavior: we can't route a non-Initial without
+			// knowing which QUIC connection it belongs to.
+			b.Release()
+			return
+		}
+	}
+
+	// For Initials (and TCP), fall through to getConnection which creates
+	// a new conn and runs the sniffer for SNI extraction.
+	migratedConn := w.tryQUICMigration(b.Bytes(), id)
+	if migratedConn != nil {
+		migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+		migratedConn.updateActivity()
+		return
+	}
 
         conn, existing := w.getConnection(id)
 
@@ -694,20 +690,15 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
-                        errors.LogWarning(ctx, "DIAG W03 worker goroutine calling proxy.Process target=", outbounds[0].Target, " ctxErr=", ctx.Err())
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogWarning(ctx, "DIAG W04 proxy.Process returned err=", err)
                         } else {
-                                errors.LogWarning(ctx, "DIAG W05 proxy.Process returned nil (OK)")
                         }
-                        errors.LogWarning(ctx, "DIAG W06 worker goroutine calling conn.Close()")
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better
                         if !conn.inactive {
                                 conn.setInactive()
                                 w.removeConn(id)
                         }
-                        errors.LogWarning(ctx, "DIAG W07 worker goroutine EXIT")
                 }()
         }
 }
