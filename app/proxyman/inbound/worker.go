@@ -471,9 +471,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         // socket. This is the fastest path for ACKs.
                         if existingConn.directWrite != nil {
                                 w.RUnlock()
-                                existingConn.directWrite(b.Bytes())
+                                n, err := existingConn.directWrite(b.Bytes())
                                 existingConn.updateActivity()
                                 b.Release()
+                                // v26.11.112 DIAG: log directWrite usage
+                                if err != nil {
+                                        errors.LogWarning(context.Background(), "DIAG DW1 directWrite ERROR: n=", n, " err=", err, " src=", source)
+                                }
                                 return
                         }
                         // Fallback: write to pipe (for conns without directWrite)
