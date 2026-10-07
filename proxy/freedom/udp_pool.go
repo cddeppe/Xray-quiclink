@@ -84,7 +84,10 @@ var packetPool = sync.Pool{
         },
 }
 
-func getPacket() []byte  { return *packetPool.Get().(*[]byte) }
+func getPacket() []byte  {
+        b := *packetPool.Get().(*[]byte)
+        return b[:cap(b)] // v26.11.81-link: reset len to full capacity
+}
 func putPacket(b []byte) { packetPool.Put(&b) }
 
 func makeDCIDKey(dcid []byte) dcidKey {
@@ -483,8 +486,15 @@ func (s *pooledSocket) readLoop() {
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
                 sentOk := false
+                // v26.11.81-link: CRITICAL FIX — slice packet to actual length n
+                // before sending. getPacket() returns a 65535-byte buffer; without
+                // slicing, copy(p, rr.data) in ReadFrom copies all 65535 bytes
+                // (including garbage), and Chrome receives a malformed 65535-byte
+                // QUIC packet instead of the actual n-byte reply. This silently
+                // broke ALL QUIC replies → video freeze.
+                packetToSend := packet[:n]
                 select {
-                case ch <- readResult{data: packet, addr: addr}:
+                case ch <- readResult{data: packetToSend, addr: addr}:
                         sentOk = true
                 default:
                         s.droppedReplies.Add(1)
