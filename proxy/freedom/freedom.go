@@ -4,7 +4,6 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
-        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -21,7 +20,6 @@ import (
         "github.com/xtls/xray-core/common/geodata"
         "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/common/platform"
-        "github.com/xtls/xray-core/common/protocol/quic"
         "github.com/xtls/xray-core/common/retry"
         "github.com/xtls/xray-core/common/session"
         "github.com/xtls/xray-core/common/signal"
@@ -418,64 +416,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // extraction code and the pool peek code can use it.
         var peekedPackets buf.MultiBuffer
 
-        // v26.11.71-link: when the sniffer fails (no TPROXY), the destination
-        // stays as the inbound's listen address. On HOP1 this is loopback
-        // (0.0.0.0/127.0.0.1). On HOP2 this is HOP2's own IP (85.155.228.208).
-        // Both cause loops. Check if the destination IP is loopback OR if the
-        // destination is an IP (not a domain) — if the sniffer had succeeded,
-        // the destination would be a domain, not an IP.
+        // v26.11.73-link: REMOVED manual SNI extraction (caused deadlock).
+        // The manual SNI extraction blocked freedom.Process waiting for
+        // the 2nd QUIC packet. But the worker callback delivers packets
+        // to the pipe, and it can't deliver the 2nd packet until
+        // freedom.Process returns → DEADLOCK → 389ms delay → Chrome falls
+        // back to TCP.
+        //
+        // Instead: when the destination is an IP (sniffer failed), forward
+        // the packet immediately to that IP. The IP is HOP2's address (via
+        // DNS hijack). HOP2's dispatcher sniffer has a 200ms timeout built
+        // in — it can wait for the 2nd packet properly.
+        //
+        // The only exception: loopback (127.0.0.1 / 0.0.0.0) — these would
+        // cause an infinite loop. Drop those.
         if destination.Network == net.Network_UDP && destination.Port == 443 {
-                isLoopback := destination.Address.Family().IsIP() &&
-                        (destination.Address.IP().IsLoopback() || destination.Address.IP().IsUnspecified())
-                // Also check if it's an IP address (sniffer failed to override to domain)
-                isIPNotDomain := destination.Address.Family().IsIP()
-                if isLoopback || isIPNotDomain {
-                        // Read packets and accumulate for SNI extraction
-                        var accumulated []byte
-                        for attempt := 0; attempt < 10; attempt++ {
-                                mb, peekErr := input.ReadMultiBuffer()
-                                if peekErr != nil {
-                                        errors.LogWarning(ctx, "DIAG P19 peek failed err=", peekErr, " attempt=", attempt)
-                                        return nil
-                                }
-                                peekedPackets = append(peekedPackets, mb...)
-                                for _, b := range mb {
-                                        accumulated = append(accumulated, b.Bytes()...)
-                                }
-                                if len(accumulated) == 0 {
-                                        continue
-                                }
-                                firstByte := accumulated[0]
-                                if firstByte&0x80 == 0 || firstByte&0x40 == 0 {
-                                        errors.LogWarning(ctx, "DIAG P22 not QUIC long header firstByte=0x", fmt.Sprintf("%02x", firstByte))
-                                        return nil
-                                }
-                                result, sniffErr := quic.SniffQUIC(accumulated)
-                                if sniffErr == nil && result != nil {
-                                        domain := result.Domain()
-                                        if domain != "" {
-                                                errors.LogWarning(ctx, "DIAG P20 manual SNI extraction SUCCEEDED domain=", domain, " after ", attempt+1, " packets len=", len(accumulated))
-                                                destination = net.UDPDestination(net.DomainAddress(domain), 443)
-                                                goto skipLoopbackDrop
-                                        }
-                                }
-                                // Check if it's "need more data" — try reading another packet
-                                if sniffErr != nil {
-                                        errStr := sniffErr.Error()
-                                        if strings.Contains(errStr, "need more data") {
-                                                errors.LogWarning(ctx, "DIAG P23 need more data, reading next packet attempt=", attempt+1, " accLen=", len(accumulated))
-                                                continue
-                                        }
-                                        // Hard error — can't sniff
-                                        errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed err=", sniffErr, " pktLen=", len(accumulated), " firstByte=0x", fmt.Sprintf("%02x", firstByte))
-                                        return nil
-                                }
-                        }
-                        // Exhausted retries — drop to prevent loop
-                        errors.LogWarning(ctx, "DIAG P21 SniffQUIC exhausted retries, dropping accLen=", len(accumulated))
+                destIP := destination.Address.IP()
+                if destIP.IsLoopback() || destIP.IsUnspecified() {
+                        errors.LogWarning(ctx, "DIAG P19 dropping loopback UDP:443 (would loop)")
                         return nil
                 }
-        skipLoopbackDrop:
+                // Destination is a real IP (HOP2's address via DNS hijack).
+                // Forward immediately — no SNI extraction needed.
+                errors.LogWarning(ctx, "DIAG P30 forwarding UDP:443 to IP=", destIP, " (sniffer failed, forwarding to next hop)")
         }
 
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
