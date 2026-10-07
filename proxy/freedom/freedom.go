@@ -20,6 +20,7 @@ import (
         "github.com/xtls/xray-core/common/geodata"
         "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/common/platform"
+        "github.com/xtls/xray-core/common/protocol/quic"
         "github.com/xtls/xray-core/common/retry"
         "github.com/xtls/xray-core/common/session"
         "github.com/xtls/xray-core/common/signal"
@@ -632,7 +633,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        // v26.11.62-link: use AcquireForDCID to reuse an existing
+                                        // pooledConn if one already exists for this DCID. This keeps
+                                        // the conn alive across Process calls so Google's ~50ms-late
+                                        // reply is delivered instead of dropped.
+                                        var dcid []byte
+                                        if pktBytes := mb[0].Bytes(); len(pktBytes) > 0 {
+                                                if d, _, e := quic.ParseDCID(pktBytes); e == nil {
+                                                        dcid = d
+                                                }
+                                        }
+                                        pooledConn, err = h.socketPool.AcquireForDCID(udpRemote, dcid)
                                         if err != nil {
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
@@ -644,7 +655,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         Port: int(inbound.Source.Port),
                                                 }
                                         }
-                                        defer pooledConn.Close()
+                                        // v26.11.62-link: Release (not Close) — decrements refcount,
+                                        // starts 5s idle timer. Conn stays alive for Google's reply.
+                                        defer pooledConn.Release()
                                         outGateway = nil
                                 }
                         } else {

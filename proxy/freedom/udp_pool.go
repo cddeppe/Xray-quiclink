@@ -46,7 +46,7 @@ type pooledSocket struct {
         // mutex contention on the readLoop hot path.
         lastUsed      atomic.Int64 // UnixNano
         lastReplyTime atomic.Int64  // UnixNano
-        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
+        demux         map[dcidKey]*pooledConn // v26.11.62-link: was chan<- readResult, now *pooledConn so inbox survives Process return
         demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
@@ -114,7 +114,21 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+
+        // v26.11.62-link: refCount tracks active freedom.Process calls
+        // using this conn. Release() decrements it; when it hits 0, an
+        // idle timer starts. If no new AcquireForDCID comes in within
+        // idleTimeoutConn, the conn is actually closed and removed from
+        // demux. This keeps the conn alive for Google's ~50ms-late reply.
+        refCount  atomic.Int32
+        idleTimer *time.Timer
+        idleMu    sync.Mutex
 }
+
+// idleTimeoutConn is how long a pooledConn stays alive after the last
+// freedom.Process releases it. Must be longer than the QUIC handshake
+// RTT (typically 50-150ms) but short enough to avoid unbounded growth.
+const idleTimeoutConn = 5 * time.Second
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
         p := &UDPSocketPool{
@@ -293,7 +307,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
-                        demux:         make(map[dcidKey]chan<- readResult),
+                        demux:         make(map[dcidKey]*pooledConn),
                         demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
@@ -332,7 +346,51 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
+        conn.refCount.Store(1) // v26.11.62: initial refcount for this Process call
         return conn, nil
+}
+
+// v26.11.62-link: AcquireForDCID checks if a pooledConn already exists
+// for this DCID. If so, it increments the refcount and returns it.
+// This is the key to keeping the conn alive across Process calls.
+func (p *UDPSocketPool) AcquireForDCID(dest *stdnet.UDPAddr, dcid []byte) (*pooledConn, error) {
+        if len(dcid) == 0 {
+                return p.Acquire(dest)
+        }
+
+        dk := makeDCIDKey(dcid)
+        key := destKey(dest)
+
+        p.mu.Lock()
+        sock, ok := p.sockets[key]
+        if ok && (sock.IsClosed() || sock.IsDead()) {
+                delete(p.sockets, key)
+                ok = false
+        }
+        if ok {
+                // Check if a pooledConn already exists for this DCID
+                sock.mu.RLock()
+                existingConn, found := sock.demux[dk]
+                sock.mu.RUnlock()
+
+                if found && !existingConn.closed.Load() {
+                        // Reuse the existing conn! Increment refcount.
+                        existingConn.refCount.Add(1)
+                        // Cancel any pending idle timer
+                        existingConn.idleMu.Lock()
+                        if existingConn.idleTimer != nil {
+                                existingConn.idleTimer.Stop()
+                                existingConn.idleTimer = nil
+                        }
+                        existingConn.idleMu.Unlock()
+                        p.mu.Unlock()
+                        return existingConn, nil
+                }
+        }
+        p.mu.Unlock()
+
+        // No existing conn for this DCID — create new one
+        return p.Acquire(dest)
 }
 
 func (s *pooledSocket) readLoop() {
@@ -391,7 +449,7 @@ func (s *pooledSocket) readLoop() {
                 // locks). The demux map is only mutated by RegisterCID
                 // and Close (which use Lock), so RLock is correct here.
                 s.mu.RLock()
-                ch, ok := s.demux[dk]
+                pc, ok := s.demux[dk]
                 src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
@@ -417,7 +475,7 @@ func (s *pooledSocket) readLoop() {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
                                         s.mu.RLock()
-                                        ch, ok = s.demux[scidKey]
+                                        pc, ok = s.demux[scidKey]
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
                                 }
@@ -440,16 +498,27 @@ func (s *pooledSocket) readLoop() {
                 // 1. Large channel (256) so drops are rare during bursts
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
+                // v26.11.62-link: send to the pooledConn's inbox. The conn
+                // stays alive across Process calls (via refCount + idleTimer),
+                // so this works even after Process returns. The select/default
+                // prevents one slow conn from blocking the readLoop.
+                // panic-safe: if inbox was closed (shouldn't happen with new
+                // lifecycle, but safety first), recover and drop the packet.
                 sentOk := false
-                select {
-                case ch <- readResult{data: packet, addr: addr}:
-                        sentOk = true
-                default:
-                        s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
-                        putPacket(packet)
-                }
+                func() {
+                        defer func() {
+                                if r := recover(); r != nil {
+                                        putPacket(packet)
+                                }
+                        }()
+                        select {
+                        case pc.inbox <- readResult{data: packet, addr: addr}:
+                                sentOk = true
+                        default:
+                                s.droppedReplies.Add(1)
+                                putPacket(packet)
+                        }
+                }()
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
@@ -571,7 +640,8 @@ func (c *pooledConn) RegisterCID(cid []byte) {
                         return
                 }
                 c.socket.mu.Lock()
-                c.socket.demux[dk] = c.inbox
+                // v26.11.62-link: demux value is now *pooledConn (not chan<-)
+                c.socket.demux[dk] = c
                 if c.source != nil {
                         c.socket.demuxSource[dk] = c.source
                 }
@@ -654,23 +724,41 @@ func (c *pooledConn) IsClosed() bool {
         return c.closed.Load()
 }
 
-func (c *pooledConn) Close() error {
-        // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
+// v26.11.62-link: Release replaces Close in freedom.go. It decrements
+// the refcount and starts an idle timer. If no new AcquireForDCID comes
+// in within idleTimeoutConn, the conn is actually closed and removed
+// from demux. This keeps the conn alive for Google's ~50ms-late reply.
+func (c *pooledConn) Release() {
+        newCount := c.refCount.Add(-1)
+        if newCount > 0 {
+                // Other Process calls are still using this conn — don't close
+                return
+        }
+
+        // refCount == 0 — start idle timer
+        c.idleMu.Lock()
+        if c.idleTimer != nil {
+                c.idleTimer.Stop()
+        }
+        c.idleTimer = time.AfterFunc(idleTimeoutConn, func() {
+                c.actualClose()
+        })
+        c.idleMu.Unlock()
+}
+
+// actualClose does the real close — removes DCID from demux and closes
+// the inbox. Called by the idle timer after idleTimeoutConn of no activity.
+func (c *pooledConn) actualClose() {
         if !c.closed.CompareAndSwap(false, true) {
-                return nil
+                return
         }
         close(c.done)
 
+        // Remove DCID entries from demux
         c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
         c.socket.mu.Lock()
         for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+                if existing, ok := c.socket.demux[dk]; ok && existing == c {
                         delete(c.socket.demux, dk)
                         delete(c.socket.demuxSource, dk)
                 }
@@ -679,6 +767,22 @@ func (c *pooledConn) Close() error {
         c.mu.Unlock()
 
         c.socket.release()
+}
+
+// Close is kept for backward compatibility (tests use it).
+// It does an immediate close without waiting for the idle timer.
+func (c *pooledConn) Close() error {
+        // Cancel any pending idle timer
+        c.idleMu.Lock()
+        if c.idleTimer != nil {
+                c.idleTimer.Stop()
+                c.idleTimer = nil
+        }
+        c.idleMu.Unlock()
+
+        // Force refCount to 0 so Release doesn't interfere
+        c.refCount.Store(0)
+        c.actualClose()
         return nil
 }
 
