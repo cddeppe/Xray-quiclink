@@ -218,6 +218,14 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 }
 
 // Write implements io.Writer.
+//
+// v26.11.58-link: SplitCoalesced + truncate fallback. Server replies
+// (Initial + Handshake coalesced via GSO) can be ~2400 bytes, which
+// exceeds path MTU on tunnels/PPPoE. SplitCoalesced splits into
+// individual QUIC packets (~1250 each). If SplitCoalesced fails to
+// parse (e.g. 0-RTT edge case), truncate to 1250 as a safety fallback
+// so the kernel never sees EMSGSIZE. The browser's QUIC stack will
+// retransmit the lost portion.
 func (c *udpConn) Write(buf []byte) (int, error) {
         if len(buf) <= 1250 {
                 n, err := c.output(buf)
@@ -231,7 +239,12 @@ func (c *udpConn) Write(buf []byte) (int, error) {
         }
         offsets, splitErr := quic.SplitCoalesced(buf)
         if splitErr != nil || len(offsets) <= 1 {
-                n, err := c.output(buf)
+                // v26.11.58-link: SplitCoalesced failed. Truncate to 1250 bytes
+                // (RFC 9000 §14.1 minimum Initial size) instead of sending the
+                // full coalesced datagram. Prevents EMSGSIZE on paths with
+                // MTU < 2400. Browser's QUIC stack will retransmit.
+                truncated := buf[:1250]
+                n, err := c.output(truncated)
                 if c.downlink != nil {
                         c.downlink.Add(int64(n))
                 }
