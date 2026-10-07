@@ -92,8 +92,9 @@ setup() {
     
     # Rule 2: TPROXY all other UDP :443 traffic
     iptables -t mangle -A "$TPROXY_CHAIN" -p udp --dport 443 -j TPROXY \
-        --tproxy-mark "$TPROXY_MARK/$TPROXY_MARK" \
-        --on-port "$TPROXY_PORT"
+        --on-port "$TPROXY_PORT" \
+        --on-ip 0.0.0.0 \
+        --tproxy-mark "$TPROXY_MARK"
     
     # Hook into PREROUTING (forwarded traffic from tunnel)
     iptables -t mangle -C PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
@@ -108,8 +109,9 @@ setup() {
         ip6tables -t mangle -N "$TPROXY_CHAIN" 2>/dev/null || ip6tables -t mangle -F "$TPROXY_CHAIN"
         ip6tables -t mangle -A "$TPROXY_CHAIN" -d ::1/128 -j RETURN
         ip6tables -t mangle -A "$TPROXY_CHAIN" -p udp --dport 443 -j TPROXY \
-            --tproxy-mark "$TPROXY_MARK/$TPROXY_MARK" \
-            --on-port "$TPROXY_PORT"
+            --on-port "$TPROXY_PORT" \
+            --on-ip "::" \
+            --tproxy-mark "$TPROXY_MARK"
         ip6tables -t mangle -C PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
             ip6tables -t mangle -A PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN"
         ip6tables -t mangle -C OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
