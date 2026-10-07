@@ -26,25 +26,6 @@ import (
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
 
-// v26.11.109: Source-based SNI cache for QUIC.
-// When the sniffer extracts SNI from a QUIC Initial, we cache source→domain.
-// When a 1-RTT short header arrives from the same source, the sniffer can't
-// extract SNI (short headers are encrypted). Instead of failing and routing
-// to 127.0.0.1, we check this cache and return the cached domain.
-//
-// This fixes the root cause of YouTube stalling: 1-RTT packets created new
-// conns → sniffer failed (no SNI in short headers) → routed to 127.0.0.1:443
-// → dropped as loopback. With the cache, the sniffer returns the cached SNI
-// and the dispatcher routes to the correct domain.
-type sniCacheEntry struct {
-        domain   string
-        expiresAt int64 // unix nano
-}
-
-var sniCache sync.Map // source string → sniCacheEntry
-
-const sniCacheTTL = 120 * time.Second // QUIC connections live longer than 2 min; refresh on each Initial
-
 type cachedReader struct {
         sync.Mutex
         reader   buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
@@ -382,15 +363,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
         if !sniffingRequest.Enabled {
                 d.routedDispatch(ctx, outbound, destination)
         } else {
-                // v26.11.113: REMOVED SNI cache (v26.11.109).
-                // The SNI cache created NEW freedom.Process calls for cached
-                // packets, which created NEW pooledConns and OVERWROTE
-                // connBySrc in the worker. This broke the first connection's
-                // ACK path — ACKs went to the wrong socket.
-                // connBySrc (v26.11.110) handles short headers at the worker
-                // level, before packets reach the dispatcher. The SNI cache
-                // is no longer needed and was harmful.
-
                 cReader := &cachedReader{
                         reader: outbound.Reader.(buf.TimeoutReader),
                         cache:  make(buf.MultiBuffer, 0, 8), // v26.10.13-link: preallocate for typical QUIC Initial exchange

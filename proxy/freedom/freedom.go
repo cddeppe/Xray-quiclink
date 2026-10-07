@@ -5,6 +5,7 @@ import (
         "crypto/rand"
         stderrors "errors"
         "io"
+        stdnet "net"
         "strings"
         "sync/atomic"
         "syscall"
@@ -406,16 +407,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         input := link.Reader
         output := link.Writer
 
-        // v26.11.104: Drop UDP packets destined to loopback:443.
-        // When SNI sniffing fails, destination stays as 127.0.0.1:443 (dokodemo default).
-        // Without this drop, freedom.Process dials 127.0.0.1:443 → loops back to
-        // the dokodemo listener → infinite loop → resource exhaustion → all QUIC fails.
-        if destination.Network == net.Network_UDP && destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() && destination.Port == 443 {
-                common.Interrupt(input)
-                common.Close(output)
-                return errors.New("dropping loopback UDP:443 — SNI extraction failed")
-        }
-
         // v26.10.37-link: inputCloser propagates EOF from outbound→inbound.
         // When the remote peer (e.g. YouTube) closes the outbound TCP, we
         // must close the inbound input pipe too — otherwise requestDone's
@@ -606,15 +597,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
-        // v26.10.71-link: log the downstream path explicitly so the log
-        // alone tells us whether QUIC survived end-to-end. The destination
-        // string already shows tcp:/udp: but does not tell us whether the
-        // QUIC pool took the connection (DCID demux) or whether the
-        // per-session path was used (0-length SCID fallback or non-QUIC UDP).
-        // v26.10.72-link: upgraded to LogWarning because LogInfo is silent
-        // at the default 'warning' log level — which made the v26.10.71
-        // lines invisible. LogWarning shows at all log levels >= warning.
-
         // For UDP pool: peek at the first packet to determine if it's QUIC.
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
@@ -635,54 +617,38 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // v26.11.103: Use inbound source port as pool key.
-                                        // Each QUIC connection (unique source port) gets its OWN pool socket.
-                                        // No sharing → no lastActiveCh stealing → server replies go to correct conn.
-                                        // The real dest IP is passed as the second arg for WriteTo.
-                                        var poolKey *net.UDPAddr = udpRemote
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                poolKey = &net.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
-                                                }
-                                        }
-                                        pooledConn, err = h.socketPool.AcquireWithDest(poolKey, udpRemote)
+                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
                                         if err != nil {
+                                                // v26.10.34-link (C3 fix): release peeked packets
+                                                // before returning. Without this, every Acquire
+                                                // failure leaks one MultiBuffer (up to 8KB+ per
+                                                // failure) — unbounded growth under flapping dest.
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
-                                        defer pooledConn.Close()
-                                        outGateway = nil
-                                        // v26.11.111: Set directWrite callback on the udpConn
-                                        // so the worker can bypass the pipe for 1-RTT short headers.
-                                        // This ensures ACKs reach Google with zero latency.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                                if setter, ok := inbound.Conn.(interface{ SetDirectWrite(func([]byte) (int, error)) }); ok {
-                                                        pc := pooledConn
-                                                        dest := udpRemote
-                                                        setter.SetDirectWrite(func(b []byte) (int, error) {
-                                                                return pc.WriteTo(b, dest)
-                                                        })
+                                        // v26.11.52-link (Solution B): bind the pooled socket's
+                                        // source to the inbound client's source IP:port so that
+                                        // pool reply packets (read via wildcard listen) are
+                                        // demuxed back to the originating client. Without this,
+                                        // all QUIC sessions sharing a pooled socket collapse to
+                                        // the socket's local (kernel-chosen) source and the
+                                        // 4-tuple-based reply routing breaks under NAT.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                pooledConn.source = &stdnet.UDPAddr{
+                                                        IP:   inbound.Source.Address.IP(),
+                                                        Port: int(inbound.Source.Port),
                                                 }
                                         }
-                                        errors.LogWarning(ctx, "freedom: UDP path=pooled (QUIC, DCID demux) dest=", destination, " remote=", udpRemote)
+                                        defer pooledConn.Close()
+                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
+                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
+                                        outGateway = nil
                                 }
-                        } else {
-                                // Non-QUIC UDP first byte — per-session path.
-                                errors.LogWarning(ctx, "freedom: UDP path=per-session (non-QUIC first byte) dest=", destination)
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
-                } else {
-                        // Peek failed (empty input pipe / EOF) — per-session fallback.
-                        errors.LogWarning(ctx, "freedom: UDP path=per-session (peek empty) dest=", destination, " peekErr=", peekErr)
                 }
                 // If peek failed, proceed with existing path (pooledConn stays nil).
-        } else if destination.Network != net.Network_TCP {
-                // socketPool not configured — per-session UDP path.
-                errors.LogWarning(ctx, "freedom: UDP path=per-session (no pool configured) dest=", destination)
-        } else {
-                errors.LogWarning(ctx, "freedom: TCP path dest=", destination)
         }
 
         var newCtx context.Context
@@ -694,18 +660,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         plcy := h.policy()
         ctx, cancel := context.WithCancel(ctx)
         timer := signal.CancelAfterInactivity(ctx, func() {
-                // v26.11.106 DIAG: log when inactivity timer fires
-                if destination.Network != net.Network_TCP {
-                        errors.LogWarning(context.Background(), "DIAG D6 TIMER FIRED: ConnectionIdle=", plcy.Timeouts.ConnectionIdle, " dest=", destination)
-                }
                 cancel()
                 if newCancel != nil {
                         newCancel()
                 }
         }, plcy.Timeouts.ConnectionIdle)
-        if destination.Network != net.Network_TCP {
-                errors.LogWarning(context.Background(), "DIAG D1 freedom.Process UDP START: dest=", destination, " ConnectionIdle=", plcy.Timeouts.ConnectionIdle, " DownlinkOnly=", plcy.Timeouts.DownlinkOnly, " UplinkOnly=", plcy.Timeouts.UplinkOnly)
-        }
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
@@ -730,17 +689,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         writer = NewPooledPacketWriter(pooledConn, statWrite)
                 } else {
                         writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
-                        // v26.11.114: Set directWrite for per-session UDP path.
-                        // connBySrc routes short headers to this conn, and directWrite
-                        // writes them directly to the outbound socket (bypassing pipe).
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                if setter, ok := inbound.Conn.(interface{ SetDirectWrite(func([]byte) (int, error)) }); ok {
-                                        outConn := conn
-                                        setter.SetDirectWrite(func(b []byte) (int, error) {
-                                                return outConn.Write(b)
-                                        })
-                                }
-                        }
                         if h.config.Noises != nil {
                                 errors.LogDebug(ctx, "NOISE", h.config.Noises)
                                 writer = &NoisePacketWriter{
@@ -781,23 +729,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
-                // v26.10.69-link: For UDP, buf.Copy returns when the input
-                // is exhausted (cachedReader EOF). The UDP connection
-                // is still alive — block on inputCloser to keep the session
-                // alive while responseDone reads YouTube's response.
-                if destination.Network != net.Network_TCP {
-                        // Override the DownlinkOnly timer with ConnectionIdle
-                        // so the session stays alive long enough for the
-                        // response to arrive. DownlinkOnly (default 1s) is
-                        // too short for UDP — the response may take longer.
-                        timer.SetTimeout(plcy.Timeouts.ConnectionIdle)
-                        // v26.11.106 DIAG: log when requestDone blocks on inputCloser
-                        errors.LogWarning(context.Background(), "DIAG D2 requestDone: buf.Copy done, blocking on inputCloser dest=", destination)
-                        <-inputCloser
-                        // v26.11.106 DIAG: log when inputCloser fires
-                        errors.LogWarning(context.Background(), "DIAG D3 requestDone: inputCloser fired dest=", destination)
-                }
-
                 return nil
         }
 
@@ -829,15 +760,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-                        // v26.11.106 DIAG: log response copy error
-                        if destination.Network != net.Network_TCP {
-                                errors.LogWarning(context.Background(), "DIAG D4 responseDone: buf.Copy error=", err, " dest=", destination)
-                        }
                         return errors.New("failed to process response").Base(err)
-                }
-                // v26.11.106 DIAG: log when responseDone finishes normally
-                if destination.Network != net.Network_TCP {
-                        errors.LogWarning(context.Background(), "DIAG D5 responseDone: buf.Copy finished normally dest=", destination)
                 }
                 return nil
         }
@@ -847,15 +770,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
-                // v26.11.106 DIAG: log when task.Run returns with error
-                if destination.Network != net.Network_TCP {
-                        errors.LogWarning(context.Background(), "DIAG D7 freedom.Process UDP END (error): dest=", destination, " err=", err)
-                }
                 return errors.New("connection ends").Base(err)
-        }
-        // v26.11.106 DIAG: log when task.Run returns normally
-        if destination.Network != net.Network_TCP {
-                errors.LogWarning(context.Background(), "DIAG D8 freedom.Process UDP END (normal): dest=", destination)
         }
 
         return nil
