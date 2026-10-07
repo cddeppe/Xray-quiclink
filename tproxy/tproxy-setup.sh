@@ -63,14 +63,20 @@ cleanup() {
     # Remove iptables rules (ignore errors if not present)
     iptables -t mangle -D PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || true
     iptables -t mangle -D OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -D PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -D OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || true
     
     # Flush and delete the chain
     iptables -t mangle -F "$TPROXY_CHAIN" 2>/dev/null || true
     iptables -t mangle -X "$TPROXY_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -F "$TPROXY_CHAIN" 2>/dev/null || true
+    ip6tables -t mangle -X "$TPROXY_CHAIN" 2>/dev/null || true
     
     # Remove ip rule and route
     ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
     ip route flush table "$TPROXY_TABLE" 2>/dev/null || true
+    ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
+    ip -6 route flush table "$TPROXY_TABLE" 2>/dev/null || true
     
     info "TPROXY cleanup complete."
 }
@@ -81,14 +87,10 @@ setup() {
     # Create the TPROXY chain (flush if exists)
     iptables -t mangle -N "$TPROXY_CHAIN" 2>/dev/null || iptables -t mangle -F "$TPROXY_CHAIN"
     
-    # Rule 1: Skip loopback traffic
+    # Rule 1: Skip loopback traffic (IPv4 only — IPv6 handled by ip6tables)
     iptables -t mangle -A "$TPROXY_CHAIN" -d 127.0.0.0/8 -j RETURN
-    iptables -t mangle -A "$TPROXY_CHAIN" -d ::1/128 -j RETURN
     
-    # Rule 2: Skip traffic already going to xray's listen port
-    # (prevents loops)
-    
-    # Rule 3: TPROXY all other UDP :443 traffic
+    # Rule 2: TPROXY all other UDP :443 traffic
     iptables -t mangle -A "$TPROXY_CHAIN" -p udp --dport 443 -j TPROXY \
         --tproxy-mark "$TPROXY_MARK/$TPROXY_MARK" \
         --on-port "$TPROXY_PORT"
@@ -101,12 +103,31 @@ setup() {
     iptables -t mangle -C OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
         iptables -t mangle -A OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN"
     
+    # === IPv6 setup (if ip6tables exists) ===
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -t mangle -N "$TPROXY_CHAIN" 2>/dev/null || ip6tables -t mangle -F "$TPROXY_CHAIN"
+        ip6tables -t mangle -A "$TPROXY_CHAIN" -d ::1/128 -j RETURN
+        ip6tables -t mangle -A "$TPROXY_CHAIN" -p udp --dport 443 -j TPROXY \
+            --tproxy-mark "$TPROXY_MARK/$TPROXY_MARK" \
+            --on-port "$TPROXY_PORT"
+        ip6tables -t mangle -C PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
+            ip6tables -t mangle -A PREROUTING -p udp --dport 443 -j "$TPROXY_CHAIN"
+        ip6tables -t mangle -C OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN" 2>/dev/null || \
+            ip6tables -t mangle -A OUTPUT -p udp --dport 443 -j "$TPROXY_CHAIN"
+    fi
+    
     # ip rule + route for TPROXY
     ip rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
     ip rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE"
     
     ip route flush table "$TPROXY_TABLE" 2>/dev/null || true
     ip route add local default dev lo table "$TPROXY_TABLE"
+    
+    # IPv6 rule + route
+    ip -6 rule del fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
+    ip -6 rule add fwmark "$TPROXY_MARK" table "$TPROXY_TABLE" 2>/dev/null || true
+    ip -6 route flush table "$TPROXY_TABLE" 2>/dev/null || true
+    ip -6 route add local default dev lo table "$TPROXY_TABLE" 2>/dev/null || true
     
     info "TPROXY setup complete."
     info "  - UDP :443 traffic → TPROXY port $TPROXY_PORT"
