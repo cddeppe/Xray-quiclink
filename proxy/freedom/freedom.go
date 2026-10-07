@@ -367,6 +367,7 @@ func isNetworkUnreachable(err error) bool {
 
 // Process implements proxy.Outbound.
 func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
+        errors.LogWarning(ctx, "DIAG P01 Process ENTER")
         outbounds := session.OutboundsFromContext(ctx)
         ob := outbounds[len(outbounds)-1]
         if !ob.Target.IsValid() {
@@ -606,7 +607,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         } else {
                 defer conn.Close()
         }
+        errors.LogWarning(ctx, "DIAG P02 dialed dest=", destination, " pool=", h.socketPool != nil)
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
+		errors.LogWarning(ctx, "DIAG P02 dialed conn dest=", destination, " network=", destination.Network, " pool=", h.socketPool != nil)
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
@@ -652,7 +655,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 } else {
                 }
         } else if destination.Network != net.Network_TCP {
+                errors.LogWarning(ctx, "DIAG P03 PER-SESSION UDP (pool OFF) (pool OFF) dest=", destination)
         } else {
+                errors.LogWarning(ctx, "DIAG P04 TCP path dest=", destination)
         }
 
         var newCtx context.Context
@@ -671,6 +676,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }, plcy.Timeouts.ConnectionIdle)
 
         requestDone := func() error {
+        errors.LogWarning(ctx, "DIAG P07 requestDone START")
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
 
                 var writer buf.Writer
@@ -692,6 +698,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                         writer = NewPooledPacketWriter(pooledConn, statWrite)
                 } else {
+                        errors.LogWarning(ctx, "DIAG P05 per-session PacketWriter created")
                         writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
                         if h.config.Noises != nil {
                                 errors.LogDebug(ctx, "NOISE", h.config.Noises)
@@ -712,8 +719,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
-                if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-                        // v26.10.38-link: swallow ErrClosedPipe when inputCloser has
+                errors.LogWarning(ctx, "DIAG P09 buf.Copy input->writer START")
+		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+        errors.LogWarning(ctx, "DIAG P09 buf.Copy input->writer returned")
+                        errors.LogWarning(ctx, "DIAG P10 requestDone buf.Copy returned err=", err)
+			// v26.10.38-link: swallow ErrClosedPipe when inputCloser has
                         // fired (responseDone returned, so YouTube closed the outbound).
                         // Without this guard, the ErrClosedPipe propagates out of
                         // freedom.Process, and handler.Dispatch (handler.go:254-258)
@@ -737,6 +747,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         responseDone := func() error {
+        errors.LogWarning(ctx, "DIAG P11 responseDone START (blocking on reply)")
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
@@ -761,9 +772,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 } else if pooledConn != nil {
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
+                        errors.LogWarning(ctx, "DIAG P06 per-session PacketReader created")
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+        errors.LogWarning(ctx, "DIAG P13 responseDone buf.Copy returned")
                         return errors.New("failed to process response").Base(err)
                 }
                 return nil
@@ -774,6 +787,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
+        errors.LogWarning(ctx, "DIAG P16 task.Run returned")
                 return errors.New("connection ends").Base(err)
         }
 
@@ -820,20 +834,26 @@ type PacketReader struct {
 }
 
 func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        errors.LogWarning(context.Background(), "DIAG R01 PacketReader ENTER")
         b := buf.New()
         b.Resize(0, buf.Size)
         for {
                 n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
+            errors.LogWarning(context.Background(), "DIAG R02 ReadFrom returned")
                 if err != nil {
                         b.Release()
+                        errors.LogWarning(context.Background(), "DIAG R01 PacketReader.ReadFrom err=", err)
                         return nil, err
                 }
+                errors.LogWarning(context.Background(), "DIAG R02 PacketReader got reply n=", n, " from=", d)
                 udpAddr := d.(*net.UDPAddr)
+            errors.LogWarning(context.Background(), "DIAG R04 reply from=", udpAddr)
                 sourceAddr := net.IPAddress(udpAddr.IP)
                 if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
                         continue
                 }
                 b.Resize(0, int32(n))
+			errors.LogWarning(context.Background(), "DIAG R07 reply resized n=", n)
 
                 // if udp dest addr is changed, we are unable to get the correct src addr
                 // so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
@@ -901,15 +921,18 @@ type PacketWriter struct {
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+        errors.LogWarning(context.Background(), "DIAG W01 PacketWriter ENTER count=", len(mb))
         for {
                 mb2, b := buf.SplitFirst(mb)
+            errors.LogWarning(context.Background(), "DIAG W03 processing buffer")
                 mb = mb2
                 if b == nil {
                         break
                 }
                 var n int
                 var err error
-                if b.UDP != nil {
+                errors.LogWarning(context.Background(), "DIAG W04 b.UDP=", b.UDP, " override=", w.UDPOverride)
+			if b.UDP != nil {
                         if w.UDPOverride.Address != nil {
                                 b.UDP.Address = w.UDPOverride.Address
                         }
@@ -957,7 +980,10 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 b.Release()
                                 continue
                         }
-                        n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+                        errors.LogWarning(context.Background(), "DIAG W07 calling WriteTo len=", len(b.Bytes()))
+				n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+            errors.LogWarning(context.Background(), "DIAG W07 WriteTo returned")
+				errors.LogWarning(context.Background(), "DIAG W08 WriteTo n=", n, " err=", err)
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
                 }
