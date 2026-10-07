@@ -685,38 +685,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                         isLong := firstByte&0x80 != 0 && firstByte&0x40 != 0
                         if isLong {
-                                // v26.11.93-link: KEY FIX — use a unique pool socket per QUIC
-                                // connection, not per destination IP. This eliminates the demux
-                                // problem entirely: each QUIC connection gets its own socket,
-                                // so server replies go to the right socket without any DCID
-                                // lookup. No guessing, no wrong delivery.
-                                //
-                                // The DCID of the first packet is unique per QUIC connection.
-                                // We use it (combined with dest IP) as the pool key.
-                                remoteAddr := conn.RemoteAddr()
-                                var udpRemote *net.UDPAddr
-                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
-                                        udpRemote = u
-                                } else {
-                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
-                                }
-                                if udpRemote != nil {
-                                        // v26.11.95-link: Use the inbound source port as the pool key,
-                                        // NOT the DCID. The source port stays constant for the entire
-                                        // QUIC connection, even after CID rotation. Using DCID as the
-                                        // pool key caused CID rotation to create new pool sockets,
-                                        // killing the old socket (staleness timeout) and breaking the
-                                        // established QUIC connection.
-                                        //
-                                        // The inbound source is available in the session context.
-                                        var poolKey *stdnet.UDPAddr = udpRemote
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                poolKey = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
-                                                }
-                                        }
-                                        pooledConn, err = h.socketPool.AcquireWithDest(poolKey, udpRemote)
+					// v26.11.97-link: Use dest IP as pool key (original approach).
+					// The demux handles multiple QUIC connections sharing the socket
+					// via DCID registration (v26.11.79) and lastActiveCh fallback
+					// with DCID registration after delivery (v26.11.84).
+					remoteAddr := conn.RemoteAddr()
+					var udpRemote *net.UDPAddr
+					if u, ok := remoteAddr.(*net.UDPAddr); ok {
+						udpRemote = u
+					} else {
+						udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
+					}
+					if udpRemote != nil {
+						pooledConn, err = h.socketPool.Acquire(udpRemote)
                                         if err != nil {
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
