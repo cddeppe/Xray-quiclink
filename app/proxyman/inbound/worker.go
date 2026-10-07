@@ -576,6 +576,43 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 }
                 w.RUnlock()
         }
+
+        // v26.11.85-link: CRITICAL FIX — for 1-RTT short-header packets from
+        // unknown source ports (Chrome connection migration), tryQUICMigration
+        // and srcIndex both miss. Instead of creating a new conn (which runs
+        // the sniffer, which always fails on short headers, and drops the
+        // packet), deliver to the most recently active conn on this worker.
+        //
+        // The most recently active conn is the one that just sent/received
+        // data — it's the most likely owner of this 1-RTT packet. QUIC will
+        // silently drop the packet if the DCID doesn't match, so misdelivery
+        // is harmless. But correct delivery keeps the video flowing.
+        //
+        // Without this, Chrome's connection migration (new source port) causes
+        // 1-RTT data packets to be dropped → video stalls.
+        if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                w.RLock()
+                var lastActiveConn *udpConn
+                var lastActiveTime int64
+                for _, c := range w.activeConn {
+                        if c.done.Done() {
+                                continue
+                        }
+                        t := atomic.LoadInt64(&c.lastActivityTime)
+                        if t > lastActiveTime {
+                                lastActiveTime = t
+                                lastActiveConn = c
+                        }
+                }
+                w.RUnlock()
+                if lastActiveConn != nil {
+                        errors.LogWarning(context.Background(), "DIAG W08a worker delivering 1-RTT to most recently active conn (migration fallback)")
+                        lastActiveConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                        lastActiveConn.updateActivity()
+                        return
+                }
+        }
+
         migratedConn := w.tryQUICMigration(b.Bytes(), id)
         if migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
