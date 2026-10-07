@@ -455,7 +455,14 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
                                 return
+                        } else {
+                                // v26.11.108 DIAG: Solution A found srcIndex entry but conn was gone/closed
+                                errors.LogWarning(context.Background(), "DIAG SA1 Solution A: srcIndex FOUND but conn gone src=", source,
+                                        " connFound=", connFound, " done=", existingConn.done.Done())
                         }
+                } else {
+                        // v26.11.108 DIAG: Solution A srcIndex lookup FAILED
+                        errors.LogWarning(context.Background(), "DIAG SA2 Solution A: srcIndex MISS src=", source, " pktLen=", len(b.Bytes()))
                 }
                 w.RUnlock()
         }
