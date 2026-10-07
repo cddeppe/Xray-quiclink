@@ -4,6 +4,7 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -434,6 +435,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         destination = net.UDPDestination(net.DomainAddress(domain), 443)
                                                         goto skipLoopbackDrop
                                                 }
+                                                errors.LogWarning(ctx, "DIAG P21 SniffQUIC ok but domain empty pktLen=", len(pktBytes))
+                                        } else {
+                                                errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed err=", sniffErr, " pktLen=", len(pktBytes), " firstByte=0x", fmt.Sprintf("%02x", pktBytes[0]))
                                         }
                                         errors.LogWarning(ctx, "DIAG P21 SniffQUIC failed for QUIC packet, dropping to prevent loop")
                                         return nil
