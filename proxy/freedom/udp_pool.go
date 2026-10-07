@@ -440,16 +440,34 @@ func (s *pooledSocket) readLoop() {
                 // 1. Large channel (256) so drops are rare during bursts
                 // 2. Non-blocking send so one slow session doesn't starve others
                 // 3. Track drops for observability
+                // v26.10.21-link: non-blocking send with large channel (256).
+                //
+                // v26.11.61-link: panic-safe send. When pooledConn.Close() fires
+                // (freedom.Process returned because the input pipe was empty after
+                // the Initial), the inbox channel is closed. Sending to a closed
+                // channel PANICS — the select/default does NOT prevent this.
+                // Without recover(), the readLoop goroutine dies, killing ALL
+                // sessions sharing this socket. With recover(), the packet is
+                // dropped and the readLoop continues serving other sessions.
+                //
+                // This is safe because the closed inbox means the conn is done —
+                // the reply is for a dead conn and should be dropped anyway.
                 sentOk := false
-                select {
-                case ch <- readResult{data: packet, addr: addr}:
-                        sentOk = true
-                default:
-                        s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
-                        putPacket(packet)
-                }
+                func() {
+                        defer func() {
+                                if r := recover(); r != nil {
+                                        // ch was closed by Close() — drop the packet
+                                        putPacket(packet)
+                                }
+                        }()
+                        select {
+                        case ch <- readResult{data: packet, addr: addr}:
+                                sentOk = true
+                        default:
+                                s.droppedReplies.Add(1)
+                                putPacket(packet)
+                        }
+                }()
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
@@ -663,20 +681,23 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
+        // v26.11.61-link: DO NOT remove DCID from demux on Close.
+        // (Restored from v26.11.38, was reverted by v26.11.54's history rewrite.)
+        //
+        // Each UDP packet triggers a SEPARATE freedom.Process call. The Initial's
+        // Process returns immediately (input pipe empty after the Initial), so
+        // defer pooledConn.Close() fires. If Close() removes demux[A], then
+        // Google's reply (arriving ~50ms later) hits a demux MISS → reply dropped.
+        //
+        // Instead: keep the DCID in demux. The readLoop's panic-safe send
+        // (recover from send-to-closed-channel) handles the case where the
+        // inbox is closed — the reply is dropped, but the readLoop survives
+        // to serve other sessions on the same socket.
+        //
+        // The DCID entry will be cleaned up by:
+        // 1. A new pooledConn overwriting it (RegisterCID on the same DCID)
+        // 2. The socket's idle reaper (when refCount=0 and unused timeout fires)
+        // 3. The stale socket eviction (when no reply for 30s)
 
         c.socket.release()
         return nil
