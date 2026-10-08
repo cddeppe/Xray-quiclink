@@ -568,26 +568,16 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         errors.LogWarning(context.Background(), "DIAG CB2: tryQUICMigration MISS src=", source, " id.dest.IsValid=", id.dest.IsValid())
 
         conn, existing := w.getConnection(id)
-        errors.LogWarning(context.Background(), "DIAG CB3: getConnection src=", source, " existing=", existing)
 
-        // v26.10.43-link (audit C3 from 2-b): re-check under lock that no
-        // other goroutine created a conn with the same id between
-        // tryQUICMigration returning nil and getConnection returning. If
-        // a race occurred (two Initials arriving simultaneously), the
-        // second goroutine would create a duplicate conn. Re-check catches
-        // this: if a conn now exists, discard the duplicate and use the
-        // existing one.
-        if !existing {
-                w.Lock()
-                if existingConn, found := w.activeConn[id]; found && !existingConn.done.Done() {
-                        // Another goroutine won the race. Use their conn.
-                        w.Unlock()
-                        conn = existingConn
-                        existing = true
-                } else {
-                        w.Unlock()
-                }
-        }
+        // v26.11.118: REMOVED the C3 re-check block (v26.10.43/v26.10.78).
+        // The re-check ALWAYS found the conn that getConnection just created
+        // (because getConnection stores it in activeConn before returning),
+        // setting existing=true and skipping the goroutine that starts
+        // proxy.Process. This is why UDP QUIC traffic was silently dropped —
+        // the goroutine never started, so the sniffer never ran, so the
+        // dispatcher never routed the traffic.
+        // getConnection already holds the lock during creation, so the race
+        // is already prevented.
 
         // Record DCID and src for new QUIC connections
         if !existing {
