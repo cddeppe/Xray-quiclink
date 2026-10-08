@@ -236,19 +236,20 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
         // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
-        // v26.11.127: Add error logging to detect EMSGSIZE (packet > path MTU)
+        // v26.11.128: Re-add unconditional reply logging (was removed in v26.11.126)
         n, err := c.output(buf)
         if c.downlink != nil {
                 c.downlink.Add(int64(n))
         }
+        firstByte := byte(0)
+        if len(buf) > 0 {
+                firstByte = buf[0]
+        }
+        isLong := len(buf) > 0 && buf[0]&0x80 != 0
         if err != nil {
-                // Log write errors — EMSGSIZE means the packet exceeded the path MTU
-                // (VPS → Chrome). This happens with coalesced QUIC handshake packets
-                // (~2500 bytes) when the path MTU is ~1400 (tunnel/PPPoE/VPN).
-                errors.LogWarning(context.Background(), "DIAG reply ERROR: udpConn.Write src=", c.remote, " pktLen=", len(buf), " err=", err)
-        } else if len(buf) > 1250 {
-                // Log large packets that succeeded (> 1250 = coalesced or jumbo)
-                errors.LogWarning(context.Background(), "DIAG reply OK (large): udpConn.Write src=", c.remote, " pktLen=", len(buf))
+                errors.LogWarning(context.Background(), "DIAG reply ERROR: udpConn.Write src=", c.remote, " pktLen=", len(buf), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong, " err=", err)
+        } else {
+                errors.LogWarning(context.Background(), "DIAG reply OK: udpConn.Write src=", c.remote, " pktLen=", len(buf), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong)
         }
         if err == nil {
                 c.updateActivity()
