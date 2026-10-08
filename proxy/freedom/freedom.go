@@ -660,8 +660,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         plcy := h.policy()
+        errors.LogWarning(context.Background(), "DIAG freedom: policy timeouts dest=", destination, " connIdle=", plcy.Timeouts.ConnectionIdle, " uplinkOnly=", plcy.Timeouts.UplinkOnly, " downlinkOnly=", plcy.Timeouts.DownlinkOnly)
         ctx, cancel := context.WithCancel(ctx)
         timer := signal.CancelAfterInactivity(ctx, func() {
+                errors.LogWarning(context.Background(), "DIAG freedom: INACTIVITY TIMER FIRED — context cancelled dest=", destination)
                 cancel()
                 if newCancel != nil {
                         newCancel()
