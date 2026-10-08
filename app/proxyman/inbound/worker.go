@@ -235,48 +235,28 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        // v26.11.124 DIAG: log reply packets being written back to Chrome
-        firstByte := byte(0)
-        if len(buf) > 0 {
-                firstByte = buf[0]
+        // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
+        //
+        // Previously, packets > 1250 bytes were split via quic.SplitCoalesced
+        // and each sub-packet was sent as a SEPARATE UDP datagram. This
+        // violates RFC 9000 §12.2: "A sender can coalesce multiple QUIC
+        // packets into one UDP datagram." The receiver MUST receive them
+        // as ONE datagram.
+        //
+        // Splitting breaks the QUIC handshake: Google sends Initial + Handshake
+        // coalesced in one datagram (> 1250 bytes). When split, Chrome's QUIC
+        // stack receives them as separate datagrams, can't complete the
+        // handshake, and retransmits the Initial indefinitely → video stalls.
+        //
+        // Fix: forward the entire buffer as ONE UDP datagram, always.
+        n, err := c.output(buf)
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
         }
-        isLong := len(buf) > 0 && buf[0]&0x80 != 0
-        errors.LogWarning(context.Background(), "DIAG reply: udpConn.Write src=", c.remote, " pktLen=", len(buf), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong)
-        if len(buf) <= 1250 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        if err == nil {
+                c.updateActivity()
         }
-        offsets, splitErr := quic.SplitCoalesced(buf)
-        if splitErr != nil || len(offsets) <= 1 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
-        }
-        total := 0
-        for _, off := range offsets {
-                packet := buf[off[0]:off[1]]
-                n, werr := c.output(packet)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if werr != nil {
-                        return total, werr
-                }
-                total += n
-        }
-        c.updateActivity()
-        return total, nil
+        return n, err
 }
 
 func (c *udpConn) Close() error {
