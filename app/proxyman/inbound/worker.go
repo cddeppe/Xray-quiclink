@@ -616,6 +616,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         outbounds := []*session.Outbound{{}}
                         if originalDest.IsValid() {
                                 outbounds[0].Target = originalDest
+                        } else {
+                                // v26.11.118: When originalDest is invalid (no TPROXY),
+                                // the outbound Target defaults to Network_TCP (Go zero value).
+                                // This causes the dispatcher to route UDP QUIC traffic as TCP.
+                                // Fix: set a UDP destination so the dispatcher knows this is UDP.
+                                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
                         }
                         ctx = session.ContextWithOutbounds(ctx, outbounds)
                         local := net.DestinationFromAddr(w.hub.Addr())
