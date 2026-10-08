@@ -3,7 +3,6 @@ package inbound
 import (
         "context"
         "encoding/hex"
-        "fmt"
         stdnet "net"
         "sync"
 
@@ -208,7 +207,6 @@ func (c *udpConn) updateActivity() {
 // is registered in dcidIndex so subsequent 1-RTT short headers (which
 // carry DCID=server_SCID) can be routed to the correct conn.
 func (c *udpConn) RegisterServerSCID(serverSCID []byte) {
-        errors.LogWarning(context.Background(), "DIAG RegisterServerSCID: called scid=", fmt.Sprintf("%x", serverSCID), " hasCallback=", c.registerServerCID != nil)
         if c.registerServerCID != nil {
                 c.registerServerCID(serverSCID)
         }
@@ -236,20 +234,10 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
         // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
-        // v26.11.128: Re-add unconditional reply logging (was removed in v26.11.126)
+        // Forward the entire buffer as ONE UDP datagram, always.
         n, err := c.output(buf)
         if c.downlink != nil {
                 c.downlink.Add(int64(n))
-        }
-        firstByte := byte(0)
-        if len(buf) > 0 {
-                firstByte = buf[0]
-        }
-        isLong := len(buf) > 0 && buf[0]&0x80 != 0
-        if err != nil {
-                errors.LogWarning(context.Background(), "DIAG reply ERROR: udpConn.Write src=", c.remote, " pktLen=", len(buf), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong, " err=", err)
-        } else {
-                errors.LogWarning(context.Background(), "DIAG reply OK: udpConn.Write src=", c.remote, " pktLen=", len(buf), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong)
         }
         if err == nil {
                 c.updateActivity()
@@ -450,14 +438,6 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
-        // v26.11.118 DIAG: log every UDP packet arrival
-        pktBytes := b.Bytes()
-        firstByte := byte(0)
-        if len(pktBytes) > 0 {
-                firstByte = pktBytes[0]
-        }
-        errors.LogWarning(context.Background(), "DIAG CB1 callback: src=", source, " origDestValid=", originalDest.IsValid(), " pktLen=", len(pktBytes), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", firstByte&0x80 != 0)
-
         id := connID{
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
@@ -526,22 +506,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                         w.RUnlock()
                                         existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                         existingConn.updateActivity()
-                                        errors.LogWarning(context.Background(), "DIAG CB1c: DCID HIT short header src=", source, " dcid=", fmt.Sprintf("%x", dcid), " routed to connID.src=", existingID.src)
                                         return
                                 }
                         }
-                        // v26.11.120 DIAG: DCID lookup missed for short header
-                        // v26.11.122: also dump dcidIndex keys and srcIndex keys for debugging
-                        dcidKeys := make([]string, 0, len(w.dcidIndex))
-                        for k := range w.dcidIndex {
-                                dcidKeys = append(dcidKeys, fmt.Sprintf("%x", k))
-                        }
-                        srcKeys := make([]string, 0, len(w.srcIndex))
-                        for sk := range w.srcIndex {
-                                srcKeys = append(srcKeys, fmt.Sprintf("%d", sk.port))
-                        }
                         w.RUnlock()
-                        errors.LogWarning(context.Background(), "DIAG CB1d: DCID MISS short header src=", source, " dcid=", fmt.Sprintf("%x", dcid), " dcidIndexSize=", len(w.dcidIndex), " dcidKeys=", dcidKeys, " srcIndexPorts=", srcKeys)
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
@@ -551,14 +519,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 w.RUnlock()
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
-                                errors.LogWarning(context.Background(), "DIAG CB1c2: srcIndex HIT short header src=", source, " routed to connID.src=", existingID.src)
                                 return
                         }
                 }
                 w.RUnlock()
 
                 // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
-                errors.LogWarning(context.Background(), "DIAG CB1e: DROP short header (DCID+srcIndex both missed) src=", source, " pktLen=", len(b.Bytes()))
                 b.Release()
                 return
         }
@@ -566,10 +532,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                 migratedConn.updateActivity()
-                errors.LogWarning(context.Background(), "DIAG CB2: tryQUICMigration HIT src=", source)
                 return
         }
-        errors.LogWarning(context.Background(), "DIAG CB2: tryQUICMigration MISS src=", source, " id.dest.IsValid=", id.dest.IsValid())
 
         conn, existing := w.getConnection(id)
 
@@ -596,16 +560,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 connIDCopy := id
                 conn.registerServerCID = func(serverSCID []byte) {
                         if len(serverSCID) == 0 {
-                                errors.LogWarning(context.Background(), "DIAG registerServerCID: empty SCID, skipping")
                                 return
                         }
                         dk := makeDCIDKey(serverSCID)
                         w.Lock()
                         if _, exists := w.dcidIndex[dk]; !exists {
                                 w.dcidIndex[dk] = connIDCopy
-                                errors.LogWarning(context.Background(), "DIAG registerServerCID: REGISTERED scid=", fmt.Sprintf("%x", serverSCID), " connID.src=", connIDCopy.src, " dcidIndexSize=", len(w.dcidIndex))
-                        } else {
-                                errors.LogWarning(context.Background(), "DIAG registerServerCID: already exists scid=", fmt.Sprintf("%x", serverSCID), " dcidIndexSize=", len(w.dcidIndex))
                         }
                         w.Unlock()
                 }
@@ -613,15 +573,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         // payload will be discarded in pipe is full.
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-        errors.LogWarning(context.Background(), "DIAG CB3a: after WriteMultiBuffer src=", source, " existing=", existing)
 
         if !existing {
-                errors.LogWarning(context.Background(), "DIAG CB3b: before checker.Start src=", source)
                 common.Must(w.checker.Start())
-                errors.LogWarning(context.Background(), "DIAG CB3c: after checker.Start src=", source)
 
                 go func() {
-                        errors.LogWarning(context.Background(), "DIAG CB4: goroutine STARTED src=", source)
                         ctx, cancel := context.WithCancel(w.ctx)
                         conn.cancel = cancel
                         sid := session.NewID()
@@ -637,7 +593,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 // Fix: set a UDP destination so the dispatcher knows this is UDP.
                                 outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
                         }
-                        errors.LogWarning(context.Background(), "DIAG CB4a: outbound Target set src=", source, " target=", outbounds[0].Target)
                         ctx = session.ContextWithOutbounds(ctx, outbounds)
                         local := net.DestinationFromAddr(w.hub.Addr())
                         if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
@@ -658,11 +613,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
-                        errors.LogWarning(context.Background(), "DIAG CB4: goroutine START src=", source, " calling proxy.Process")
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogWarning(context.Background(), "DIAG CB5: proxy.Process ERROR src=", source, " err=", err)
-                        } else {
-                                errors.LogWarning(context.Background(), "DIAG CB5: proxy.Process DONE src=", source)
+                                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better
@@ -952,37 +904,27 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
 // the same udpConn.
 func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) {
         if len(serverSCID) == 0 || browserSrc == nil {
-                errors.LogWarning(context.Background(), "DIAG OnServerSCID: early return (empty scid or nil src)")
                 return
         }
         sk := makeSrcKeyFromUDPAddr(browserSrc)
         if sk.port == 0 && sk.ip == ([16]byte{}) {
-                errors.LogWarning(context.Background(), "DIAG OnServerSCID: early return (zero srcKey) browserSrc=", browserSrc)
                 return
         }
         w.Lock()
         defer w.Unlock()
         existingID, found := w.srcIndex[sk]
         if !found {
-                // v26.11.120 DIAG: srcIndex lookup missed — this means the server SCID
-                // cannot be registered because we don't know which conn it belongs to.
-                // This happens when the browser's source port doesn't match any
-                // existing conn (e.g., connection migration to a new port before the
-                // Initial reply arrived).
-                errors.LogWarning(context.Background(), "DIAG OnServerSCID: srcIndex MISS scid=", fmt.Sprintf("%x", serverSCID), " browserSrc=", browserSrc, " srcIndexSize=", len(w.srcIndex))
                 return
         }
         existingConn, ok := w.activeConn[existingID]
         if !ok || existingConn.done.Done() {
                 delete(w.srcIndex, sk)
-                errors.LogWarning(context.Background(), "DIAG OnServerSCID: conn gone scid=", fmt.Sprintf("%x", serverSCID), " browserSrc=", browserSrc)
                 return
         }
         _ = existingConn
         dk := makeDCIDKey(serverSCID)
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = existingID
-                errors.LogWarning(context.Background(), "DIAG OnServerSCID: REGISTERED scid=", fmt.Sprintf("%x", serverSCID), " browserSrc=", browserSrc, " dcidIndexSize=", len(w.dcidIndex))
         }
 }
 

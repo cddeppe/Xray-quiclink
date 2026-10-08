@@ -333,19 +333,6 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
                                 } else {
                                         ob.Target = destination
                                 }
-                        } else {
-                                // v26.11.123 DIAG: sniffing failed — log why
-                                if err != nil {
-                                        errors.LogWarning(ctx, "DIAG sniff FAILED: err=", err, " dest=", destination, " network=", destination.Network)
-                                } else {
-                                        domain := ""
-                                        if result != nil {
-                                                domain = result.Domain()
-                                        }
-                                        if domain == "" {
-                                                errors.LogWarning(ctx, "DIAG sniff OK but no domain: dest=", destination, " protocol=", result.Protocol())
-                                        }
-                                }
                         }
                         d.routedDispatch(ctx, outbound, destination)
                 }()

@@ -4,7 +4,6 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
-        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -660,10 +659,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         plcy := h.policy()
-        errors.LogWarning(context.Background(), "DIAG freedom: policy timeouts dest=", destination, " connIdle=", plcy.Timeouts.ConnectionIdle, " uplinkOnly=", plcy.Timeouts.UplinkOnly, " downlinkOnly=", plcy.Timeouts.DownlinkOnly)
         ctx, cancel := context.WithCancel(ctx)
         timer := signal.CancelAfterInactivity(ctx, func() {
-                errors.LogWarning(context.Background(), "DIAG freedom: INACTIVITY TIMER FIRED — context cancelled dest=", destination)
                 cancel()
                 if newCancel != nil {
                         newCancel()
@@ -717,14 +714,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // fired (responseDone returned, so YouTube closed the outbound).
                         select {
                         case <-inputCloser:
-                                errors.LogWarning(context.Background(), "DIAG freedom: requestDone RETURNED (inputCloser graceful) dest=", destination)
                                 return nil // graceful — let Dispatch Close(link.Writer)
                         default:
-                                errors.LogWarning(context.Background(), "DIAG freedom: requestDone ERROR dest=", destination, " err=", err)
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
-                errors.LogWarning(context.Background(), "DIAG freedom: requestDone RETURNED (buf.Copy done — Chrome stopped sending) dest=", destination)
                 return nil
         }
 
@@ -767,20 +761,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 register:   reg.RegisterServerSCID,
                                                 registered: &scidRegistered,
                                         }
-                                        errors.LogWarning(context.Background(), "DIAG freedom: serverSCIDReader WRAPPED (per-session path, pool OFF) dest=", destination)
-                                } else {
-                                        errors.LogWarning(context.Background(), "DIAG freedom: inbound.Conn does NOT implement RegisterServerSCID — serverSCIDReader NOT wrapped")
                                 }
-                        } else {
-                                errors.LogWarning(context.Background(), "DIAG freedom: inbound or inbound.Conn is nil — serverSCIDReader NOT wrapped")
                         }
                 }
-                errors.LogWarning(context.Background(), "DIAG freedom: responseDone STARTED copying Google replies to output dest=", destination)
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-                        errors.LogWarning(context.Background(), "DIAG freedom: responseDone buf.Copy ERROR dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
-                errors.LogWarning(context.Background(), "DIAG freedom: responseDone buf.Copy DONE (Google socket closed) dest=", destination)
                 return nil
         }
 
@@ -1171,30 +1157,10 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         if len(data) > 0 && data[0]&0x80 != 0 {
                                 // Long header — try to parse SCID
                                 if scid, _, perr := quic.ParseSCID(data); perr == nil && len(scid) > 0 {
-                                        // Register the server's SCID in dcidIndex
-                                        errors.LogWarning(context.Background(), "DIAG serverSCIDReader: FOUND long header scid=", fmt.Sprintf("%x", scid), " pktLen=", len(data))
                                         r.register(scid)
                                         *r.registered = true
                                         break
-                                } else if perr != nil {
-                                        errors.LogWarning(context.Background(), "DIAG serverSCIDReader: long header but ParseSCID error=", perr, " pktLen=", len(data))
-                                } else if len(scid) == 0 {
-                                        errors.LogWarning(context.Background(), "DIAG serverSCIDReader: long header but SCID is 0-length (Chrome/Edge) pktLen=", len(data))
                                 }
-                        }
-                }
-                if !*r.registered {
-                        // v26.11.121 DIAG: log that we read packets but found no long header
-                        // (all short headers — server Initial not yet seen or already passed)
-                        shortCount := 0
-                        for _, b := range mb {
-                                data := b.Bytes()
-                                if len(data) > 0 && data[0]&0x80 == 0 {
-                                        shortCount++
-                                }
-                        }
-                        if shortCount > 0 {
-                                errors.LogWarning(context.Background(), "DIAG serverSCIDReader: read ", len(mb), " bufs, ", shortCount, " short headers, no long header yet")
                         }
                 }
         }
