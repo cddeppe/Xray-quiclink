@@ -541,12 +541,22 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                         w.RUnlock()
                                         existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                         existingConn.updateActivity()
+                                        errors.LogWarning(context.Background(), "DIAG CB1c: DCID HIT short header src=", source, " dcid=", fmt.Sprintf("%x", dcid), " routed to connID.src=", existingID.src)
                                         return
                                 }
                         }
-                        w.RUnlock()
                         // v26.11.120 DIAG: DCID lookup missed for short header
-                        errors.LogWarning(context.Background(), "DIAG CB1d: DCID MISS short header src=", source, " dcid=", fmt.Sprintf("%x", dcid), " dcidIndexSize=", len(w.dcidIndex))
+                        // v26.11.122: also dump dcidIndex keys and srcIndex keys for debugging
+                        dcidKeys := make([]string, 0, len(w.dcidIndex))
+                        for k := range w.dcidIndex {
+                                dcidKeys = append(dcidKeys, fmt.Sprintf("%x", k))
+                        }
+                        srcKeys := make([]string, 0, len(w.srcIndex))
+                        for sk := range w.srcIndex {
+                                srcKeys = append(srcKeys, fmt.Sprintf("%d", sk.port))
+                        }
+                        w.RUnlock()
+                        errors.LogWarning(context.Background(), "DIAG CB1d: DCID MISS short header src=", source, " dcid=", fmt.Sprintf("%x", dcid), " dcidIndexSize=", len(w.dcidIndex), " dcidKeys=", dcidKeys, " srcIndexPorts=", srcKeys)
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
@@ -556,21 +566,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 w.RUnlock()
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
+                                errors.LogWarning(context.Background(), "DIAG CB1c2: srcIndex HIT short header src=", source, " routed to connID.src=", existingID.src)
                                 return
                         }
                 }
                 w.RUnlock()
 
                 // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
-                // Previously these fell through to getConnection() → CB4 → proxy.Process
-                // → dokodemo → dispatcher. But the sniffer cannot extract SNI from a
-                // short header (no ClientHello), so the dispatcher falls back to the
-                // dokodemo LocalAddr-derived destination (127.0.0.1:443), and freedom
-                // dials the WRONG endpoint. This causes the video to stall because
-                // data goes to the local listener instead of Google.
-                //
-                // Dropping the packet is safer: QUIC will retransmit, and if the
-                // client gives up, it will start a fresh Initial (which CAN be sniffed).
                 errors.LogWarning(context.Background(), "DIAG CB1e: DROP short header (DCID+srcIndex both missed) src=", source, " pktLen=", len(b.Bytes()))
                 b.Release()
                 return
