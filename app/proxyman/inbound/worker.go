@@ -620,6 +620,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 common.Must(w.checker.Start())
 
                 go func() {
+                        errors.LogWarning(context.Background(), "DIAG CB4: goroutine STARTED src=", source)
                         ctx, cancel := context.WithCancel(w.ctx)
                         conn.cancel = cancel
                         sid := session.NewID()
@@ -635,6 +636,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 // Fix: set a UDP destination so the dispatcher knows this is UDP.
                                 outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
                         }
+                        errors.LogWarning(context.Background(), "DIAG CB4a: outbound Target set src=", source, " target=", outbounds[0].Target)
                         ctx = session.ContextWithOutbounds(ctx, outbounds)
                         local := net.DestinationFromAddr(w.hub.Addr())
                         if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
