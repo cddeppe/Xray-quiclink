@@ -208,6 +208,7 @@ func (c *udpConn) updateActivity() {
 // is registered in dcidIndex so subsequent 1-RTT short headers (which
 // carry DCID=server_SCID) can be routed to the correct conn.
 func (c *udpConn) RegisterServerSCID(serverSCID []byte) {
+        errors.LogWarning(context.Background(), "DIAG RegisterServerSCID: called scid=", fmt.Sprintf("%x", serverSCID), " hasCallback=", c.registerServerCID != nil)
         if c.registerServerCID != nil {
                 c.registerServerCID(serverSCID)
         }
@@ -608,12 +609,16 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 connIDCopy := id
                 conn.registerServerCID = func(serverSCID []byte) {
                         if len(serverSCID) == 0 {
+                                errors.LogWarning(context.Background(), "DIAG registerServerCID: empty SCID, skipping")
                                 return
                         }
                         dk := makeDCIDKey(serverSCID)
                         w.Lock()
                         if _, exists := w.dcidIndex[dk]; !exists {
                                 w.dcidIndex[dk] = connIDCopy
+                                errors.LogWarning(context.Background(), "DIAG registerServerCID: REGISTERED scid=", fmt.Sprintf("%x", serverSCID), " connID.src=", connIDCopy.src, " dcidIndexSize=", len(w.dcidIndex))
+                        } else {
+                                errors.LogWarning(context.Background(), "DIAG registerServerCID: already exists scid=", fmt.Sprintf("%x", serverSCID), " dcidIndexSize=", len(w.dcidIndex))
                         }
                         w.Unlock()
                 }
