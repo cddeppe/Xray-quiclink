@@ -460,20 +460,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // the sticky resolver (if enabled), so the warm pool key matches the
         // actual IP:port the dialer would have used.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
-                // v26.10.45-link: provide the dialer to the warm pool for
-                // pre-warming. Set once — the dialer is the same for all
-                // Process calls on this handler.
+                // v26.11.132: SetDialFunc is now a no-op after the first call
+                // (checks for nil internally), so calling it every Process is cheap.
                 h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
                         return dialer.Dial(ctx, dest)
                 })
                 if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
-                        if warmConn.RemoteAddr() != nil {
-                                conn = warmConn
-                                warmAcquired = true
-                                errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
-                        } else {
-                                warmConn.Close()
-                        }
+                        conn = warmConn
+                        warmAcquired = true
+                        errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
                 }
         }
         var blockedDest *net.Destination
@@ -525,7 +520,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
 
                 rawConn, err := dialer.Dial(ctx, destination)
-                // v26.10.44-link: if we already have a warm conn, skip the dial.
+                // v26.11.132: warmAcquired conns are now liveness-checked in
+                // Acquire (getsockopt SO_ERROR), so a dead warm conn is
+                // detected before reaching here. If we did get a warm conn,
+                // skip the dial — the conn is already set.
                 if warmAcquired {
                         return nil // conn is already set from the warm pool
                 }

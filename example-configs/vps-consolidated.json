@@ -88,11 +88,7 @@
           "enableTcpWarmPool": true,
           "tcpWarmPoolTimeout": 30,
           "preWarmFirstN": 10,
-          "preWarmLearnVisits": 3,
-          "enableTcpWarmPoolHealthCheck": true,
-          "tcpWarmPoolMaxIdle": 120,
-          "tcpConnectTimeout": 10,
-          "edgeHealthCooldown": 30
+          "preWarmLearnVisits": 3
         }
       }
     },
