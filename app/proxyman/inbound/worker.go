@@ -562,10 +562,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
                 migratedConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                 migratedConn.updateActivity()
+                errors.LogWarning(context.Background(), "DIAG CB2: tryQUICMigration HIT src=", source)
                 return
         }
+        errors.LogWarning(context.Background(), "DIAG CB2: tryQUICMigration MISS src=", source, " id.dest.IsValid=", id.dest.IsValid())
 
         conn, existing := w.getConnection(id)
+        errors.LogWarning(context.Background(), "DIAG CB3: getConnection src=", source, " existing=", existing)
 
         // v26.10.43-link (audit C3 from 2-b): re-check under lock that no
         // other goroutine created a conn with the same id between
@@ -652,8 +655,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
                         ctx = session.ContextWithContent(ctx, content)
+                        errors.LogWarning(context.Background(), "DIAG CB4: goroutine START src=", source, " calling proxy.Process")
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogInfoInner(ctx, err, "connection ends")
+                                errors.LogWarning(context.Background(), "DIAG CB5: proxy.Process ERROR src=", source, " err=", err)
+                        } else {
+                                errors.LogWarning(context.Background(), "DIAG CB5: proxy.Process DONE src=", source)
                         }
                         conn.Close()
                         // conn not removed by checker TODO may be lock worker here is better
