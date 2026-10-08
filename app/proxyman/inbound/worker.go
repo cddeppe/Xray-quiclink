@@ -615,9 +615,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         // payload will be discarded in pipe is full.
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+        errors.LogWarning(context.Background(), "DIAG CB3a: after WriteMultiBuffer src=", source, " existing=", existing)
 
         if !existing {
+                errors.LogWarning(context.Background(), "DIAG CB3b: before checker.Start src=", source)
                 common.Must(w.checker.Start())
+                errors.LogWarning(context.Background(), "DIAG CB3c: after checker.Start src=", source)
 
                 go func() {
                         errors.LogWarning(context.Background(), "DIAG CB4: goroutine STARTED src=", source)
