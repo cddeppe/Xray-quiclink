@@ -236,22 +236,19 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
         // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
-        //
-        // Previously, packets > 1250 bytes were split via quic.SplitCoalesced
-        // and each sub-packet was sent as a SEPARATE UDP datagram. This
-        // violates RFC 9000 §12.2: "A sender can coalesce multiple QUIC
-        // packets into one UDP datagram." The receiver MUST receive them
-        // as ONE datagram.
-        //
-        // Splitting breaks the QUIC handshake: Google sends Initial + Handshake
-        // coalesced in one datagram (> 1250 bytes). When split, Chrome's QUIC
-        // stack receives them as separate datagrams, can't complete the
-        // handshake, and retransmits the Initial indefinitely → video stalls.
-        //
-        // Fix: forward the entire buffer as ONE UDP datagram, always.
+        // v26.11.127: Add error logging to detect EMSGSIZE (packet > path MTU)
         n, err := c.output(buf)
         if c.downlink != nil {
                 c.downlink.Add(int64(n))
+        }
+        if err != nil {
+                // Log write errors — EMSGSIZE means the packet exceeded the path MTU
+                // (VPS → Chrome). This happens with coalesced QUIC handshake packets
+                // (~2500 bytes) when the path MTU is ~1400 (tunnel/PPPoE/VPN).
+                errors.LogWarning(context.Background(), "DIAG reply ERROR: udpConn.Write src=", c.remote, " pktLen=", len(buf), " err=", err)
+        } else if len(buf) > 1250 {
+                // Log large packets that succeeded (> 1250 = coalesced or jumbo)
+                errors.LogWarning(context.Background(), "DIAG reply OK (large): udpConn.Write src=", c.remote, " pktLen=", len(buf))
         }
         if err == nil {
                 c.updateActivity()
