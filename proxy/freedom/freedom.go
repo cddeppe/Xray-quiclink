@@ -781,9 +781,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 errors.LogWarning(context.Background(), "DIAG freedom: inbound or inbound.Conn is nil — serverSCIDReader NOT wrapped")
                         }
                 }
+                errors.LogWarning(context.Background(), "DIAG freedom: responseDone STARTED copying Google replies to output dest=", destination)
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+                        errors.LogWarning(context.Background(), "DIAG freedom: responseDone buf.Copy ERROR dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(context.Background(), "DIAG freedom: responseDone buf.Copy DONE (Google socket closed) dest=", destination)
                 return nil
         }
 

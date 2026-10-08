@@ -235,6 +235,13 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
+        // v26.11.124 DIAG: log reply packets being written back to Chrome
+        firstByte := byte(0)
+        if len(buf) > 0 {
+                firstByte = buf[0]
+        }
+        isLong := len(buf) > 0 && buf[0]&0x80 != 0
+        errors.LogWarning(context.Background(), "DIAG reply: udpConn.Write src=", c.remote, " pktLen=", len(buf), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", isLong)
         if len(buf) <= 1250 {
                 n, err := c.output(buf)
                 if c.downlink != nil {
