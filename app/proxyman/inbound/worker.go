@@ -544,6 +544,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 }
                         }
                         w.RUnlock()
+                        // v26.11.120 DIAG: DCID lookup missed for short header
+                        errors.LogWarning(context.Background(), "DIAG CB1d: DCID MISS short header src=", source, " dcid=", fmt.Sprintf("%x", dcid), " dcidIndexSize=", len(w.dcidIndex))
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
@@ -557,6 +559,20 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         }
                 }
                 w.RUnlock()
+
+                // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
+                // Previously these fell through to getConnection() → CB4 → proxy.Process
+                // → dokodemo → dispatcher. But the sniffer cannot extract SNI from a
+                // short header (no ClientHello), so the dispatcher falls back to the
+                // dokodemo LocalAddr-derived destination (127.0.0.1:443), and freedom
+                // dials the WRONG endpoint. This causes the video to stall because
+                // data goes to the local listener instead of Google.
+                //
+                // Dropping the packet is safer: QUIC will retransmit, and if the
+                // client gives up, it will start a fresh Initial (which CAN be sniffed).
+                errors.LogWarning(context.Background(), "DIAG CB1e: DROP short header (DCID+srcIndex both missed) src=", source, " pktLen=", len(b.Bytes()))
+                b.Release()
+                return
         }
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
@@ -944,27 +960,37 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
 // the same udpConn.
 func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) {
         if len(serverSCID) == 0 || browserSrc == nil {
+                errors.LogWarning(context.Background(), "DIAG OnServerSCID: early return (empty scid or nil src)")
                 return
         }
         sk := makeSrcKeyFromUDPAddr(browserSrc)
         if sk.port == 0 && sk.ip == ([16]byte{}) {
+                errors.LogWarning(context.Background(), "DIAG OnServerSCID: early return (zero srcKey) browserSrc=", browserSrc)
                 return
         }
         w.Lock()
         defer w.Unlock()
         existingID, found := w.srcIndex[sk]
         if !found {
+                // v26.11.120 DIAG: srcIndex lookup missed — this means the server SCID
+                // cannot be registered because we don't know which conn it belongs to.
+                // This happens when the browser's source port doesn't match any
+                // existing conn (e.g., connection migration to a new port before the
+                // Initial reply arrived).
+                errors.LogWarning(context.Background(), "DIAG OnServerSCID: srcIndex MISS scid=", fmt.Sprintf("%x", serverSCID), " browserSrc=", browserSrc, " srcIndexSize=", len(w.srcIndex))
                 return
         }
         existingConn, ok := w.activeConn[existingID]
         if !ok || existingConn.done.Done() {
                 delete(w.srcIndex, sk)
+                errors.LogWarning(context.Background(), "DIAG OnServerSCID: conn gone scid=", fmt.Sprintf("%x", serverSCID), " browserSrc=", browserSrc)
                 return
         }
         _ = existingConn
         dk := makeDCIDKey(serverSCID)
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = existingID
+                errors.LogWarning(context.Background(), "DIAG OnServerSCID: REGISTERED scid=", fmt.Sprintf("%x", serverSCID), " browserSrc=", browserSrc, " dcidIndexSize=", len(w.dcidIndex))
         }
 }
 
