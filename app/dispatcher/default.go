@@ -422,7 +422,17 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
         }
 
         contentResult, contentErr := func() (SniffResult, error) {
+                // v26.11.130: Fast path for UDP — QUIC Initial arrives as one
+                // complete datagram. No need for the 200ms / 2-attempt loop that
+                // TCP/TLS uses for fragmented ClientHellos. One read, one sniff,
+                // return immediately. This eliminates the buffering delay that
+                // may break Chrome's QUIC timing.
                 cacheDeadline := 200 * time.Millisecond
+                maxAttempts := 2
+                if network == net.Network_UDP {
+                        cacheDeadline = 10 * time.Millisecond
+                        maxAttempts = 1
+                }
                 totalAttempt := 0
                 for {
                         select {
@@ -450,7 +460,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                                 } else {
                                         totalAttempt++
                                 }
-                                if totalAttempt >= 2 || cacheDeadline <= 0 {
+                                if totalAttempt >= maxAttempts || cacheDeadline <= 0 {
                                         return nil, errSniffingTimeout
                                 }
                         }
