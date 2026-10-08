@@ -389,3 +389,17 @@ git rebase upstream/main
 3. **NEW_CONNECTION_ID frame tracking** — current srcIndex fallback handles common case
 4. **GSO/GRO for outbound** — batch syscalls for throughput, not needed for single user
 5. **WireGuard + TPROXY** — the only way to make YouTube over QUIC work. Would require switching from DNS hijacking to a routed tunnel architecture.
+
+---
+
+## License
+
+[Mozilla Public License Version 2.0](LICENSE)
+
+This fork is based on [Xray-core](https://github.com/XTLS/Xray-core) by the Project X community. All upstream license terms apply to the original code. Fork-specific additions are licensed under the same MPL-2.0.
+
+## Credits
+
+- [Xray-core](https://github.com/XTLS/Xray-core) — the upstream project this fork is based on
+- [Project X](https://github.com/XTLS) — the community behind xray-core
+- All contributors to the upstream project whose work this fork builds upon
