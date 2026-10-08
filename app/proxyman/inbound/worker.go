@@ -3,6 +3,7 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        "fmt"
         stdnet "net"
         "sync"
 
@@ -463,6 +464,14 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
+        // v26.11.118 DIAG: log every UDP packet arrival
+        pktBytes := b.Bytes()
+        firstByte := byte(0)
+        if len(pktBytes) > 0 {
+                firstByte = pktBytes[0]
+        }
+        errors.LogWarning(context.Background(), "DIAG CB1 callback: src=", source, " origDestValid=", originalDest.IsValid(), " pktLen=", len(pktBytes), " firstByte=0x", fmt.Sprintf("%02x", firstByte), " isLong=", firstByte&0x80 != 0)
+
         id := connID{
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
