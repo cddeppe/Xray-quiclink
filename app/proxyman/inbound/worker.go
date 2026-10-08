@@ -188,6 +188,10 @@ type udpConn struct {
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
+        // v26.11.117: Callback to register server SCID when seen in reply.
+        // Set by freedom.Process when pool is OFF, so the per-session reader
+        // can learn the server's SCID and register it in dcidIndex.
+        registerServerCID func([]byte)
 }
 
 func (c *udpConn) setInactive() {
@@ -196,6 +200,16 @@ func (c *udpConn) setInactive() {
 
 func (c *udpConn) updateActivity() {
         atomic.StoreInt64(&c.lastActivityTime, time.Now().Unix())
+}
+
+// v26.11.117: RegisterServerSCID is called by freedom's reader wrapper
+// when it detects a long-header reply from Google. The server's SCID
+// is registered in dcidIndex so subsequent 1-RTT short headers (which
+// carry DCID=server_SCID) can be routed to the correct conn.
+func (c *udpConn) RegisterServerSCID(serverSCID []byte) {
+        if c.registerServerCID != nil {
+                c.registerServerCID(serverSCID)
+        }
 }
 
 // ReadMultiBuffer implements buf.Reader
@@ -493,18 +507,37 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         }
                 }
         }
-        // v26.11.52-link: Solution A — for short headers with no id.dest,
-        // look up the existing conn by srcKey and reuse its id.dest so
-        // getConnection finds the same conn. This avoids creating a new
-        // conn → new DispatchLink → sniffing fails (no SNI) → 127.0.0.1
-        // loop → freeze.
+        // v26.11.117: DCID-first routing for short headers.
         //
-        // v26.11.56-link: restored (was removed in v26.11.54's rewrite).
-        // Without this, 1-RTT short headers create a new conn, the sniffer
-        // can't extract SNI (short headers don't carry it), and the packet
-        // is routed to 127.0.0.1:443 — a packet loop that kills the QUIC
-        // connection and forces TCP fallback.
+        // Chrome multiplexes multiple QUIC connections through ONE UDP socket
+        // (same source port). The old Solution A routed ALL short headers from
+        // a source port to the FIRST connection — connection #2's packets went
+        // to connection #1's server, causing stalls.
+        //
+        // Fix: For short headers, try DCID lookup FIRST. The DCID in a 1-RTT
+        // short header is the server's SCID (learned from the server's Initial
+        // reply). If dcidIndex has it, route to the correct conn.
+        //
+        // Fall back to srcIndex only if DCID lookup misses AND there's exactly
+        // one conn for this source (safe for single-connection cases like h3
+        // test sites).
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                // Try DCID lookup first
+                if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
+                        dk := makeDCIDKey(dcid)
+                        w.RLock()
+                        if existingID, found := w.dcidIndex[dk]; found {
+                                if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                        w.RUnlock()
+                                        existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                                        existingConn.updateActivity()
+                                        return
+                                }
+                        }
+                        w.RUnlock()
+                }
+
+                // DCID miss — fall back to srcIndex (single-connection case)
                 w.RLock()
                 if existingID, found := w.srcIndex[id.srcKey]; found {
                         if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
@@ -548,6 +581,24 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         if !existing {
                 w.recordDCID(b.Bytes(), id, conn)
                 w.recordSrc(id, conn)
+                // v26.11.117: Set up server SCID registration callback.
+                // When freedom.Process sees a long-header reply from Google,
+                // it extracts the server's SCID and calls this callback.
+                // The callback registers the SCID in dcidIndex so subsequent
+                // 1-RTT short headers (which carry DCID=server_SCID) can be
+                // routed to the correct conn.
+                connIDCopy := id
+                conn.registerServerCID = func(serverSCID []byte) {
+                        if len(serverSCID) == 0 {
+                                return
+                        }
+                        dk := makeDCIDKey(serverSCID)
+                        w.Lock()
+                        if _, exists := w.dcidIndex[dk]; !exists {
+                                w.dcidIndex[dk] = connIDCopy
+                        }
+                        w.Unlock()
+                }
         }
 
         // payload will be discarded in pipe is full.
@@ -581,6 +632,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
                                 Gateway: net.UDPDestination(w.address, w.port),
                                 Tag:     w.tag,
+                                Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
                         })
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
@@ -632,40 +684,11 @@ func (w *udpWorker) removeConn(id connID) {
 //     via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
 //     finds existing conn. New DCID is added to dcidIndex for future packets.
 func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
-        // v26.10.36-link: 1-RTT short-header packets are zero-overhead here.
-        // The SNI was already extracted from the Initial; the conn is
-        // already in srcIndex under id.srcKey. We don't need to parse
-        // DCID or acquire w.Lock() for the 99% case in a long-lived
-        // QUIC connection.
-        //
-        // v26.10.10 introduced the same regression here as in SniffQUIC:
-        // every 1-RTT packet paid ParseDCID + dcidKey + w.Lock + map
-        // lookup, all of which miss because the conn is already known
-        // by srcKey (handled by the fast path below). At 1000+ pps this
-        // was 80ns + 1 mutex per packet of pure waste.
-        //
-        // v26.10.35 fixed the sniffer half; v26.10.36 fixes the worker
-        // half. A 1-RTT packet now does: 1 byte test + RLock + 1 map
-        // lookup (srcIndex) + RUnlock + return nil.
-        if len(packet) > 0 && packet[0]&0x80 == 0 {
-                // Short header — existing conn, no migration lookup needed.
-                // The srcIndex fast path below will return nil for this case.
-                // Use RLock instead of Lock since we only read maps.
-                w.RLock()
-                _, found := w.srcIndex[id.srcKey]
-                w.RUnlock()
-                if found {
-                        // Conn is known, no migration. Return nil so the
-                        // caller falls through to getConnection (which will
-                        // also hit the same srcIndex lookup — slight waste
-                        // but keeps the code simple; the fast path is still
-                        // 1 mutex + 1 lookup total).
-                        return nil
-                }
-                // src is unknown — must be a new connection OR a migration
-                // we haven't seen yet. Fall through to the full path with
-                // ParseDCID + dcidIndex lookup.
-        }
+        // v26.11.117: Removed the short-header fast-path bypass.
+        // Previously, short headers from a known source skipped DCID lookup
+        // entirely and returned nil. This prevented DCID-based routing for
+        // parallel QUIC connections sharing a source port.
+        // Now short headers go through the full DCID lookup path.
 
         // v26.10.16-link: src-first fast path with zero-allocation struct keys.
         //

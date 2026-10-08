@@ -20,6 +20,7 @@ import (
         "github.com/xtls/xray-core/common/geodata"
         "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/common/platform"
+        "github.com/xtls/xray-core/common/protocol/quic"
         "github.com/xtls/xray-core/common/retry"
         "github.com/xtls/xray-core/common/session"
         "github.com/xtls/xray-core/common/signal"
@@ -758,6 +759,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+                        // v26.11.117: Wrap reader to detect server SCID from
+                        // long-header replies. When Google's Initial reply
+                        // arrives, extract the SCID and register it in the
+                        // worker's dcidIndex via RegisterServerSCID.
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
+                                        var scidRegistered bool
+                                        baseReader := reader
+                                        reader = &serverSCIDReader{
+                                                base:       baseReader,
+                                                register:   reg.RegisterServerSCID,
+                                                registered: &scidRegistered,
+                                        }
+                                }
+                        }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         return errors.New("failed to process response").Base(err)
@@ -1125,4 +1141,41 @@ func GenerateRandomBytes(n int64) ([]byte, error) {
         }
 
         return b, nil
+}
+
+// v26.11.117: serverSCIDReader wraps a buf.Reader to detect the server's
+// SCID from long-header QUIC replies. When Google's Initial reply arrives,
+// the SCID is extracted and registered via RegisterServerSCID, so the
+// worker's dcidIndex can route subsequent 1-RTT short headers (which
+// carry DCID=server_SCID) to the correct conn.
+type serverSCIDReader struct {
+        base       buf.Reader
+        register   func([]byte) // RegisterServerSCID method
+        registered *bool
+}
+
+func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        mb, err := r.base.ReadMultiBuffer()
+        if err != nil {
+                return mb, err
+        }
+
+        // Only scan once — after the first long header is seen, no need to
+        // check again (the SCID is registered).
+        if !*r.registered {
+                for _, b := range mb {
+                        data := b.Bytes()
+                        if len(data) > 0 && data[0]&0x80 != 0 {
+                                // Long header — try to parse SCID
+                                if scid, _, perr := quic.ParseSCID(data); perr == nil && len(scid) > 0 {
+                                        // Register the server's SCID in dcidIndex
+                                        r.register(scid)
+                                        *r.registered = true
+                                        break
+                                }
+                        }
+                }
+        }
+
+        return mb, nil
 }
