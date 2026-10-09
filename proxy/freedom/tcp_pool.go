@@ -52,7 +52,14 @@ type warmConn struct {
 }
 
 func NewTCPSocketPool(timeout time.Duration, preWarmN int, preWarmFirstN int, learnVisits int) *TCPSocketPool {
-        maxIdle := 4 // default: allow 4 conns per destination
+        // v26.11.134: default maxIdle=8 (was 4) — YouTube opens 6-12 parallel
+        // connections per CDN IP. 8 allows most to be reused.
+        maxIdle := 8
+        // v26.11.134: if timeout is too short, bump to 120s — connections
+        // expire too quickly during active browsing with 30s.
+        if timeout < 60*time.Second {
+                timeout = 120 * time.Second
+        }
         p := &TCPSocketPool{
                 warm:        make(map[string][]*warmConn),
                 maxIdle:     maxIdle,
