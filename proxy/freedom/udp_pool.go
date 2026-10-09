@@ -656,25 +656,26 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
-        // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
-        // v26.11.158: Do NOT delete demux entries here.
-        // The demux entries (DCID → inbox) must stay so that replies for
-        // OTHER connections sharing this socket still get routed. The
-        // readLoop will check c.closed and skip sending to closed conns
-        // (ReadFrom returns EOF via c.done). The entries will be cleaned
-        // up by the pool's evictExpired() when the socket is released.
-        //
-        // The old code deleted ALL DCID entries belonging to this pooledConn
-        // from the socket's demux. This killed other connections sharing
-        // the same socket (same destination IP) — the second video's
-        // replies would be dropped.
+        // v26.11.160: RESTORE demux cleanup. The original code only deleted
+        // entries where existing == c.inbox (this pooledConn's own entries).
+        // It did NOT delete other connections' entries. This is safe and
+        // necessary — without it, stale entries accumulate and the readLoop
+        // wastes time sending to dead inboxes.
+        c.mu.Lock()
+        c.socket.mu.Lock()
+        for dk := range c.scidsDCID {
+                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+                        delete(c.socket.demux, dk)
+                        delete(c.socket.demuxSource, dk)
+                }
+        }
+        c.socket.mu.Unlock()
+        c.mu.Unlock()
 
         c.socket.release()
         return nil
