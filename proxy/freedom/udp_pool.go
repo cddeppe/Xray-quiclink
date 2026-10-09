@@ -38,24 +38,21 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
+        mu            sync.RWMutex
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        // v26.10.43-link (audit P5): atomic timestamps to avoid
-        // mutex contention on the readLoop hot path.
-        lastUsed      atomic.Int64 // UnixNano
-        lastReplyTime atomic.Int64  // UnixNano
-        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
+        lastUsed      atomic.Int64
+        lastReplyTime atomic.Int64
+        demux         map[dcidKey]chan<- readResult
         demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
-        // v26.10.15-link: dropped reply packets counter for observability.
-        // Incremented when the inbox channel (cap 32) is full and the
-        // readLoop drops a reply packet. QUIC will retransmit, but
-        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
+        // v26.11.158: Track all pooledConns so readLoop can check
+        // if a pooledConn is closed before sending to its inbox.
+        conns []*pooledConn
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -335,6 +332,10 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
+        // v26.11.158: Track this pooledConn so readLoop can check IsClosed
+        sock.mu.Lock()
+        sock.conns = append(sock.conns, conn)
+        sock.mu.Unlock()
         return conn, nil
 }
 
@@ -431,18 +432,23 @@ func (s *pooledSocket) readLoop() {
                         }
                 }
 
+                // v26.11.158: Check if the pooledConn is closed before sending.
+                // If closed, nobody is reading from the inbox. Drop the packet
+                // instead of filling the channel and blocking the readLoop.
+                s.mu.RLock()
+                isClosed := false
+                for _, pc := range s.conns {
+                        if pc.inbox == ch && pc.closed.Load() {
+                                isClosed = true
+                                break
+                        }
+                }
+                s.mu.RUnlock()
+                if isClosed {
+                        putPacket(packet)
+                        continue
+                }
                 // v26.10.21-link: non-blocking send with large channel (256).
-                //
-                // The blocking send (v26.10.20) was WRONG for the shared-socket
-                // model: one slow/stale session's full channel would block the
-                // entire readLoop, starving ALL other sessions sharing the same
-                // socket. This made YouTube stalls WORSE when swiping quickly
-                // between videos (many sessions, one stale session blocks all).
-                //
-                // The correct approach for a shared readLoop:
-                // 1. Large channel (256) so drops are rare during bursts
-                // 2. Non-blocking send so one slow session doesn't starve others
-                // 3. Track drops for observability
                 sentOk := false
                 packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
                 select {
@@ -667,20 +673,17 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
+        // v26.11.158: Do NOT delete demux entries here.
+        // The demux entries (DCID → inbox) must stay so that replies for
+        // OTHER connections sharing this socket still get routed. The
+        // readLoop will check c.closed and skip sending to closed conns
+        // (ReadFrom returns EOF via c.done). The entries will be cleaned
+        // up by the pool's evictExpired() when the socket is released.
+        //
+        // The old code deleted ALL DCID entries belonging to this pooledConn
+        // from the socket's demux. This killed other connections sharing
+        // the same socket (same destination IP) — the second video's
+        // replies would be dropped.
 
         c.socket.release()
         return nil
