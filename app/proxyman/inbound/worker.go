@@ -278,6 +278,20 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 }
 
 func (c *udpConn) Close() error {
+        // v26.11.151: Soft close — don't close done or writer.
+        // handler.Dispatch calls Close() when proxy.Process returns, but
+        // we want the conn to stay alive for restarts. Only cancel the
+        // context (stops freedom's goroutines) and mark as needing restart.
+        if c.cancel != nil {
+                c.cancel()
+        }
+        // Do NOT close done or writer — they're needed for restarts.
+        // clean() will call hardClose() when the idle timeout expires.
+        return nil
+}
+
+// hardClose actually closes the pipe and done. Called by clean().
+func (c *udpConn) hardClose() error {
         if c.cancel != nil {
                 c.cancel()
         }
@@ -1013,7 +1027,7 @@ func (w *udpWorker) clean() error {
                                 delete(w.srcIndex, addr.srcKey)
                                 delete(w.activeConn, addr)
                         }
-                        conn.Close()
+                        conn.hardClose()
                 }
         }
 
