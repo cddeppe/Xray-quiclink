@@ -4,6 +4,7 @@ import (
         "context"
         "encoding/hex"
         stdnet "net"
+        "os"
         "sync"
 
         "github.com/xtls/xray-core/common/protocol/quic"
@@ -38,6 +39,14 @@ type worker interface {
         Port() net.Port
         Proxy() proxy.Inbound
 }
+
+// v26.11.135: dropQUICData controls whether QUIC 1-RTT (short header)
+// packets are dropped after the handshake. This causes Chrome to detect
+// QUIC loss and fall back to TCP quickly (~200ms), while still allowing
+// the QUIC handshake to complete (for snappy 0-RTT navigation).
+//
+// Enabled via env var: XRAY_QUIC_FALLBACK=1
+var dropQUICData = os.Getenv("XRAY_QUIC_FALLBACK") != ""
 
 type tcpWorker struct {
         address         net.Address
@@ -235,6 +244,12 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 func (c *udpConn) Write(buf []byte) (int, error) {
         // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
         // Forward the entire buffer as ONE UDP datagram, always.
+        // v26.11.135: In QUIC fallback mode, drop 1-RTT (short header) replies
+        // too — so Chrome doesn't receive any QUIC data and falls back to TCP.
+        if dropQUICData && len(buf) > 0 && buf[0]&0x80 == 0 {
+                // Short header (1-RTT) — drop it
+                return len(buf), nil
+        }
         n, err := c.output(buf)
         if c.downlink != nil {
                 c.downlink.Add(int64(n))
@@ -497,6 +512,17 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // one conn for this source (safe for single-connection cases like h3
         // test sites).
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+                // v26.11.135: QUIC fallback mode — drop ALL 1-RTT (short header)
+                // packets. The QUIC handshake (long headers) still goes through,
+                // so Chrome completes the handshake and gets 0-RTT benefits for
+                // small requests. But when Chrome tries to send/receive 1-RTT
+                // video data, the packets are dropped. Chrome detects 100% loss
+                // on 1-RTT and falls back to TCP within ~200ms (1 PTO).
+                if dropQUICData {
+                        b.Release()
+                        return
+                }
+
                 // Try DCID lookup first
                 if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
                         dk := makeDCIDKey(dcid)
