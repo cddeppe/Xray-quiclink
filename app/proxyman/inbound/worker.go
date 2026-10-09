@@ -45,8 +45,15 @@ type worker interface {
 // QUIC loss and fall back to TCP quickly (~200ms), while still allowing
 // the QUIC handshake to complete (for snappy 0-RTT navigation).
 //
-// Enabled via env var: XRAY_QUIC_FALLBACK=1
+// Enabled via config: destOverride: ["quic-fallback"]
+// (also via env var: XRAY_QUIC_FALLBACK=1 for backwards compat)
 var dropQUICData = os.Getenv("XRAY_QUIC_FALLBACK") != ""
+
+// SetQUICFallback enables/disables QUIC fallback mode at runtime.
+// Called from infra/conf when "quic-fallback" is in destOverride.
+func SetQUICFallback(enable bool) {
+        dropQUICData = enable
+}
 
 type tcpWorker struct {
         address         net.Address
