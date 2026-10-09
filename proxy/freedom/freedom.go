@@ -460,15 +460,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // the sticky resolver (if enabled), so the warm pool key matches the
         // actual IP:port the dialer would have used.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
-                // v26.11.132: SetDialFunc is now a no-op after the first call
-                // (checks for nil internally), so calling it every Process is cheap.
+                // v26.10.45-link: provide the dialer to the warm pool for
+                // pre-warming. Set once — the dialer is the same for all
+                // Process calls on this handler.
                 h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
                         return dialer.Dial(ctx, dest)
                 })
                 if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
-                        conn = warmConn
-                        warmAcquired = true
-                        errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        if warmConn.RemoteAddr() != nil {
+                                conn = warmConn
+                                warmAcquired = true
+                                errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        } else {
+                                warmConn.Close()
+                        }
                 }
         }
         var blockedDest *net.Destination
