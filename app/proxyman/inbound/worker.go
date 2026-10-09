@@ -577,10 +577,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         conn, existing := w.getConnection(id)
 
-        if existing {
-                errors.LogWarning(context.Background(), "DIAG: EXISTING conn src=", source, " dest=", id.dest)
-        }
-
         // v26.11.118: REMOVED the C3 re-check block (v26.10.43/v26.10.78).
         // The re-check ALWAYS found the conn that getConnection just created
         // (because getConnection stores it in activeConn before returning),
@@ -619,11 +615,9 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
         if !existing {
-                errors.LogWarning(context.Background(), "DIAG: NEW conn src=", source, " dest=", id.dest)
                 common.Must(w.checker.Start())
 
                 go func() {
-                        startTime := time.Now()
                         ctx, cancel := context.WithCancel(w.ctx)
                         conn.cancel = cancel
                         sid := session.NewID()
@@ -662,12 +656,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
-                        errors.LogWarning(context.Background(), "DIAG: Process RETURNED src=", source, " after=", time.Since(startTime).Round(time.Millisecond))
                         conn.Close()
                         if !conn.inactive {
                                 conn.setInactive()
                                 w.removeConn(id)
-                                errors.LogWarning(context.Background(), "DIAG: removeConn src=", source, " dcid=", len(w.dcidIndex), " src=", len(w.srcIndex))
                         }
                 }()
         }
