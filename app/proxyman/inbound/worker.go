@@ -604,6 +604,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
         if !existing {
+                errors.LogWarning(context.Background(), "DIAG: NEW conn created src=", source, " id.dest=", id.dest)
                 common.Must(w.checker.Start())
 
                 go func() {
@@ -645,14 +646,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
-                        // v26.11.146: Revert to v26.11.144 behavior — remove
-                        // conn from index when proxy.Process returns. v26.11.145
-                        // kept dead conns in the index, which was WORSE because
-                        // new packets routed to dead pipes (silently dropped).
+                        errors.LogWarning(context.Background(), "DIAG: proxy.Process RETURNED src=", source, " id.dest=", id.dest)
                         conn.Close()
                         if !conn.inactive {
                                 conn.setInactive()
                                 w.removeConn(id)
+                                errors.LogWarning(context.Background(), "DIAG: removeConn src=", source, " dcidIndexSize=", len(w.dcidIndex), " srcIndexSize=", len(w.srcIndex))
                         }
                 }()
         }
