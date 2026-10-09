@@ -664,21 +664,20 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        // v26.11.160: RESTORE demux cleanup. The original code only deleted
-        // entries where existing == c.inbox (this pooledConn's own entries).
-        // It did NOT delete other connections' entries. This is safe and
-        // necessary — without it, stale entries accumulate and the readLoop
-        // wastes time sending to dead inboxes.
-        c.mu.Lock()
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
+        // v26.11.164: Do NOT delete demux entries on Close.
+        // The registerPoolCID callback (v26.11.156) adds new DCIDs to the
+        // demux when CID rotation is detected. But proxy.Process can return
+        // immediately after, calling Close() which deletes those same entries.
+        // This creates a race: CID rotation registered → Close deletes it →
+        // Google's replies with the rotated DCID get dropped.
+        //
+        // Instead: leave entries in the demux. The non-blocking send in
+        // readLoop handles dead conns naturally — if nobody reads, the
+        // inbox channel fills up (256-cap) and packets are dropped (QUIC
+        // retransmits). No lock needed, no race condition.
+        //
+        // Stale entries are cleaned up when the pool socket is reaped
+        // (evictExpired closes the socket and clears all demux entries).
 
         c.socket.release()
         return nil
