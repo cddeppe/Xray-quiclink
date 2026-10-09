@@ -414,7 +414,10 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
                 // TCP/TLS uses for fragmented ClientHellos. One read, one sniff,
                 // return immediately. This eliminates the buffering delay that
                 // may break Chrome's QUIC timing.
-                cacheDeadline := 200 * time.Millisecond
+                // v26.11.133: Also speed up TCP — 50ms deadline (was 200ms).
+                // TLS ClientHello typically arrives in one packet (~1-5ms).
+                // 50ms is 10× safety margin for fragmented ECH ClientHellos.
+                cacheDeadline := 50 * time.Millisecond
                 maxAttempts := 2
                 if network == net.Network_UDP {
                         cacheDeadline = 10 * time.Millisecond
