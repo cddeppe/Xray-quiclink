@@ -249,22 +249,50 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
-        // Forward the entire buffer as ONE UDP datagram, always.
         // v26.11.135: In QUIC fallback mode, drop 1-RTT (short header) replies
         // too — so Chrome doesn't receive any QUIC data and falls back to TCP.
         if dropQUICData && len(buf) > 0 && buf[0]&0x80 == 0 {
                 // Short header (1-RTT) — drop it
                 return len(buf), nil
         }
-        n, err := c.output(buf)
-        if c.downlink != nil {
-                c.downlink.Add(int64(n))
+        // v26.11.137: Re-add SplitCoalesced (from v26.11.55 which had smooth
+        // QUIC). Packets > 1250 bytes are split into separate UDP datagrams.
+        // This was the behavior when QUIC worked smoothly.
+        if len(buf) <= 1250 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        if err == nil {
-                c.updateActivity()
+        offsets, splitErr := quic.SplitCoalesced(buf)
+        if splitErr != nil || len(offsets) <= 1 {
+                n, err := c.output(buf)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if err == nil {
+                        c.updateActivity()
+                }
+                return n, err
         }
-        return n, err
+        total := 0
+        for _, off := range offsets {
+                packet := buf[off[0]:off[1]]
+                n, werr := c.output(packet)
+                if c.downlink != nil {
+                        c.downlink.Add(int64(n))
+                }
+                if werr != nil {
+                        return total, werr
+                }
+                total += n
+        }
+        c.updateActivity()
+        return total, nil
 }
 
 func (c *udpConn) Close() error {
