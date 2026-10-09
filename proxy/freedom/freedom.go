@@ -649,6 +649,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
+                                        // v26.11.156: Set up pool CID registration callback.
+                                        // When the inbound worker detects CID rotation in a
+                                        // 1-RTT short header, it calls this to register the
+                                        // new DCID in the pool's demux. Without this, Google's
+                                        // replies with the rotated DCID get dropped.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
+                                                        pc := pooledConn
+                                                        uc.SetRegisterPoolCID(func(newDCID []byte) {
+                                                                pc.RegisterCID(newDCID)
+                                                        })
+                                                }
+                                        }
                                 }
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.

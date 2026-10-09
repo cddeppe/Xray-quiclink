@@ -192,6 +192,11 @@ type udpConn struct {
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
+        // v26.11.156: registerPoolCID registers a new DCID in the UDP socket
+        // pool's demux. Called when CID rotation is detected — without this,
+        // the pool's readLoop drops replies with the new DCID, causing Google
+        // to think the connection is dead and stop replying (20-second freeze).
+        registerPoolCID func([]byte)
 }
 
 func (c *udpConn) setInactive() {
@@ -210,6 +215,12 @@ func (c *udpConn) RegisterServerSCID(serverSCID []byte) {
         if c.registerServerCID != nil {
                 c.registerServerCID(serverSCID)
         }
+}
+
+// v26.11.156: SetRegisterPoolCID sets the callback for registering
+// new DCIDs in the pool's demux. Called by freedom when the pool is used.
+func (c *udpConn) SetRegisterPoolCID(f func([]byte)) {
+        c.registerPoolCID = f
 }
 
 // ReadMultiBuffer implements buf.Reader
@@ -740,8 +751,13 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         newDk := makeDCIDKey(newDcid)
                                         if _, exists := w.dcidIndex[newDk]; !exists {
                                                 w.dcidIndex[newDk] = oldID
-                                                // Don't overwrite conn.dcid —
-                                                // keep the original for cleanup.
+                                                // v26.11.156: Also register in pool's demux so
+                                                // readLoop can route replies with the new DCID.
+                                                // Without this, Google's replies with the rotated
+                                                // DCID get dropped → connection dies after ~20s.
+                                                if oldConn.registerPoolCID != nil {
+                                                        oldConn.registerPoolCID(newDcid)
+                                                }
                                         }
                                 }
                         }
