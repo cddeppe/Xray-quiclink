@@ -432,23 +432,14 @@ func (s *pooledSocket) readLoop() {
                         }
                 }
 
-                // v26.11.158: Check if the pooledConn is closed before sending.
-                // If closed, nobody is reading from the inbox. Drop the packet
-                // instead of filling the channel and blocking the readLoop.
-                s.mu.RLock()
-                isClosed := false
-                for _, pc := range s.conns {
-                        if pc.inbox == ch && pc.closed.Load() {
-                                isClosed = true
-                                break
-                        }
-                }
-                s.mu.RUnlock()
-                if isClosed {
-                        putPacket(packet)
-                        continue
-                }
                 // v26.10.21-link: non-blocking send with large channel (256).
+                // v26.11.159: Removed IsClosed check — it acquired RLock and
+                // iterated ALL conns per packet, blocking RegisterCID (which
+                // needs Lock). This delayed CID rotation registration, causing
+                // Google's replies with the new DCID to be dropped.
+                // The non-blocking send already handles dead conns: if the
+                // inbox is full (nobody reading), the packet is dropped (QUIC
+                // retransmits). No lock needed.
                 sentOk := false
                 packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
                 select {
