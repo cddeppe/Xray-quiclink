@@ -522,62 +522,19 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         }
                 }
         }
-        // v26.11.117: DCID-first routing for short headers.
+        // v26.11.141: REMOVED DCID-first routing block (was v26.11.117).
+        // This block added ParseDCID + RLock + map lookup overhead on EVERY
+        // short-header packet, even when packets are being dropped.
+        // v26.11.55 (smooth) did NOT have this block — it relied on
+        // tryQUICMigration's fast path for short headers instead.
         //
-        // Chrome multiplexes multiple QUIC connections through ONE UDP socket
-        // (same source port). The old Solution A routed ALL short headers from
-        // a source port to the FIRST connection — connection #2's packets went
-        // to connection #1's server, causing stalls.
-        //
-        // Fix: For short headers, try DCID lookup FIRST. The DCID in a 1-RTT
-        // short header is the server's SCID (learned from the server's Initial
-        // reply). If dcidIndex has it, route to the correct conn.
-        //
-        // Fall back to srcIndex only if DCID lookup misses AND there's exactly
-        // one conn for this source (safe for single-connection cases like h3
-        // test sites).
+        // v26.11.135: QUIC fallback mode — drop ALL 1-RTT (short header)
+        // packets early, before any DCID parsing or lock acquisition.
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                // v26.11.135: QUIC fallback mode — drop ALL 1-RTT (short header)
-                // packets. The QUIC handshake (long headers) still goes through,
-                // so Chrome completes the handshake and gets 0-RTT benefits for
-                // small requests. But when Chrome tries to send/receive 1-RTT
-                // video data, the packets are dropped. Chrome detects 100% loss
-                // on 1-RTT and falls back to TCP within ~200ms (1 PTO).
                 if dropQUICData {
                         b.Release()
                         return
                 }
-
-                // Try DCID lookup first
-                if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
-                        dk := makeDCIDKey(dcid)
-                        w.RLock()
-                        if existingID, found := w.dcidIndex[dk]; found {
-                                if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                        w.RUnlock()
-                                        existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                        existingConn.updateActivity()
-                                        return
-                                }
-                        }
-                        w.RUnlock()
-                }
-
-                // DCID miss — fall back to srcIndex (single-connection case)
-                w.RLock()
-                if existingID, found := w.srcIndex[id.srcKey]; found {
-                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                w.RUnlock()
-                                existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                existingConn.updateActivity()
-                                return
-                        }
-                }
-                w.RUnlock()
-
-                // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
-                b.Release()
-                return
         }
         // Try QUIC DCID-based migration lookup before creating a new conn
         if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
@@ -728,25 +685,24 @@ func (w *udpWorker) removeConn(id connID) {
 //     via NEW_CONNECTION_ID frames). DCID lookup misses, but src IP:port lookup
 //     finds existing conn. New DCID is added to dcidIndex for future packets.
 func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
-        // v26.11.117: Removed the short-header fast-path bypass.
-        // Previously, short headers from a known source skipped DCID lookup
-        // entirely and returned nil. This prevented DCID-based routing for
-        // parallel QUIC connections sharing a source port.
-        // Now short headers go through the full DCID lookup path.
+        // v26.11.141: RESTORE short-header fast-path bypass (from v26.11.55).
+        // For 1-RTT short-header packets from a known source, skip the full
+        // DCID migration lookup entirely — just return nil so the caller
+        // falls through to getConnection (which finds the existing conn via
+        // srcIndex). This eliminates ParseDCID + Lock overhead on 99% of
+        // packets in a long-lived QUIC connection.
+        if len(packet) > 0 && packet[0]&0x80 == 0 {
+                // Short header — existing conn, no migration lookup needed.
+                w.RLock()
+                _, found := w.srcIndex[id.srcKey]
+                w.RUnlock()
+                if found {
+                        return nil
+                }
+                // src is unknown — fall through to full path
+        }
 
         // v26.10.16-link: src-first fast path with zero-allocation struct keys.
-        //
-        // For steady-state 1-RTT traffic (99% of packets in a long-lived
-        // QUIC connection), the source IP:port is already in srcIndex and
-        // matches the existing conn. We check src FIRST using id.srcKey
-        // (a precomputed 18-byte struct) so we can return nil (no
-        // migration) without parsing the DCID, hex-encoding it, or
-        // allocating any string. This eliminates 4 allocations per
-        // inbound packet (the old id.src.String() triggered IP.String +
-        // Port.String + two string concats).
-        //
-        // Only if src is unknown (new connection) OR src is known but the
-        // dest differs (CID rotation) do we parse the DCID.
         sk := id.srcKey
 
         w.Lock()
