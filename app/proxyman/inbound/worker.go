@@ -598,15 +598,23 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         conn, existing := w.getConnection(id)
 
-        // v26.11.118: REMOVED the C3 re-check block (v26.10.43/v26.10.78).
-        // The re-check ALWAYS found the conn that getConnection just created
-        // (because getConnection stores it in activeConn before returning),
-        // setting existing=true and skipping the goroutine that starts
-        // proxy.Process. This is why UDP QUIC traffic was silently dropped —
-        // the goroutine never started, so the sniffer never ran, so the
-        // dispatcher never routed the traffic.
-        // getConnection already holds the lock during creation, so the race
-        // is already prevented.
+        // v26.11.138: RE-ADD the C3 re-check block (from v26.10.43/v26.10.78).
+        // This was present in v26.11.55 when QUIC was smooth. Without it,
+        // QUIC is not smooth. The re-check catches races where two Initials
+        // arrive simultaneously — the second goroutine's getConnection creates
+        // a duplicate conn, and the re-check discards it in favor of the
+        // existing one.
+        if !existing {
+                w.Lock()
+                if existingConn, found := w.activeConn[id]; found && !existingConn.done.Done() {
+                        // Another goroutine won the race. Use their conn.
+                        w.Unlock()
+                        conn = existingConn
+                        existing = true
+                } else {
+                        w.Unlock()
+                }
+        }
 
         // Record DCID and src for new QUIC connections
         if !existing {
