@@ -717,11 +717,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // fired (responseDone returned, so YouTube closed the outbound).
                         select {
                         case <-inputCloser:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (inputCloser) dest=", destination)
                                 return nil // graceful — let Dispatch Close(link.Writer)
                         default:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (error) dest=", destination, " err=", err)
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
+                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (copy done) dest=", destination)
                 return nil
         }
 
@@ -768,8 +771,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+                        errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
                 return nil
         }
 
