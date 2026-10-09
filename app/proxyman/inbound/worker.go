@@ -645,14 +645,15 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
+                        // v26.11.146: Revert to v26.11.144 behavior — remove
+                        // conn from index when proxy.Process returns. v26.11.145
+                        // kept dead conns in the index, which was WORSE because
+                        // new packets routed to dead pipes (silently dropped).
                         conn.Close()
-                        // v26.11.145: Do NOT call removeConn here. Let clean()
-                        // handle removal on the idle timeout (default 1800s).
-                        // This prevents connection leaks when Chrome reuses the
-                        // same source port for a new QUIC connection — the old
-                        // conn stays in srcIndex/dcidIndex so tryQUICMigration
-                        // can find it and avoid creating a duplicate.
-                        conn.setInactive()
+                        if !conn.inactive {
+                                conn.setInactive()
+                                w.removeConn(id)
+                        }
                 }()
         }
 }
