@@ -83,6 +83,13 @@ func (c *SniffingConfig) Build() (*proxyman.SniffingConfig, error) {
                         // Chrome falls back to TCP for video data.
                         protocols = append(protocols, "quic")
                         proxyman_inbound.SetQUICFallback(true)
+                case "quic-drop":
+                        // v26.11.140: QUIC drop mode. Sniff QUIC for SNI (so
+                        // routing works) but drop ALL packets silently. Chrome
+                        // gets silence (not ICMP), so its connection racing
+                        // starts TCP in parallel — no 1-second delay.
+                        protocols = append(protocols, "quic")
+                        proxyman_inbound.SetQUICDrop(true)
                 case "fakedns", "fakedns+others":
                         protocols = append(protocols, "fakedns")
                 default:

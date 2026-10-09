@@ -49,10 +49,23 @@ type worker interface {
 // (also via env var: XRAY_QUIC_FALLBACK=1 for backwards compat)
 var dropQUICData = os.Getenv("XRAY_QUIC_FALLBACK") != ""
 
+// v26.11.140: dropQUICAll controls whether ALL QUIC packets are dropped
+// silently (no ICMP, no reply). This replicates the C3 bug behavior:
+// Chrome sends QUIC, gets silence (not port-unreachable), and Chrome's
+// connection racing starts TCP in parallel. This avoids the 1-second
+// delay that occurs with destOverride: ["tls"] (which sends ICMP).
+//
+// Enabled via config: destOverride: ["quic-drop"]
+var dropQUICAll = false
+
 // SetQUICFallback enables/disables QUIC fallback mode at runtime.
-// Called from infra/conf when "quic-fallback" is in destOverride.
 func SetQUICFallback(enable bool) {
         dropQUICData = enable
+}
+
+// SetQUICDrop enables/disables QUIC drop mode at runtime.
+func SetQUICDrop(enable bool) {
+        dropQUICAll = enable
 }
 
 type tcpWorker struct {
@@ -450,6 +463,12 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 w.RLock()
                 srcCopy := *conn.src
                 w.RUnlock()
+                // v26.11.140: In quic-drop mode, don't send replies to Chrome.
+                // Chrome gets silence (not ICMP), so its connection racing
+                // starts TCP in parallel — no 1-second delay.
+                if dropQUICAll {
+                        return len(b), nil
+                }
                 return w.hub.WriteTo(b, srcCopy)
         }
         w.activeConn[id] = conn
@@ -616,6 +635,15 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         if !existing {
                 common.Must(w.checker.Start())
+
+                // v26.11.140: In quic-drop mode, don't start proxy.Process.
+                // The sniffer still runs (extracts SNI for routing), but
+                // freedom never dials Google. Chrome gets silence and
+                // falls back to TCP via connection racing. This replicates
+                // the C3 bug behavior but as an explicit feature.
+                if dropQUICAll {
+                        return
+                }
 
                 go func() {
                         ctx, cancel := context.WithCancel(w.ctx)
