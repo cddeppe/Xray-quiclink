@@ -646,11 +646,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
                         conn.Close()
-                        // conn not removed by checker TODO may be lock worker here is better
-                        if !conn.inactive {
-                                conn.setInactive()
-                                w.removeConn(id)
-                        }
+                        // v26.11.145: Do NOT call removeConn here. Let clean()
+                        // handle removal on the idle timeout (default 1800s).
+                        // This prevents connection leaks when Chrome reuses the
+                        // same source port for a new QUIC connection — the old
+                        // conn stays in srcIndex/dcidIndex so tryQUICMigration
+                        // can find it and avoid creating a duplicate.
+                        conn.setInactive()
                 }()
         }
 }
