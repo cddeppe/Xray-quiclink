@@ -255,44 +255,15 @@ func (c *udpConn) Write(buf []byte) (int, error) {
                 // Short header (1-RTT) — drop it
                 return len(buf), nil
         }
-        // v26.11.137: Re-add SplitCoalesced (from v26.11.55 which had smooth
-        // QUIC). Packets > 1250 bytes are split into separate UDP datagrams.
-        // This was the behavior when QUIC worked smoothly.
-        if len(buf) <= 1250 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        // v26.11.139: No SplitCoalesced — forward as ONE UDP datagram (testing)
+        n, err := c.output(buf)
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
         }
-        offsets, splitErr := quic.SplitCoalesced(buf)
-        if splitErr != nil || len(offsets) <= 1 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        if err == nil {
+                c.updateActivity()
         }
-        total := 0
-        for _, off := range offsets {
-                packet := buf[off[0]:off[1]]
-                n, werr := c.output(packet)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if werr != nil {
-                        return total, werr
-                }
-                total += n
-        }
-        c.updateActivity()
-        return total, nil
+        return n, err
 }
 
 func (c *udpConn) Close() error {
