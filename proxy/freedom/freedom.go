@@ -622,6 +622,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 }
                                 if udpRemote != nil {
                                         pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
@@ -685,6 +686,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pooledConn != nil)
 
                 var writer buf.Writer
                 if destination.Network == net.Network_TCP {
@@ -730,16 +732,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // fired (responseDone returned, so YouTube closed the outbound).
                         select {
                         case <-inputCloser:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (inputCloser) dest=", destination)
                                 return nil // graceful — let Dispatch Close(link.Writer)
                         default:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (error) dest=", destination, " err=", err)
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
+                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (copy done) dest=", destination)
                 return nil
         }
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
@@ -781,8 +787,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+                        errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
                 return nil
         }
 

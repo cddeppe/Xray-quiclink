@@ -661,30 +661,21 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        // v26.11.161: Collect entries to delete under lock, then delete
-        // without holding both c.mu and c.socket.mu simultaneously.
-        // Previously, holding both locks during iteration blocked the
-        // readLoop (which needs s.mu.RLock()). With 28+ simultaneous
-        // Close calls during rapid swiping, this blocked the readLoop
-        // for ~28ms, causing the kernel UDP buffer to overflow and
-        // drop Google's replies for active connections.
+        // v26.11.160: RESTORE demux cleanup. The original code only deleted
+        // entries where existing == c.inbox (this pooledConn's own entries).
+        // It did NOT delete other connections' entries. This is safe and
+        // necessary — without it, stale entries accumulate and the readLoop
+        // wastes time sending to dead inboxes.
         c.mu.Lock()
-        entriesToDelete := make([]dcidKey, 0, len(c.scidsDCID))
-        for dk := range c.scidsDCID {
-                entriesToDelete = append(entriesToDelete, dk)
-        }
-        c.mu.Unlock()
-
-        // Delete entries under socket.mu only (not c.mu).
-        // This is faster and blocks the readLoop for less time.
         c.socket.mu.Lock()
-        for _, dk := range entriesToDelete {
+        for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
                         delete(c.socket.demux, dk)
                         delete(c.socket.demuxSource, dk)
                 }
         }
         c.socket.mu.Unlock()
+        c.mu.Unlock()
 
         c.socket.release()
         return nil
