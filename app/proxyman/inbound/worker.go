@@ -769,13 +769,28 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         // (b) two distinct QUIC connections from the same src
                         //     to different destinations (YouTube does this)
                         //
-                        // Old code treated ALL same-src-different-dest as
-                        // CID rotation, mixing two connections' state machines.
-                        //
-                        // Fix: check if the DCID matches an existing conn
-                        // in dcidIndex. If it does, it's genuine migration
-                        // (same DCID found = same conn with new src). If not,
-                        // it's a new connection — fall through to slow path.
+                        // v26.11.165: For short-header packets (1-RTT), CID rotation
+                        // is the most likely cause. The new DCID won't be in dcidIndex
+                        // (it was never registered — it just arrived). But if the source
+                        // is known and the packet is a short header, register the new
+                        // DCID for the existing conn and return nil (same conn, no migration).
+                        // This prevents creating a new connection for CID rotation.
+                        if len(packet) > 0 && packet[0]&0x80 == 0 {
+                                if newDcid, _, err := quic.ParseDCID(packet); err == nil && len(newDcid) > 0 {
+                                        newDk := makeDCIDKey(newDcid)
+                                        if _, exists := w.dcidIndex[newDk]; !exists {
+                                                // New DCID not in index → CID rotation.
+                                                // Register it for this conn + pool demux.
+                                                w.dcidIndex[newDk] = oldID
+                                                if oldConn.registerPoolCID != nil {
+                                                        oldConn.registerPoolCID(newDcid)
+                                                }
+                                                w.Unlock()
+                                                return nil
+                                        }
+                                }
+                        }
+                        // Long header or DCID already exists → check dcidIndex
                         w.Unlock()
                         dcid, _, err := quic.ParseDCID(packet)
                         if err != nil || len(dcid) == 0 {

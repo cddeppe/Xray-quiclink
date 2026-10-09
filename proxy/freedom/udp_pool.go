@@ -137,15 +137,12 @@ func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
         if err != nil {
                 return nil, err
         }
-        // v26.11.163: Increase receive buffer to 4MB. During rapid swiping,
-        // 11+ connections close simultaneously, blocking the readLoop for
-        // ~11ms while pooledConn.Close() acquires socket.mu. The default
-        // 208KB buffer (~170 packets) overflows during this block, dropping
-        // Google's replies. Chrome's congestion control sees the drops,
-        // collapses the congestion window, and the video stalls.
-        // 4MB holds ~3000 packets — enough for 11ms of blocking at 1000 pps.
-        _ = pc.SetReadBuffer(4 * 1024 * 1024)
-        _ = pc.SetWriteBuffer(1 * 1024 * 1024)
+        // v26.10.19-link: only enter the SyscallConn/Control path when we
+        // actually have something to apply. If the sockopt has no interface
+        // and no mark (e.g., the "direct" outbound for YouTube), skip the
+        // entire Control path and return the bare socket — identical to
+        // v26.10.16 behavior. This avoids a regression where SyscallConn()
+        // + Control() had a side effect that broke the pool's read path.
         if p.sockopt == nil {
                 return pc, nil
         }
@@ -664,20 +661,21 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        // v26.11.164: Do NOT delete demux entries on Close.
-        // The registerPoolCID callback (v26.11.156) adds new DCIDs to the
-        // demux when CID rotation is detected. But proxy.Process can return
-        // immediately after, calling Close() which deletes those same entries.
-        // This creates a race: CID rotation registered → Close deletes it →
-        // Google's replies with the rotated DCID get dropped.
-        //
-        // Instead: leave entries in the demux. The non-blocking send in
-        // readLoop handles dead conns naturally — if nobody reads, the
-        // inbox channel fills up (256-cap) and packets are dropped (QUIC
-        // retransmits). No lock needed, no race condition.
-        //
-        // Stale entries are cleaned up when the pool socket is reaped
-        // (evictExpired closes the socket and clears all demux entries).
+        // v26.11.160: RESTORE demux cleanup. The original code only deleted
+        // entries where existing == c.inbox (this pooledConn's own entries).
+        // It did NOT delete other connections' entries. This is safe and
+        // necessary — without it, stale entries accumulate and the readLoop
+        // wastes time sending to dead inboxes.
+        c.mu.Lock()
+        c.socket.mu.Lock()
+        for dk := range c.scidsDCID {
+                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+                        delete(c.socket.demux, dk)
+                        delete(c.socket.demuxSource, dk)
+                }
+        }
+        c.socket.mu.Unlock()
+        c.mu.Unlock()
 
         c.socket.release()
         return nil
