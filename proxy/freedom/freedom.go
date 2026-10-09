@@ -622,6 +622,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 }
                                 if udpRemote != nil {
                                         pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
@@ -672,6 +673,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pooledConn != nil)
 
                 var writer buf.Writer
                 if destination.Network == net.Network_TCP {
@@ -730,6 +732,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
