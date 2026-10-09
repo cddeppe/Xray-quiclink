@@ -192,11 +192,6 @@ type udpConn struct {
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
-        // v26.11.147: processRunning prevents multiple proxy.Process goroutines.
-        // When proxy.Process returns, the goroutine sets this to false.
-        // When a new packet arrives for an existing conn, if processRunning
-        // is false, a new proxy.Process goroutine is started.
-        processRunning atomic.Bool
 }
 
 func (c *udpConn) setInactive() {
@@ -608,65 +603,59 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // payload will be discarded in pipe is full.
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
-        // v26.11.147: Start or restart proxy.Process if not already running.
-        // This keeps the conn alive across proxy.Process returns — when
-        // freedom's task.Run returns (e.g. idle timeout), the goroutine
-        // exits but the conn stays in the index. The next packet that
-        // arrives for this conn finds it, writes to the pipe, and starts
-        // a fresh proxy.Process goroutine.
-        if !conn.processRunning.Load() {
-                if conn.processRunning.CompareAndSwap(false, true) {
-                        common.Must(w.checker.Start())
-                        go w.runProcess(w.ctx, id, conn, source, originalDest)
-                }
-        }
-}
+        if !existing {
+                common.Must(w.checker.Start())
 
-// v26.11.147: runProcess runs proxy.Process on the given conn. When it
-// returns, processRunning is cleared so the next packet can restart it.
-// The conn is NOT closed or removed from the index — it stays alive so
-// tryQUICMigration and getConnection can find it for future packets.
-func (w *udpWorker) runProcess(parentCtx context.Context, id connID, conn *udpConn, source net.Destination, originalDest net.Destination) {
-        defer conn.processRunning.Store(false)
+                go func() {
+                        ctx, cancel := context.WithCancel(w.ctx)
+                        conn.cancel = cancel
+                        sid := session.NewID()
+                        ctx = c.ContextWithID(ctx, sid)
 
-        ctx, cancel := context.WithCancel(w.ctx)
-        conn.cancel = cancel
-        sid := session.NewID()
-        ctx = c.ContextWithID(ctx, sid)
+                        outbounds := []*session.Outbound{{}}
+                        if originalDest.IsValid() {
+                                outbounds[0].Target = originalDest
+                        } else {
+                                // v26.11.118: When originalDest is invalid (no TPROXY),
+                                // the outbound Target defaults to Network_TCP (Go zero value).
+                                // This causes the dispatcher to route UDP QUIC traffic as TCP.
+                                // Fix: set a UDP destination so the dispatcher knows this is UDP.
+                                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
+                        }
+                        ctx = session.ContextWithOutbounds(ctx, outbounds)
+                        local := net.DestinationFromAddr(w.hub.Addr())
+                        if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
+                                if source.Address.Family().IsIPv4() {
+                                        local.Address = net.AnyIP
+                                } else if source.Address.Family().IsIPv6() {
+                                        local.Address = net.AnyIPv6
+                                }
+                        }
 
-        outbounds := []*session.Outbound{{}}
-        if originalDest.IsValid() {
-                outbounds[0].Target = originalDest
-        } else {
-                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
+                        ctx = session.ContextWithInbound(ctx, &session.Inbound{
+                                Source:  source,
+                                Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
+                                Gateway: net.UDPDestination(w.address, w.port),
+                                Tag:     w.tag,
+                                Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
+                        })
+                        content := new(session.Content)
+                        content.SniffingRequest = w.sniffingRequest
+                        ctx = session.ContextWithContent(ctx, content)
+                        if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+                                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
+                        }
+                        // v26.11.146: Revert to v26.11.144 behavior — remove
+                        // conn from index when proxy.Process returns. v26.11.145
+                        // kept dead conns in the index, which was WORSE because
+                        // new packets routed to dead pipes (silently dropped).
+                        conn.Close()
+                        if !conn.inactive {
+                                conn.setInactive()
+                                w.removeConn(id)
+                        }
+                }()
         }
-        ctx = session.ContextWithOutbounds(ctx, outbounds)
-        local := net.DestinationFromAddr(w.hub.Addr())
-        if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
-                if source.Address.Family().IsIPv4() {
-                        local.Address = net.AnyIP
-                } else if source.Address.Family().IsIPv6() {
-                        local.Address = net.AnyIPv6
-                }
-        }
-
-        ctx = session.ContextWithInbound(ctx, &session.Inbound{
-                Source:  source,
-                Local:   local,
-                Gateway: net.UDPDestination(w.address, w.port),
-                Tag:     w.tag,
-                Conn:    conn,
-        })
-        content := new(session.Content)
-        content.SniffingRequest = w.sniffingRequest
-        ctx = session.ContextWithContent(ctx, content)
-        if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
-        }
-        // v26.11.147: Do NOT close conn or remove from index.
-        // The conn stays in activeConn/srcIndex/dcidIndex so future
-        // packets can find it and restart proxy.Process.
-        // clean() will remove it after idle timeout (1800s).
 }
 
 func (w *udpWorker) removeConn(id connID) {
