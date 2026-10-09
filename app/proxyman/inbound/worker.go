@@ -189,9 +189,12 @@ type udpConn struct {
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
         // v26.11.117: Callback to register server SCID when seen in reply.
-        // Set by freedom.Process when pool is OFF, so the per-session reader
-        // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
+        // v26.11.150: Restartable proxy.Process support
+        processRunning   atomic.Bool
+        // resolvedDest is the destination resolved by the sniffer on the first
+        // proxy.Process run. On restart, we skip the sniffer and use this.
+        resolvedDest     net.Destination
 }
 
 func (c *udpConn) setInactive() {
@@ -603,58 +606,74 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // payload will be discarded in pipe is full.
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
-        if !existing {
-                errors.LogWarning(context.Background(), "DIAG: NEW conn created src=", source, " id.dest=", id.dest)
-                common.Must(w.checker.Start())
-
-                go func() {
-                        ctx, cancel := context.WithCancel(w.ctx)
-                        conn.cancel = cancel
-                        sid := session.NewID()
-                        ctx = c.ContextWithID(ctx, sid)
-
-                        outbounds := []*session.Outbound{{}}
-                        if originalDest.IsValid() {
-                                outbounds[0].Target = originalDest
-                        } else {
-                                // v26.11.118: When originalDest is invalid (no TPROXY),
-                                // the outbound Target defaults to Network_TCP (Go zero value).
-                                // This causes the dispatcher to route UDP QUIC traffic as TCP.
-                                // Fix: set a UDP destination so the dispatcher knows this is UDP.
-                                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
-                        }
-                        ctx = session.ContextWithOutbounds(ctx, outbounds)
-                        local := net.DestinationFromAddr(w.hub.Addr())
-                        if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
-                                if source.Address.Family().IsIPv4() {
-                                        local.Address = net.AnyIP
-                                } else if source.Address.Family().IsIPv6() {
-                                        local.Address = net.AnyIPv6
-                                }
-                        }
-
-                        ctx = session.ContextWithInbound(ctx, &session.Inbound{
-                                Source:  source,
-                                Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
-                                Gateway: net.UDPDestination(w.address, w.port),
-                                Tag:     w.tag,
-                                Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
-                        })
-                        content := new(session.Content)
-                        content.SniffingRequest = w.sniffingRequest
-                        ctx = session.ContextWithContent(ctx, content)
-                        if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
-                        }
-                        errors.LogWarning(context.Background(), "DIAG: proxy.Process RETURNED src=", source, " id.dest=", id.dest)
-                        conn.Close()
-                        if !conn.inactive {
-                                conn.setInactive()
-                                w.removeConn(id)
-                                errors.LogWarning(context.Background(), "DIAG: removeConn src=", source, " dcidIndexSize=", len(w.dcidIndex), " srcIndexSize=", len(w.srcIndex))
-                        }
-                }()
+        // v26.11.150: Start or restart proxy.Process if not already running.
+        if !conn.processRunning.Load() {
+                if conn.processRunning.CompareAndSwap(false, true) {
+                        common.Must(w.checker.Start())
+                        go w.runProcess(w.ctx, id, conn, source, originalDest)
+                }
         }
+}
+
+// v26.11.150: runProcess runs proxy.Process on the given conn. When it
+// returns, processRunning is cleared so the next packet can restart it.
+// The conn is NOT closed or removed from the index.
+//
+// Key: on FIRST run, the sniffer extracts SNI and resolves the destination.
+// On RESTARTS, we skip the sniffer (disabled) and use the previously
+// resolved destination. This is critical because restart packets are
+// 1-RTT short headers (no SNI), so the sniffer would fail.
+func (w *udpWorker) runProcess(parentCtx context.Context, id connID, conn *udpConn, source net.Destination, originalDest net.Destination) {
+        defer conn.processRunning.Store(false)
+
+        ctx, cancel := context.WithCancel(w.ctx)
+        conn.cancel = cancel
+        sid := session.NewID()
+        ctx = c.ContextWithID(ctx, sid)
+
+        outbounds := []*session.Outbound{{}}
+        if conn.resolvedDest.IsValid() {
+                outbounds[0].Target = conn.resolvedDest
+        } else if originalDest.IsValid() {
+                outbounds[0].Target = originalDest
+        } else {
+                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
+        }
+        ctx = session.ContextWithOutbounds(ctx, outbounds)
+        local := net.DestinationFromAddr(w.hub.Addr())
+        if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
+                if source.Address.Family().IsIPv4() {
+                        local.Address = net.AnyIP
+                } else if source.Address.Family().IsIPv6() {
+                        local.Address = net.AnyIPv6
+                }
+        }
+
+        // v26.11.150: On restart (resolvedDest already set), disable sniffing
+        sniffingReq := w.sniffingRequest
+        if conn.resolvedDest.IsValid() {
+                sniffingReq.Enabled = false
+        }
+
+        ctx = session.ContextWithInbound(ctx, &session.Inbound{
+                Source:  source,
+                Local:   local,
+                Gateway: net.UDPDestination(w.address, w.port),
+                Tag:     w.tag,
+                Conn:    conn,
+        })
+        content := new(session.Content)
+        content.SniffingRequest = sniffingReq
+        ctx = session.ContextWithContent(ctx, content)
+        if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
+        }
+
+        // v26.11.150: Save the resolved destination for restarts.
+        if !conn.resolvedDest.IsValid() {
+                conn.resolvedDest = outbounds[0].Target
+        }
+        // Do NOT close conn or remove from index.
 }
 
 func (w *udpWorker) removeConn(id connID) {
