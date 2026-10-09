@@ -645,7 +645,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         Port: int(inbound.Source.Port),
                                                 }
                                         }
-                                        defer pooledConn.Close()
+                                        // v26.11.157: Do NOT defer pooledConn.Close().
+                                        // Closing pooledConn deletes ALL DCID entries from the
+                                        // pool's demux — including entries for other QUIC
+                                        // connections sharing the same socket. This kills
+                                        // the second video's connections when the first
+                                        // video's proxy.Process returns.
+                                        // Instead, let the pool's own timeout handle cleanup.
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
