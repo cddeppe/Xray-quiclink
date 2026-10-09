@@ -137,12 +137,15 @@ func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
         if err != nil {
                 return nil, err
         }
-        // v26.10.19-link: only enter the SyscallConn/Control path when we
-        // actually have something to apply. If the sockopt has no interface
-        // and no mark (e.g., the "direct" outbound for YouTube), skip the
-        // entire Control path and return the bare socket — identical to
-        // v26.10.16 behavior. This avoids a regression where SyscallConn()
-        // + Control() had a side effect that broke the pool's read path.
+        // v26.11.163: Increase receive buffer to 4MB. During rapid swiping,
+        // 11+ connections close simultaneously, blocking the readLoop for
+        // ~11ms while pooledConn.Close() acquires socket.mu. The default
+        // 208KB buffer (~170 packets) overflows during this block, dropping
+        // Google's replies. Chrome's congestion control sees the drops,
+        // collapses the congestion window, and the video stalls.
+        // 4MB holds ~3000 packets — enough for 11ms of blocking at 1000 pps.
+        _ = pc.SetReadBuffer(4 * 1024 * 1024)
+        _ = pc.SetWriteBuffer(1 * 1024 * 1024)
         if p.sockopt == nil {
                 return pc, nil
         }
