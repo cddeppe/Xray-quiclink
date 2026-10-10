@@ -831,18 +831,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.205: Re-enable BufferedPacketReader. This is what
-                        // makes the POOL work better — the pool has a dedicated
-                        // readLoop that always drains the socket, even when the
-                        // pipe to Chrome is blocked. Without this, buf.Copy
-                        // couples read+write: when the pipe write blocks, the
-                        // socket read stalls, the kernel UDP buffer overflows,
-                        // and Google's replies are dropped at the kernel level.
-                        //
-                        // The readLoop uses non-blocking send (drops when inbox
-                        // is full) so it NEVER blocks. The socket is always
-                        // drained. This matches the pool's architecture.
-                        reader = NewBufferedPacketReader(reader)
+                        // v26.11.208: BufferedPacketReader reverted. The lock
+                        // contention fixes (v206 srcMu + v207 sync.Map) should
+                        // be the real fix. BufferedPacketReader adds complexity
+                        // and wasn't conclusively helping.
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)

@@ -2,7 +2,6 @@ package udp
 
 import (
         "context"
-        "time"
 
         "github.com/xtls/xray-core/common/buf"
         "github.com/xtls/xray-core/common/errors"
@@ -83,13 +82,9 @@ func (h *Hub) Close() error {
 }
 
 func (h *Hub) WriteTo(payload []byte, dest net.Destination) (int, error) {
-        // v26.11.204: Add a tiny inter-packet delay to prevent kernel-level
-        // UDP receive buffer overflow on the client side. Simulation proved that
-        // without this, 15-23% of packets are dropped by the kernel during
-        // Google's burst transmissions (50-200 packets per burst).
-        // The delay is only 5 microseconds — negligible on real networks
-        // with 20-50ms RTT, but critical for preventing burst overflow.
-        time.Sleep(5 * time.Microsecond)
+        // v26.11.208: Removed 5µs delay (v204) — it wasn't helping and may
+        // interfere with QUIC timing. The real fix is the lock contention
+        // removal (v206 per-conn srcMu + v207 sync.Map for dcidIndex/srcIndex).
         return h.conn.WriteTo(payload, &net.UDPAddr{
                 IP:   dest.Address.IP(),
                 Port: int(dest.Port),
