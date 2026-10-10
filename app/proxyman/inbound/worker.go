@@ -585,11 +585,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 common.Must(w.checker.Start())
 
                 go func() {
-                        defer func() {
-                                if r := recover(); r != nil {
-                                        errors.LogWarning(context.Background(), "recovered panic: ", r)
-                                }
-                        }()
                         ctx, cancel := context.WithCancel(w.ctx)
                         conn.cancel = cancel
                         sid := session.NewID()
@@ -628,12 +623,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
-                        // v26.11.238: Do NOT close conn or removeConn when Process returns.
-                        // Process can return transiently while the Chrome QUIC connection
-                        // is still alive. removeConn deletes srcIndex/dcidIndex entries,
-                        // causing all subsequent packets to be dropped. Chrome sees no
-                        // ACKs, waits ~500ms, falls back to TCP.
-                        // clean() is the ONLY retirement path (idle timeout = 1800s).
+                        conn.Close()
+                        // conn not removed by checker TODO may be lock worker here is better
+                        if !conn.inactive {
+                                conn.setInactive()
+                                w.removeConn(id)
+                        }
                 }()
         }
 }
@@ -951,14 +946,7 @@ func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) 
 func (w *udpWorker) handlePackets() {
         receive := w.hub.Receive()
         for payload := range receive {
-                func() {
-                        defer func() {
-                                if r := recover(); r != nil {
-                                        errors.LogWarning(context.Background(), "recovered panic in callback: ", r)
-                                }
-                        }()
-                        w.callback(payload.Payload, payload.Source, payload.Target)
-                }()
+                w.callback(payload.Payload, payload.Source, payload.Target)
         }
 }
 
