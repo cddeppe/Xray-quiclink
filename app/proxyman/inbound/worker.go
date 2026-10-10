@@ -623,12 +623,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
-                        conn.Close()
-                        // conn not removed by checker TODO may be lock worker here is better
-                        if !conn.inactive {
-                                conn.setInactive()
-                                w.removeConn(id)
-                        }
+                        // v26.11.238: Do NOT close conn or removeConn when Process returns.
+                        // Process can return transiently while the Chrome QUIC connection
+                        // is still alive. removeConn deletes srcIndex/dcidIndex entries,
+                        // causing all subsequent packets to be dropped. Chrome sees no
+                        // ACKs, waits ~500ms, falls back to TCP.
+                        // clean() is the ONLY retirement path (idle timeout = 1800s).
                 }()
         }
 }
