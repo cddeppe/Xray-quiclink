@@ -753,7 +753,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
-                        // v26.11.217: Removed serverSCIDReader wrapper for testing
+                        // v26.11.224: Re-add serverSCIDReader — now lock-free!
+                        // The register callback uses sync.Map.Store (no w.Lock())
+                        // so it won't block the response path.
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
+                                        var scidRegistered bool
+                                        baseReader := reader
+                                        reader = &serverSCIDReader{
+                                                base:       baseReader,
+                                                register:   reg.RegisterServerSCID,
+                                                registered: &scidRegistered,
+                                        }
+                                }
+                        }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         return errors.New("failed to process response").Base(err)
