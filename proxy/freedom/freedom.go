@@ -640,6 +640,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 }
                                         }
                                         defer pooledConn.Close()
+                                        // v26.11.231: Set up registerPoolCID callback so
+                                        // OnServerSCID can register the server's SCID in
+                                        // the pool's demux for 1-RTT short header routing.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                type poolCIDRegistrar interface {
+                                                        SetRegisterPoolCID(func([]byte))
+                                                }
+                                                if reg, ok := inbound.Conn.(poolCIDRegistrar); ok {
+                                                        pc := pooledConn
+                                                        reg.SetRegisterPoolCID(pc.RegisterCID)
+                                                }
+                                        }
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
