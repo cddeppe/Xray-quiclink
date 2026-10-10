@@ -44,15 +44,11 @@ type pooledSocket struct {
         refCount      int
         lastUsed      atomic.Int64
         lastReplyTime atomic.Int64
-        demuxLF       sync.Map
-        demuxSrcLF    sync.Map
-        // v26.11.237: List of ALL inboxes for this socket. readLoop
-        // broadcasts every reply to ALL inboxes. Each connection's
-        // ReadFrom gets packets with wrong DCID, but QUIC silently
-        // drops them. This is simpler and more correct than demux —
-        // no CID registration needed, no 0-length SCID issues, no
-        // server SCID issues, no CID rotation issues.
-        inboxesLF     sync.Map // int -> chan<- readResult
+        demux         map[dcidKey]chan<- readResult
+        demuxSource   map[dcidKey]*stdnet.UDPAddr
+        // v26.11.246: Broadcast list — all inboxes for this socket.
+        // readLoop broadcasts every reply to ALL inboxes.
+        inboxes       sync.Map // int -> chan<- readResult
         inboxCount    atomic.Int64
         closed        chan struct{}
         closeOnce     sync.Once
@@ -298,6 +294,8 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
+                        demux:         make(map[dcidKey]chan<- readResult),
+                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
@@ -335,9 +333,9 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
-        // v26.11.237: Register this inbox in the socket's broadcast list
+        // v26.11.246: Register inbox in broadcast list
         idx := sock.inboxCount.Add(1)
-        sock.inboxesLF.Store(idx, inbox)
+        sock.inboxes.Store(idx, inbox)
         return conn, nil
 }
 
@@ -382,23 +380,21 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                // v26.11.237: Broadcast to ALL inboxes — no demux needed.
+                // v26.11.246: Broadcast to ALL inboxes — no demux lookup.
                 // Each connection's QUIC stack drops packets with wrong DCID.
                 nowNano := time.Now().UnixNano()
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
                 delivered := false
-                s.inboxesLF.Range(func(_, v interface{}) bool {
+                s.inboxes.Range(func(_, v interface{}) bool {
                         ch := v.(chan<- readResult)
-                        // Make a copy for each inbox (they may consume at different rates)
                         pktCopy := getPacket()
                         copy(pktCopy, packet[:n])
                         select {
                         case ch <- readResult{data: pktCopy[:n], addr: addr}:
                                 delivered = true
                         default:
-                                // inbox full — skip this one
                         }
                         return true
                 })
@@ -490,8 +486,13 @@ func (c *pooledConn) RegisterCID(cid []byte) {
         if len(cid) == 0 {
                 return
         }
+        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
+        // and the demux map. Eliminates hex.EncodeToString per SCID
+        // registration (was 1 string alloc; now zero).
         dk := makeDCIDKey(cid)
 
+        // v26.10.15-link: atomic closed check avoids acquiring mu
+        // when the conn is already closed.
         if c.closed.Load() {
                 return
         }
@@ -503,14 +504,21 @@ func (c *pooledConn) RegisterCID(cid []byte) {
         c.mu.Unlock()
 
         if !already {
+                // H4 fix: re-check closed under lock before mutating demux.
+                // Between the first closed check and here, another goroutine
+                // could call Close() which clears scidsDCID from demux.
+                c.mu.Lock()
                 if c.closed.Load() {
+                        c.mu.Unlock()
                         return
                 }
-                // v26.11.234: Lock-free Store — no socket.mu needed
-                c.socket.demuxLF.Store(dk, c.inbox)
+                c.socket.mu.Lock()
+                c.socket.demux[dk] = c.inbox
                 if c.source != nil {
-                        c.socket.demuxSrcLF.Store(dk, c.source)
+                        c.socket.demuxSource[dk] = c.source
                 }
+                c.socket.mu.Unlock()
+                c.mu.Unlock()
         }
 }
 
@@ -595,14 +603,23 @@ func (c *pooledConn) Close() error {
         close(c.done)
 
         c.mu.Lock()
-        // v26.11.237: Remove from socket's broadcast list
-        c.socket.inboxesLF.Range(func(k, v interface{}) bool {
+        // v26.11.246: Remove from broadcast list
+        c.socket.inboxes.Range(func(k, v interface{}) bool {
                 if v.(chan<- readResult) == c.inbox {
-                        c.socket.inboxesLF.Delete(k)
+                        c.socket.inboxes.Delete(k)
                         return false
                 }
                 return true
         })
+        // v26.10.34-link: also clean up demux (kept for compatibility)
+        c.socket.mu.Lock()
+        for dk := range c.scidsDCID {
+                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+                        delete(c.socket.demux, dk)
+                        delete(c.socket.demuxSource, dk)
+                }
+        }
+        c.socket.mu.Unlock()
         c.mu.Unlock()
 
         c.socket.release()

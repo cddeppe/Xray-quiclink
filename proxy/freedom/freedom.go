@@ -591,13 +591,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network == net.Network_TCP {
+        } else {
                 defer conn.Close()
         }
-        // For UDP: no defer conn.Close() — the pool's pooledConn.Close()
-        // (deferred at Acquire) manages the socket lifecycle via refCount.
-        // Closing conn here would close the shared socket, killing all
-        // other connections sharing it.
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
@@ -643,25 +639,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         Port: int(inbound.Source.Port),
                                                 }
                                         }
-                                        // v26.11.243: Do NOT defer pooledConn.Close().
-                                        // pooledConn.Close() closes c.done, which makes
-                                        // responseDone's ReadFrom return EOF, which
-                                        // causes Process to return prematurely.
-                                        // The pool's release() (via refCount) handles
-                                        // socket cleanup. The inbox stays registered
-                                        // in inboxesLF until the socket is reaped.
-                                        // v26.11.234: Wire up registerPoolCID so
-                                        // OnServerSCID can register server's SCID in
-                                        // pool's lock-free demux without holding worker lock.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                                type poolCIDRegistrar interface {
-                                                        SetRegisterPoolCID(func([]byte))
-                                                }
-                                                if reg, ok := inbound.Conn.(poolCIDRegistrar); ok {
-                                                        pc := pooledConn
-                                                        reg.SetRegisterPoolCID(pc.RegisterCID)
-                                                }
-                                        }
+                                        defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
