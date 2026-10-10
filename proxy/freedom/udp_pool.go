@@ -46,11 +46,14 @@ type pooledSocket struct {
         lastReplyTime atomic.Int64
         demuxLF       sync.Map
         demuxSrcLF    sync.Map
-        // v26.11.236: When refCount==1, route ALL replies to this single inbox.
-        // No demux needed — one connection per socket means CID parsing is
-        // unnecessary and error-prone (0-length SCIDs, server SCID never
-        // registered, etc).
-        singleInbox   chan<- readResult
+        // v26.11.237: List of ALL inboxes for this socket. readLoop
+        // broadcasts every reply to ALL inboxes. Each connection's
+        // ReadFrom gets packets with wrong DCID, but QUIC silently
+        // drops them. This is simpler and more correct than demux —
+        // no CID registration needed, no 0-length SCID issues, no
+        // server SCID issues, no CID rotation issues.
+        inboxesLF     sync.Map // int -> chan<- readResult
+        inboxCount    atomic.Int64
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -332,17 +335,9 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
-        // v26.11.236: Set singleInbox for fast-path routing.
-        // When refCount==1, readLoop routes ALL replies to this inbox
-        // without DCID parsing — fixes 0-length SCID and unregistered
-        // server SCID issues.
-        sock.mu.Lock()
-        if sock.refCount == 1 {
-                sock.singleInbox = inbox
-        } else {
-                sock.singleInbox = nil // multiple conns, use demux
-        }
-        sock.mu.Unlock()
+        // v26.11.237: Register this inbox in the socket's broadcast list
+        idx := sock.inboxCount.Add(1)
+        sock.inboxesLF.Store(idx, inbox)
         return conn, nil
 }
 
@@ -387,95 +382,30 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                // v26.11.236: Fast path — if there's a single inbox, route
-                // ALL replies to it without parsing DCID. This is the fix
-                // for 0-length SCID and unregistered server SCID issues.
-                if inbox := s.singleInbox; inbox != nil {
-                        nowNano := time.Now().UnixNano()
-                        s.lastUsed.Store(nowNano)
-                        s.lastReplyTime.Store(nowNano)
-                        select {
-                        case inbox <- readResult{data: packet[:n], addr: addr}:
-                        default:
-                                s.droppedReplies.Add(1)
-                                putPacket(packet)
-                        }
-                        continue
-                }
-
-                dcid, _, err := quic.ParseDCID(packet[:n])
-                if err != nil {
-                        putPacket(packet)
-                        continue
-                }
-                dk := makeDCIDKey(dcid)
-
-                // v26.11.234: Lock-free demux lookup via sync.Map
-                var ch chan<- readResult
-                var src *stdnet.UDPAddr
-                if v, ok := s.demuxLF.Load(dk); ok {
-                        ch = v.(chan<- readResult)
-                }
-                if v, ok := s.demuxSrcLF.Load(dk); ok {
-                        src = v.(*stdnet.UDPAddr)
-                }
-
+                // v26.11.237: Broadcast to ALL inboxes — no demux needed.
+                // Each connection's QUIC stack drops packets with wrong DCID.
                 nowNano := time.Now().UnixNano()
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
-                if ch == nil {
-                        // SCID-based fallback for long headers
-                        if n > 0 && packet[0]&0x80 != 0 {
-                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
-                                        scidKey := makeDCIDKey(scid)
-                                        if v, ok := s.demuxLF.Load(scidKey); ok {
-                                                ch = v.(chan<- readResult)
-                                        }
-                                        if v, ok := s.demuxSrcLF.Load(scidKey); ok {
-                                                src = v.(*stdnet.UDPAddr)
-                                        }
-                                }
+                delivered := false
+                s.inboxesLF.Range(func(_, v interface{}) bool {
+                        ch := v.(chan<- readResult)
+                        // Make a copy for each inbox (they may consume at different rates)
+                        pktCopy := getPacket()
+                        copy(pktCopy, packet[:n])
+                        select {
+                        case ch <- readResult{data: pktCopy[:n], addr: addr}:
+                                delivered = true
+                        default:
+                                // inbox full — skip this one
                         }
-                        if ch == nil {
-                                putPacket(packet)
-                                continue
-                        }
-                }
-
-                // v26.10.21-link: non-blocking send with large channel (256).
-                //
-                // The blocking send (v26.10.20) was WRONG for the shared-socket
-                // model: one slow/stale session's full channel would block the
-                // entire readLoop, starving ALL other sessions sharing the same
-                // socket. This made YouTube stalls WORSE when swiping quickly
-                // between videos (many sessions, one stale session blocks all).
-                //
-                // The correct approach for a shared readLoop:
-                // 1. Large channel (256) so drops are rare during bursts
-                // 2. Non-blocking send so one slow session doesn't starve others
-                // 3. Track drops for observability
-                sentOk := false
-                packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
-                select {
-                case ch <- readResult{data: packetToSend, addr: addr}:
-                        sentOk = true
-                default:
+                        return true
+                })
+                if !delivered {
                         s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
-                        putPacket(packet)
                 }
-
-                if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
-                        pktType := (packet[0] >> 4) & 0x03
-                        if pktType == 0x00 {
-                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
-                                        scidCopy := append([]byte(nil), scid...)
-                                        quic.NotifyServerSCID(scidCopy, src)
-                                }
-                        }
-                }
+                putPacket(packet)
         }
 }
 
@@ -665,17 +595,14 @@ func (c *pooledConn) Close() error {
         close(c.done)
 
         c.mu.Lock()
-        // v26.11.236: Clear singleInbox if it points to us
-        if c.socket.singleInbox == c.inbox {
-                c.socket.singleInbox = nil
-        }
-        // v26.11.234: Lock-free Delete from sync.Map
-        for dk := range c.scidsDCID {
-                if v, ok := c.socket.demuxLF.Load(dk); ok && v == c.inbox {
-                        c.socket.demuxLF.Delete(dk)
-                        c.socket.demuxSrcLF.Delete(dk)
+        // v26.11.237: Remove from socket's broadcast list
+        c.socket.inboxesLF.Range(func(k, v interface{}) bool {
+                if v.(chan<- readResult) == c.inbox {
+                        c.socket.inboxesLF.Delete(k)
+                        return false
                 }
-        }
+                return true
+        })
         c.mu.Unlock()
 
         c.socket.release()
