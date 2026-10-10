@@ -713,20 +713,42 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if udp, ok := addr.(*stdnet.UDPAddr); ok {
                 dest = udp
         }
-        n, err := c.socket.conn.WriteTo(b, dest)
-        if err != nil {
-                // v26.10.15-link: only mark the socket dead on persistent
-                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
-                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
-                // will retry or the route will come back. Killing the socket
-                // on a transient error would kill all 50+ QUIC sessions
-                // sharing this socket, which is much worse than dropping one
-                // packet.
+        // v26.11.255: CRITICAL FIX — retry transient write errors internally
+        // instead of returning them to the caller. Previously, a single ICMP
+        // port unreachable (ECONNREFUSED from CDN edge rotation) would:
+        //   1. WriteTo returns ECONNREFUSED
+        //   2. PooledPacketWriter.WriteMultiBuffer returns error
+        //   3. buf.Copy in requestDone returns
+        //   4. task.Run cancels → Process returns → pooledConn.Close()
+        //   5. QUIC connection dies, Chrome retries, gets same ICMP, gives up
+        //   6. Chrome falls back to TCP
+        // With per-conn sockets (v252+), this is especially deadly because
+        // each new Process creates a new socket, and the first write hits the
+        // same ICMP → immediate death. This is why UDP went flat at 402 while
+        // TCP kept growing. The fix: swallow transient errors and retry —
+        // the kernel will deliver the packet once the route stabilizes, or
+        // QUIC retransmission will handle it. Only persistent errors (EBADF,
+        // EINVAL) kill the socket.
+        for retry := 0; retry < 3; retry++ {
+                n, err := c.socket.conn.WriteTo(b, dest)
+                if err == nil {
+                        return n, nil
+                }
                 if !isTransientWriteError(err) {
+                        // Persistent error — socket is broken
                         c.socket.MarkDead()
+                        return n, err
+                }
+                // Transient error — retry after brief backoff
+                if retry < 2 {
+                        time.Sleep(time.Millisecond * time.Duration(1<<retry))
                 }
         }
-        return n, err
+        // All retries exhausted — return nil error (swallow it) to prevent
+        // Process from dying. QUIC will retransmit if the packet was lost.
+        // Returning nil here is intentional: one transient write failure
+        // should NOT kill a long-lived QUIC connection.
+        return len(b), nil
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
