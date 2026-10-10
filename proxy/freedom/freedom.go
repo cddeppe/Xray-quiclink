@@ -832,10 +832,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.197: Reverted BufferedPacketReader (v195). It made
-                        // things worse — added latency and buffering that broke QUIC
-                        // timing. The pipe already has a 256KB buffer with DiscardOverflow
-                        // which is sufficient.
+                        // v26.11.202: Re-enable BufferedPacketReader with NON-BLOCKING
+                        // drop. This decouples the socket read from the pipe write.
+                        // Without this, buf.Copy serializes read+write: when the
+                        // write to the downlink pipe blocks, the next socket read
+                        // doesn't happen, Google's replies pile up in the kernel
+                        // UDP buffer, overflow, and get dropped. Google sees no
+                        // ACKs and kills the connection after ~1-2 seconds.
+                        //
+                        // v195's mistake: the readLoop blocked on channel send
+                        // when the inbox was full — same problem as buf.Copy.
+                        // v202 fix: non-blocking send with drop. The readLoop
+                        // NEVER blocks — always reads from the socket immediately.
+                        // When the consumer can't keep up, packets are dropped
+                        // (QUIC retransmission handles this gracefully).
+                        reader = NewBufferedPacketReader(reader)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
@@ -1336,11 +1347,22 @@ func (r *BufferedPacketReader) readLoop() {
                         }
                         return
                 }
+                // v26.11.202: NON-BLOCKING send. Never block the readLoop —
+                // if the inbox is full (consumer can't keep up), drop the
+                // packet. QUIC retransmission handles loss gracefully.
+                // Blocking here would cause the same bug as buf.Copy:
+                // socket reads stall, kernel buffer overflows, Google
+                // kills the connection.
                 select {
                 case r.inbox <- mb:
+                default:
+                        buf.ReleaseMulti(mb) // inbox full — drop packet
+                }
+                // Check if we should exit
+                select {
                 case <-r.done:
-                        buf.ReleaseMulti(mb)
                         return
+                default:
                 }
         }
 }
