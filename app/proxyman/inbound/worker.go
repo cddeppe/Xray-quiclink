@@ -188,21 +188,10 @@ type udpConn struct {
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
-        // v26.11.196: Persistent outbound conn (to Google). Survives Process
-        // restarts so the source port stays stable.
-        outboundConn net.Conn
-        outboundMu   sync.Mutex
-        // v26.11.196: Track whether the Process goroutine is running.
-        processRunning atomic.Bool
         // v26.11.117: Callback to register server SCID when seen in reply.
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
-        // v26.11.156: registerPoolCID registers a new DCID in the UDP socket
-        // pool's demux. Called when CID rotation is detected — without this,
-        // the pool's readLoop drops replies with the new DCID, causing Google
-        // to think the connection is dead and stop replying (20-second freeze).
-        registerPoolCID func([]byte)
 }
 
 func (c *udpConn) setInactive() {
@@ -221,12 +210,6 @@ func (c *udpConn) RegisterServerSCID(serverSCID []byte) {
         if c.registerServerCID != nil {
                 c.registerServerCID(serverSCID)
         }
-}
-
-// v26.11.156: SetRegisterPoolCID sets the callback for registering
-// new DCIDs in the pool's demux. Called by freedom when the pool is used.
-func (c *udpConn) SetRegisterPoolCID(f func([]byte)) {
-        c.registerPoolCID = f
 }
 
 // ReadMultiBuffer implements buf.Reader
@@ -250,62 +233,16 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-        // v26.11.201: REMOVED per-packet VPS->Chrome log — was causing stalls.
-        // The logger mutex serialized all packet writes, backing up the pipe.
-        // v26.11.144: Re-add SplitCoalesced (from v26.11.55).
-        // Packets > 1250 bytes are split into separate UDP datagrams.
-        // This allows coalesced QUIC packets (Initial+Handshake) to be
-        // delivered even when the path MTU can't handle the full packet.
-        if len(buf) <= 1250 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        // v26.11.126: CRITICAL FIX — do NOT split coalesced QUIC packets.
+        // Forward the entire buffer as ONE UDP datagram, always.
+        n, err := c.output(buf)
+        if c.downlink != nil {
+                c.downlink.Add(int64(n))
         }
-        offsets, splitErr := quic.SplitCoalesced(buf)
-        if splitErr != nil || len(offsets) <= 1 {
-                n, err := c.output(buf)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if err == nil {
-                        c.updateActivity()
-                }
-                return n, err
+        if err == nil {
+                c.updateActivity()
         }
-        total := 0
-        for _, off := range offsets {
-                packet := buf[off[0]:off[1]]
-                n, werr := c.output(packet)
-                if c.downlink != nil {
-                        c.downlink.Add(int64(n))
-                }
-                if werr != nil {
-                        return total, werr
-                }
-                total += n
-        }
-        c.updateActivity()
-        return total, nil
-}
-
-// v26.11.196: GetOutboundConn returns the persistent outbound conn (to Google).
-func (c *udpConn) GetOutboundConn() net.Conn {
-        c.outboundMu.Lock()
-        defer c.outboundMu.Unlock()
-        return c.outboundConn
-}
-
-// SetOutboundConn stores the persistent outbound conn. Called by freedom.Process
-// on first dial. Subsequent Process calls will reuse this conn.
-func (c *udpConn) SetOutboundConn(conn net.Conn) {
-        c.outboundMu.Lock()
-        defer c.outboundMu.Unlock()
-        c.outboundConn = conn
+        return n, err
 }
 
 func (c *udpConn) Close() error {
@@ -314,13 +251,6 @@ func (c *udpConn) Close() error {
         }
         common.Must(c.done.Close())
         common.Must(common.Close(c.writer))
-        // v26.11.196: Close the persistent outbound conn too
-        c.outboundMu.Lock()
-        if c.outboundConn != nil {
-                c.outboundConn.Close()
-                c.outboundConn = nil
-        }
-        c.outboundMu.Unlock()
         return nil
 }
 
@@ -439,7 +369,6 @@ type udpWorker struct {
         activeConn map[connID]*udpConn
         dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
         srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
-        // taking w.RLock() — which blocks when tryQUICMigration takes w.Lock().
 
         ctx  context.Context
         cone bool
@@ -454,7 +383,19 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 return conn, true
         }
 
-        // 256KB pipe with DiscardOverflow
+        // v26.10.25-link: 256KB pipe with DiscardOverflow (not blocking).
+        //
+        // v26.10.24 tried removing DiscardOverflow (blocking writes) but
+        // this was wrong: if the outbound truly stalls (CDN edge rotation),
+        // the blocking pipe freezes the entire inbound worker's callback
+        // loop, preventing ANY new connections from being processed.
+        // That's a worse failure mode than dropping packets.
+        //
+        // The correct fix: keep DiscardOverflow but increase the size from
+        // 16KB to 256KB. 16KB was only ~14 QUIC packets — YouTube burst
+        // downloads overflowed it immediately. 256KB (~213 packets) absorbs
+        // most bursts. When it does overflow, the drop is far enough apart
+        // that QUIC retransmits recover quickly.
         pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(256*1024))
         srcCopy := id.src
         conn := &udpConn{
@@ -474,8 +415,17 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 src:      &srcCopy,
         }
         conn.output = func(b []byte) (int, error) {
-                // v26.11.209: Reverted to w.RLock() — the per-conn srcMu (v206)
-                // broke QUIC entirely. Go back to the working v205 behavior.
+                // Snapshot src under w.Lock() so we race-free against
+                // tryQUICMigration()'s `*conn.src = id.src` reassignment. The
+                // outbound hub.WriteTo call is performed outside the lock so
+                // a slow network write does not block the inbound worker's
+                // packet-processing loop.
+                //
+                // v26.10.34-link (M10 fix): use RLock instead of Lock. The
+                // closure only READS *conn.src; the writer (*oldConn.src =
+                // id.src in tryQUICMigration) already uses w.Lock(). RLock
+                // allows multiple outbound packets to snapshot concurrently
+                // instead of serializing against every inbound packet.
                 w.RLock()
                 srcCopy := *conn.src
                 w.RUnlock()
@@ -587,10 +537,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
         conn, existing := w.getConnection(id)
 
-        if existing {
-                errors.LogWarning(context.Background(), "DIAG: EXISTING conn src=", source, " dest=", id.dest)
-        }
-
         // v26.11.118: REMOVED the C3 re-check block (v26.10.43/v26.10.78).
         // The re-check ALWAYS found the conn that getConnection just created
         // (because getConnection stores it in activeConn before returning),
@@ -620,7 +566,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         w.Lock()
                         if _, exists := w.dcidIndex[dk]; !exists {
                                 w.dcidIndex[dk] = connIDCopy
-                                // v26.11.207: also write to lock-free map
                         }
                         w.Unlock()
                 }
@@ -630,14 +575,9 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
         if !existing {
-                errors.LogWarning(context.Background(), "DIAG: NEW conn src=", source, " dest=", id.dest)
                 common.Must(w.checker.Start())
-        }
 
-        // v26.11.196: Start (or restart) the Process goroutine.
-        if !conn.processRunning.Swap(true) {
                 go func() {
-                        defer conn.processRunning.Store(false)
                         ctx, cancel := context.WithCancel(w.ctx)
                         conn.cancel = cancel
                         sid := session.NewID()
@@ -647,6 +587,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if originalDest.IsValid() {
                                 outbounds[0].Target = originalDest
                         } else {
+                                // v26.11.118: When originalDest is invalid (no TPROXY),
+                                // the outbound Target defaults to Network_TCP (Go zero value).
+                                // This causes the dispatcher to route UDP QUIC traffic as TCP.
+                                // Fix: set a UDP destination so the dispatcher knows this is UDP.
                                 outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
                         }
                         ctx = session.ContextWithOutbounds(ctx, outbounds)
@@ -661,10 +605,10 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 
                         ctx = session.ContextWithInbound(ctx, &session.Inbound{
                                 Source:  source,
-                                Local:   local,
+                                Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
                                 Gateway: net.UDPDestination(w.address, w.port),
                                 Tag:     w.tag,
-                                Conn:    conn,
+                                Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
                         })
                         content := new(session.Content)
                         content.SniffingRequest = w.sniffingRequest
@@ -672,9 +616,12 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
-                        // v26.11.196: Do NOT close conn or removeConn when Process returns.
-                        // The outbound socket (stored in conn.outboundConn) must survive.
-                        // clean() will retire the conn after idle timeout.
+                        conn.Close()
+                        // conn not removed by checker TODO may be lock worker here is better
+                        if !conn.inactive {
+                                conn.setInactive()
+                                w.removeConn(id)
+                        }
                 }()
         }
 }
@@ -757,13 +704,8 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         newDk := makeDCIDKey(newDcid)
                                         if _, exists := w.dcidIndex[newDk]; !exists {
                                                 w.dcidIndex[newDk] = oldID
-                                                // v26.11.156: Also register in pool's demux so
-                                                // readLoop can route replies with the new DCID.
-                                                // Without this, Google's replies with the rotated
-                                                // DCID get dropped → connection dies after ~20s.
-                                                if oldConn.registerPoolCID != nil {
-                                                        oldConn.registerPoolCID(newDcid)
-                                                }
+                                                // Don't overwrite conn.dcid —
+                                                // keep the original for cleanup.
                                         }
                                 }
                         }
@@ -775,28 +717,13 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         // (b) two distinct QUIC connections from the same src
                         //     to different destinations (YouTube does this)
                         //
-                        // v26.11.165: For short-header packets (1-RTT), CID rotation
-                        // is the most likely cause. The new DCID won't be in dcidIndex
-                        // (it was never registered — it just arrived). But if the source
-                        // is known and the packet is a short header, register the new
-                        // DCID for the existing conn and return nil (same conn, no migration).
-                        // This prevents creating a new connection for CID rotation.
-                        if len(packet) > 0 && packet[0]&0x80 == 0 {
-                                if newDcid, _, err := quic.ParseDCID(packet); err == nil && len(newDcid) > 0 {
-                                        newDk := makeDCIDKey(newDcid)
-                                        if _, exists := w.dcidIndex[newDk]; !exists {
-                                                // New DCID not in index → CID rotation.
-                                                // Register it for this conn + pool demux.
-                                                w.dcidIndex[newDk] = oldID
-                                                if oldConn.registerPoolCID != nil {
-                                                        oldConn.registerPoolCID(newDcid)
-                                                }
-                                                w.Unlock()
-                                                return nil
-                                        }
-                                }
-                        }
-                        // Long header or DCID already exists → check dcidIndex
+                        // Old code treated ALL same-src-different-dest as
+                        // CID rotation, mixing two connections' state machines.
+                        //
+                        // Fix: check if the DCID matches an existing conn
+                        // in dcidIndex. If it does, it's genuine migration
+                        // (same DCID found = same conn with new src). If not,
+                        // it's a new connection — fall through to slow path.
                         w.Unlock()
                         dcid, _, err := quic.ParseDCID(packet)
                         if err != nil || len(dcid) == 0 {
@@ -928,11 +855,10 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
 // recordSrc associates a source IP:port with a connID for future CID rotation lookup.
 func (w *udpWorker) recordSrc(id connID, conn *udpConn) {
         w.Lock()
+        defer w.Unlock()
         if _, exists := w.srcIndex[id.srcKey]; !exists {
                 w.srcIndex[id.srcKey] = id
-                // v26.11.207: also write to lock-free map
         }
-        w.Unlock()
 }
 
 // recordDCID associates a QUIC DCID with a connID for future migration lookup.
@@ -955,9 +881,10 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
         dk := makeDCIDKey(dcid)
 
         w.Lock()
+        defer w.Unlock()
+
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = id
-                // v26.11.207: also write to lock-free map
                 conn.dcid = dcid
         }
 }
