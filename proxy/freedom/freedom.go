@@ -251,6 +251,11 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                                 h.socketConfig, // v26.10.17-link: pass sockopt for interface binding
                         )
                         errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (staleness=", staleness, "s idle=", idle, "s unused=", unused, "s)")
+                } else {
+                        // v26.11.198: Explicitly log when the pool is NOT enabled.
+                        // This helps diagnose why video stalls — without the pool,
+                        // each QUIC connection gets its own outbound socket.
+                        errors.LogWarning(context.Background(), "freedom: UDP socket pool DISABLED (enableSocketPool=false)")
                 }
                 if config.UdpConfig.EnableStickyResolver {
                         // v26.10.23-link: configurable sticky resolver TTL.
@@ -787,7 +792,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil, " socketPool=", h.socketPool != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
@@ -921,6 +926,8 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         return nil, err
                 }
                 // NPDIAG 1: Google reply received by outbound socket
+                // v26.11.198: Add diagnostic to confirm Google is replying.
+                errors.LogInfo(context.Background(), "NPDIAG: Google reply received n=", n, " from=", d)
                 udpAddr := d.(*net.UDPAddr)
                 sourceAddr := net.IPAddress(udpAddr.IP)
                 if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
