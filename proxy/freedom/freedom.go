@@ -4,6 +4,7 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -33,6 +34,7 @@ import (
         "github.com/xtls/xray-core/proxy/freedom/udptimeout"
         "github.com/xtls/xray-core/transport"
         "github.com/xtls/xray-core/transport/internet"
+        "github.com/xtls/xray-core/transport/internet/finalmask"
         "github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -524,6 +526,28 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // v26.11.196: For UDP, check if the udpConn already has a persistent
+                // outbound conn from a previous Process call. If so, reuse it — this
+                // keeps the source port stable so Google doesn't trigger path validation.
+                if destination.Network != net.Network_TCP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                type outboundConnHolder interface {
+                                        GetOutboundConn() stdnet.Conn
+                                }
+                                if holder, ok := inbound.Conn.(outboundConnHolder); ok {
+                                        if existingConn := holder.GetOutboundConn(); existingConn != nil {
+                                                conn = existingConn
+                                                // v26.11.197: Diagnostic — verify the reuse path is taken.
+                                                // If we see "REUSING outbound conn" in logs, the persistent
+                                                // socket is working. If we see "dialing to udp:" instead,
+                                                // the reuse path failed (GetOutboundConn returned nil).
+                                                errors.LogInfo(ctx, "NPDIAG: REUSING outbound conn, local endpoint ", existingConn.LocalAddr(), ", remote endpoint ", existingConn.RemoteAddr())
+                                                return nil
+                                        }
+                                }
+                        }
+                }
+
                 rawConn, err := dialer.Dial(ctx, destination)
                 // v26.11.132: warmAcquired conns are now liveness-checked in
                 // Acquire (getsockopt SO_ERROR), so a dead warm conn is
@@ -563,6 +587,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if !warmAcquired {
                         conn = rawConn
                 }
+                // v26.11.196: Store the outbound conn in udpConn for reuse on
+                // subsequent Process calls. This keeps the source port stable.
+                if destination.Network != net.Network_TCP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                type outboundConnSetter interface {
+                                        SetOutboundConn(stdnet.Conn)
+                                }
+                                if setter, ok := inbound.Conn.(outboundConnSetter); ok {
+                                        setter.SetOutboundConn(conn)
+                                }
+                        }
+                }
                 return nil
         })
         if err != nil {
@@ -594,11 +630,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // to the warm pool instead of closing. The warm pool will close the
         // conn when it expires (default 5s) or when a new inbound reuses it.
         // For non-warm-pool paths, close normally.
+        // v26.11.196: For UDP, do NOT close the outbound conn when Process
+        // returns. The conn is stored in udpConn.outboundConn and reused on
+        // the next Process call to maintain a stable source port for Google's
+        // QUIC path validation. clean() in worker.go will close it after idle.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else {
+        } else if destination.Network == net.Network_TCP {
                 defer conn.Close()
         }
+        // For UDP: no defer conn.Close() — the caller manages the lifecycle
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
@@ -727,6 +768,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // NPDIAG 3: requestDone starting buf.Copy
                 if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
                         // v26.10.38-link: swallow ErrClosedPipe when inputCloser has
                         // fired (responseDone returned, so YouTube closed the outbound).
@@ -785,6 +827,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
+                        // v26.11.197: Reverted BufferedPacketReader (v195). It made
+                        // things worse — added latency and buffering that broke QUIC
+                        // timing. The pipe already has a 256KB buffer with DiscardOverflow
+                        // which is sufficient.
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
@@ -831,6 +877,27 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
                 }
         }
+        // v26.11.194: Also check for finalmask.PacketConnWrapper
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                isOverridden := false
+                if UDPOverride.Address != nil || UDPOverride.Port != 0 {
+                        isOverridden = true
+                }
+                // Wrap in internet.PacketConnWrapper so existing PacketReader works
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                return &PacketReader{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        IsOverridden:      isOverridden,
+                        InitUnchangedAddr: DialDest.Address,
+                        InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
+                }
+        }
         return &buf.PacketReader{Reader: conn}
 }
 
@@ -853,6 +920,7 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         b.Release()
                         return nil, err
                 }
+                // NPDIAG 1: Google reply received by outbound socket
                 udpAddr := d.(*net.UDPAddr)
                 sourceAddr := net.IPAddress(udpAddr.IP)
                 if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
@@ -891,6 +959,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                 counter = statConn.WriteCounter
         }
         if c, ok := iConn.(*internet.PacketConnWrapper); ok {
+                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (internet.PacketConnWrapper)")
                 // If DialDest is a domain, it will be resolved in dialer
                 // check this behavior and add it to map
                 resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
@@ -907,6 +976,33 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         OutGateway:        outGateway,
                 }
         }
+        // v26.11.194: Also check for finalmask.PacketConnWrapper — the finalmask
+        // transport layer wraps UDP connections in its own PacketConnWrapper type.
+        // Without this check, the non-pool UDP path falls back to SequentialWriter,
+        // which doesn't handle UDP source address routing correctly.
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (finalmask.PacketConnWrapper)")
+                // Extract the underlying net.PacketConn and wrap it in an internet.PacketConnWrapper
+                // so the existing PacketReader/PacketWriter code works unchanged.
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
+                if DialDest.Address.Family().IsDomain() {
+                        resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
+                }
+                return &PacketWriter{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        UDPOverride:       UDPOverride,
+                        ResolvedUDPAddr:   resolvedUDPAddr,
+                        OutGateway:        outGateway,
+                }
+        }
+        errors.LogWarning(context.Background(), "NPDIAG: SequentialWriter fallback! conn type=", fmt.Sprintf("%T", iConn))
         return &buf.SequentialWriter{Writer: conn}
 }
 
@@ -983,6 +1079,7 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 continue
                         }
                         n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+                        // NPDIAG 4: Chrome data sent to Google
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
                 }
@@ -1190,4 +1287,73 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         }
 
         return mb, nil
+}
+
+// v26.11.195: BufferedPacketReader wraps a buf.Reader with a dedicated
+// readLoop goroutine. This decouples the read from the write — the
+// readLoop always reads from the socket, even when the write path
+// (pipe to Chrome) is blocked. This prevents Google's replies from
+// being dropped when the pipe is full.
+//
+// This is the same architecture as the pool's readLoop, but for
+// single (non-pooled) connections. Without this, buf.Copy serializes
+// read and write — when output.WriteMultiBuffer blocks, the next
+// reader.ReadMultiBuffer doesn't happen, the socket buffer fills up,
+// and Google's replies are dropped by the kernel.
+type BufferedPacketReader struct {
+        base   buf.Reader
+        inbox  chan buf.MultiBuffer
+        done   chan struct{}
+}
+
+func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
+        r := &BufferedPacketReader{
+                base:  base,
+                inbox: make(chan buf.MultiBuffer, 256), // same as pool's inbox
+                done:  make(chan struct{}),
+        }
+        go r.readLoop()
+        return r
+}
+
+func (r *BufferedPacketReader) readLoop() {
+        for {
+                mb, err := r.base.ReadMultiBuffer()
+                if err != nil {
+                        buf.ReleaseMulti(mb)
+                        // Send EOF to unblock ReadMultiBuffer
+                        select {
+                        case r.inbox <- nil:
+                        case <-r.done:
+                        }
+                        return
+                }
+                select {
+                case r.inbox <- mb:
+                case <-r.done:
+                        buf.ReleaseMulti(mb)
+                        return
+                }
+        }
+}
+
+func (r *BufferedPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        select {
+        case mb, ok := <-r.inbox:
+                if !ok || mb == nil {
+                        return nil, io.EOF
+                }
+                return mb, nil
+        case <-r.done:
+                return nil, io.EOF
+        }
+}
+
+func (r *BufferedPacketReader) Close() error {
+        select {
+        case <-r.done:
+        default:
+                close(r.done)
+        }
+        return nil
 }
