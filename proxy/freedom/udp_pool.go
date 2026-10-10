@@ -445,13 +445,18 @@ func (s *pooledSocket) readLoop() {
                 // 3. Track drops for observability
                 sentOk := false
                 packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
-                // v26.11.0.11: recover from panic — the inbox channel may be
+                // v26.11.0.12: recover from panic — the inbox channel may be
                 // closed (pooledConn.Close() no longer deletes from demux,
-                // so stale entries point to closed channels). The recover
-                // silently drops the packet, which is correct behavior.
+                // so stale entries point to closed channels). When we recover,
+                // DELETE the stale entry so future replies with the same DCID
+                // don't trigger another panic. Panics are expensive in Go
+                // (~1us each), and accumulated stale entries would cause the
+                // readLoop to slow down, delaying replies to active connections.
+                panicked := false
                 func() {
                         defer func() {
                                 if r := recover(); r != nil {
+                                        panicked = true
                                         s.droppedReplies.Add(1)
                                         putPacket(packet)
                                 }
@@ -464,6 +469,13 @@ func (s *pooledSocket) readLoop() {
                                 putPacket(packet)
                         }
                 }()
+                // v26.11.0.12: clean up stale demux entry on panic
+                if panicked {
+                        s.mu.Lock()
+                        delete(s.demux, dk)
+                        delete(s.demuxSource, dk)
+                        s.mu.Unlock()
+                }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
