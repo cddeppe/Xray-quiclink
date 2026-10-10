@@ -35,15 +35,6 @@ type UDPSocketPool struct {
         // WireGuard policy routing and QUIC traffic leaks outside the
         // tunnel. Set via NewUDPSocketPool from the freedom Handler.Init.
         sockopt *internet.SocketConfig
-        // v26.11.0.7: stall block list. When a QUIC connection stalls,
-        // the destination IP is added here with a block-until time.
-        // During the block period, WriteTo silently drops Chrome's packets
-        // instead of forwarding them to Google. Chrome sees total silence
-        // (no ACKs) and its QUIC loss detection fires within ~5 seconds
-        // (QUIC PTO), forcing TCP fallback much faster than Chrome's
-        // default 25-second timeout.
-        stallBlockMu sync.RWMutex
-        stallBlock   map[string]int64 // dest IP string → UnixNano block-until
 }
 
 type pooledSocket struct {
@@ -51,8 +42,6 @@ type pooledSocket struct {
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        // v26.11.0.7: back-reference to the owning pool for stall block list access.
-        pool *UDPSocketPool
         // v26.10.43-link (audit P5): atomic timestamps to avoid
         // mutex contention on the readLoop hot path.
         lastUsed      atomic.Int64 // UnixNano
@@ -123,16 +112,6 @@ type pooledConn struct {
         // pool can bind outbound packets to the originating client. nil
         // for non-QUIC / per-session paths.
         source *stdnet.UDPAddr
-        // v26.11.0.5: lastReplyTime tracks when we last received a reply
-        // from Google. Used by ReadFrom's stall detection — if no reply
-        // arrives within stallTimeout, we return EOF to kill the QUIC
-        // connection and let Chrome fall back to TCP.
-        lastReplyTime atomic.Int64 // UnixNano
-        // v26.11.0.5: lastWriteTime tracks when Chrome last sent us a
-        // packet. If Chrome is actively sending but Google isn't replying,
-        // the connection is stalled. If Chrome is idle (paused video),
-        // we don't kill the connection.
-        lastWriteTime atomic.Int64 // UnixNano
         // v26.10.16-link: scidsDCID stores the SCIDs we've registered
         // in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
         // so Close() can index demux directly without converting from
@@ -147,38 +126,9 @@ func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.S
                 idleTimeout:      idle,
                 unusedTimeout:    unused,
                 sockopt:          sockopt,
-                stallBlock:       make(map[string]int64), // v26.11.0.7
         }
         p.startReaper()
         return p
-}
-
-// BlockDest marks a destination IP as blocked for QUIC for the given duration.
-// Called when a stall is detected. During the block period, WriteTo silently
-// drops Chrome's packets, forcing Chrome's QUIC loss detection to fire.
-func (p *UDPSocketPool) BlockDest(ip string, duration time.Duration) {
-        p.stallBlockMu.Lock()
-        p.stallBlock[ip] = time.Now().Add(duration).UnixNano()
-        p.stallBlockMu.Unlock()
-        xrayerrors.LogInfo(context.Background(), "udp_pool: blocking QUIC to ", ip, " for ", duration, " (stall detected)")
-}
-
-// IsDestBlocked checks if a destination IP is currently blocked for QUIC.
-func (p *UDPSocketPool) IsDestBlocked(ip string) bool {
-        p.stallBlockMu.RLock()
-        until, ok := p.stallBlock[ip]
-        p.stallBlockMu.RUnlock()
-        if !ok {
-                return false
-        }
-        if time.Now().UnixNano() > until {
-                // Block expired — clean up
-                p.stallBlockMu.Lock()
-                delete(p.stallBlock, ip)
-                p.stallBlockMu.Unlock()
-                return false
-        }
-        return true
 }
 
 // listenUDPWithSockopt creates a UDP socket and applies the pool's
@@ -346,7 +296,6 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
-                                pool:          p, // v26.11.0.7: back-ref for stall block list
                         demux:         make(map[dcidKey]chan<- readResult),
                         demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
@@ -686,64 +635,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.MarkDead()
                 }
         }
-        // v26.11.0.5: track write time for stall detection.
-        // This tells ReadFrom that Chrome is actively sending.
-        c.lastWriteTime.Store(time.Now().UnixNano())
         return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
-        // v26.11.0.7: Stall detection + destination blocking.
-        // When a stall is detected:
-        // 1. Block the destination IP for 30 seconds (stop forwarding Chrome's packets)
-        // 2. Return EOF to kill this connection
-        // During the 30-second block, Chrome's QUIC packets to this IP are silently
-        // dropped. Chrome sees total silence (no ACKs) and its QUIC loss detection
-        // fires within ~5 seconds (QUIC PTO = 3 retransmissions × ~1.5s), forcing
-        // TCP fallback much faster than Chrome's default 25-second timeout.
-        const stallTimeout = 5 * time.Second
-
-        // Check if we're stalled RIGHT NOW (before blocking on inbox).
-        if c.isStalled(stallTimeout) {
-                c.triggerStallBlock()
-                return 0, nil, io.EOF
-        }
-
-        // Calculate the remaining time until stall timeout.
-        // Use the lesser of lastReplyTime and lastWriteTime as the reference.
-        now := time.Now()
-        lastReplyNano := c.lastReplyTime.Load()
-        lastWriteNano := c.lastWriteTime.Load()
-        lastWrite := time.Unix(0, lastWriteNano)
-
-        // v26.11.0.7: if lastWriteNano is 0 (no write yet), wait for the full
-        // timeout — don't penalize the connection before Chrome has sent anything.
-        if lastWriteNano == 0 {
-                lastWrite = now
-        }
-
-        var refTime time.Time
-        if lastReplyNano > 0 {
-                lastReply := time.Unix(0, lastReplyNano)
-                if lastReply.Before(lastWrite) {
-                        refTime = lastWrite
-                } else {
-                        refTime = lastReply
-                }
-        } else {
-                refTime = lastWrite
-        }
-
-        // Time since we last heard from Google
-        since := now.Sub(refTime)
-        remaining := stallTimeout - since
-        if remaining < 0 {
-                remaining = 0
-        }
-
-        timer := time.NewTimer(remaining)
-        defer timer.Stop()
-
         select {
         case rr, ok := <-c.inbox:
                 if !ok {
@@ -753,67 +648,10 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
                 // v26.10.42-link (audit P3): return the pooled buffer
                 // after copying the data out.
                 putPacket(rr.data)
-                // v26.11.0.5: update last reply time
-                c.lastReplyTime.Store(time.Now().UnixNano())
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
-        case <-timer.C:
-                // v26.11.0.7: stall timeout — no reply from Google.
-                // Check if Chrome is still actively sending. If Chrome
-                // stopped sending (idle/paused), don't kill the connection.
-                if c.isStalled(stallTimeout) {
-                        c.triggerStallBlock()
-                        return 0, nil, io.EOF
-                }
-                // Chrome is idle (not sending) — loop and wait again
-                return c.ReadFrom(p)
         }
-}
-
-// triggerStallBlock blocks the destination IP for 30 seconds and logs it.
-// This stops xray from forwarding Chrome's QUIC packets to that IP,
-// forcing Chrome's QUIC loss detection to fire and trigger TCP fallback.
-func (c *pooledConn) triggerStallBlock() {
-        xrayerrors.LogInfo(context.Background(), "udp_pool: QUIC stall — blocking dest and killing connection")
-        if c.socket != nil && c.socket.dest != nil {
-                ip := c.socket.dest.IP.String()
-                if pool := c.socket.pool; pool != nil {
-                        pool.BlockDest(ip, 30*time.Second)
-                }
-        }
-}
-
-// isStalled returns true if Chrome is actively sending (lastWriteTime
-// within 2x stallTimeout) but Google hasn't replied within stallTimeout.
-// If Chrome is idle (no recent writes), returns false — the connection
-// is just idle, not stalled.
-func (c *pooledConn) isStalled(stallTimeout time.Duration) bool {
-        now := time.Now()
-        lastReplyNano := c.lastReplyTime.Load()
-        lastWriteNano := c.lastWriteTime.Load()
-        lastWrite := time.Unix(0, lastWriteNano)
-
-        // Has Chrome sent us anything recently? (within 2x stall timeout)
-        // If not, Chrome is idle — connection is not stalled, just idle.
-        if now.Sub(lastWrite) > 2*stallTimeout {
-                return false
-        }
-
-        // Chrome is active. Has Google ever replied?
-        // v26.11.0.6: check the raw int64, NOT lastReply.IsZero().
-        // time.Unix(0, 0) returns 1970-01-01, which is NOT the Go zero time.
-        // So lastReply.IsZero() returns false even when no reply was received.
-        if lastReplyNano == 0 {
-                // Never received a reply. Check if we've been waiting long enough
-                // since the last write. Give QUIC time to complete the handshake
-                // (Initial + Handshake can take 1-2 RTTs).
-                return now.Sub(lastWrite) > stallTimeout
-        }
-
-        // Google replied before but hasn't replied recently
-        lastReply := time.Unix(0, lastReplyNano)
-        return now.Sub(lastReply) > stallTimeout
 }
 
 func (c *pooledConn) IsClosed() bool {
@@ -1033,18 +871,6 @@ func (w *PooledPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                         }
                 } else {
                         destAddr = w.conn.socket.dest
-                }
-
-                // v26.11.0.7: check if destination is blocked due to a stall.
-                // If blocked, silently drop the packet (don't forward to Google).
-                // Chrome sees no ACKs → QUIC loss detection fires → TCP fallback.
-                if udp, ok := destAddr.(*stdnet.UDPAddr); ok {
-                        if pool := w.conn.socket.pool; pool != nil {
-                                if pool.IsDestBlocked(udp.IP.String()) {
-                                        b.Release()
-                                        continue // silently drop
-                                }
-                        }
                 }
 
                 n, err := w.conn.WriteTo(b.Bytes(), destAddr)
