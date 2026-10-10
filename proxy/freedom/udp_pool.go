@@ -71,7 +71,11 @@ type pooledSocket struct {
         // → FD exhaustion → Acquire fails → TCP fallback.
         perConn bool
         // v26.10.15-link: dropped reply packets counter for observability.
-        droppedReplies atomic.Int64
+        droppedReplies   atomic.Int64
+        // v26.11.253: counts how many replies were routed via defaultInbox
+        // fallback (DCID+SCID demux missed). High count = per-conn sockets
+        // are working correctly for 0-length-SCID clients (Chrome/Edge).
+        defaultInboxHits atomic.Int64
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -388,6 +392,9 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) (*
                 sock.mu.Lock()
                 sock.defaultInbox = inbox
                 sock.mu.Unlock()
+                // v26.11.253: one-line per-connection diagnostic (not per-packet).
+                // Confirms v253 is running and perConn sockets are being created.
+                xrayerrors.LogInfo(context.Background(), "POOL: acquire per-conn socket key=", key)
         }
         return conn, nil
 }
@@ -495,6 +502,7 @@ func (s *pooledSocket) readLoop() {
                                 if di != nil {
                                         ch = di
                                         ok = true
+                                        s.defaultInboxHits.Add(1)
                                         // src is unknown for the defaultInbox path — skip
                                         // NotifyServerSCID for this packet. This only affects
                                         // 1-RTT packets (short headers), where NotifyServerSCID
