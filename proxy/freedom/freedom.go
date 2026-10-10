@@ -640,9 +640,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 }
                                         }
                                         defer pooledConn.Close()
-                                        // v26.11.231: Set up registerPoolCID callback so
-                                        // OnServerSCID can register the server's SCID in
-                                        // the pool's demux for 1-RTT short header routing.
+                                        // v26.11.232: Set up registerPoolCID so
+                                        // tryQUICMigration can register rotated DCIDs
+                                        // in the pool's demux.
                                         if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                                                 type poolCIDRegistrar interface {
                                                         SetRegisterPoolCID(func([]byte))
