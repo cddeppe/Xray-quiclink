@@ -34,6 +34,7 @@ import (
         "github.com/xtls/xray-core/proxy/freedom/udptimeout"
         "github.com/xtls/xray-core/transport"
         "github.com/xtls/xray-core/transport/internet"
+        "github.com/xtls/xray-core/transport/internet/finalmask"
         "github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -530,28 +531,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
-                // v26.11.196: For UDP, check if the udpConn already has a persistent
-                // outbound conn from a previous Process call. If so, reuse it — this
-                // keeps the source port stable so Google doesn't trigger path validation.
-                if destination.Network != net.Network_TCP {
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                type outboundConnHolder interface {
-                                        GetOutboundConn() stdnet.Conn
-                                }
-                                if holder, ok := inbound.Conn.(outboundConnHolder); ok {
-                                        if existingConn := holder.GetOutboundConn(); existingConn != nil {
-                                                conn = existingConn
-                                                // v26.11.197: Diagnostic — verify the reuse path is taken.
-                                                // If we see "REUSING outbound conn" in logs, the persistent
-                                                // socket is working. If we see "dialing to udp:" instead,
-                                                // the reuse path failed (GetOutboundConn returned nil).
-                                                errors.LogInfo(ctx, "NPDIAG: REUSING outbound conn, local endpoint ", existingConn.LocalAddr(), ", remote endpoint ", existingConn.RemoteAddr())
-                                                return nil
-                                        }
-                                }
-                        }
-                }
-
                 rawConn, err := dialer.Dial(ctx, destination)
                 // v26.11.132: warmAcquired conns are now liveness-checked in
                 // Acquire (getsockopt SO_ERROR), so a dead warm conn is
@@ -591,18 +570,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if !warmAcquired {
                         conn = rawConn
                 }
-                // v26.11.196: Store the outbound conn in udpConn for reuse on
-                // subsequent Process calls. This keeps the source port stable.
-                if destination.Network != net.Network_TCP {
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                type outboundConnSetter interface {
-                                        SetOutboundConn(stdnet.Conn)
-                                }
-                                if setter, ok := inbound.Conn.(outboundConnSetter); ok {
-                                        setter.SetOutboundConn(conn)
-                                }
-                        }
-                }
                 return nil
         })
         if err != nil {
@@ -634,16 +601,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // to the warm pool instead of closing. The warm pool will close the
         // conn when it expires (default 5s) or when a new inbound reuses it.
         // For non-warm-pool paths, close normally.
-        // v26.11.196: For UDP, do NOT close the outbound conn when Process
-        // returns. The conn is stored in udpConn.outboundConn and reused on
-        // the next Process call to maintain a stable source port for Google's
-        // QUIC path validation. clean() in worker.go will close it after idle.
+        // For UDP: defer conn.Close() — Process manages the lifecycle.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
         } else if destination.Network == net.Network_TCP {
                 defer conn.Close()
+        } else {
+                defer conn.Close() // UDP: close when Process returns
         }
-        // For UDP: no defer conn.Close() — the caller manages the lifecycle
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
@@ -881,9 +846,29 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
                 }
         }
-        // v26.11.203: Reverted finalmask.PacketConnWrapper detection (v194).
-        // Pre-v194, finalmask.PacketConnWrapper fell through to buf.PacketReader
-        // (the simple reader that calls readOneUDP). v166 used this path.
+        // v26.11.194: Detect finalmask.PacketConnWrapper — the finalmask
+        // transport layer wraps UDP connections in its own PacketConnWrapper
+        // type. Without this check, the non-pool UDP path falls back to
+        // SequentialWriter, which doesn't handle UDP source address routing.
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                isOverridden := false
+                if UDPOverride.Address != nil || UDPOverride.Port != 0 {
+                        isOverridden = true
+                }
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                return &PacketReader{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        IsOverridden:      isOverridden,
+                        InitUnchangedAddr: DialDest.Address,
+                        InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
+                }
+        }
         return &buf.PacketReader{Reader: conn}
 }
 
@@ -965,11 +950,27 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         OutGateway:        outGateway,
                 }
         }
-        // v26.11.203: Reverted finalmask.PacketConnWrapper detection (v194).
-        // Pre-v194, finalmask.PacketConnWrapper fell through to SequentialWriter.
-        // v166 (which worked for 5+ min videos) used SequentialWriter for this type.
-        // The v194 change to use PacketReader/PacketWriter may have introduced a subtle
-        // bug in the non-pool path. Reverting to SequentialWriter to match v166.
+        // v26.11.194: Also check for finalmask.PacketConnWrapper
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (finalmask.PacketConnWrapper)")
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
+                if DialDest.Address.Family().IsDomain() {
+                        resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
+                }
+                return &PacketWriter{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        UDPOverride:       UDPOverride,
+                        ResolvedUDPAddr:   resolvedUDPAddr,
+                        OutGateway:        outGateway,
+                }
+        }
         errors.LogWarning(context.Background(), "NPDIAG: SequentialWriter fallback! conn type=", fmt.Sprintf("%T", iConn))
         return &buf.SequentialWriter{Writer: conn}
 }

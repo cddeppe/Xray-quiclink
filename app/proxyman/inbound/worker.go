@@ -197,16 +197,6 @@ type udpConn struct {
         // the pool's readLoop drops replies with the new DCID, causing Google
         // to think the connection is dead and stop replying (20-second freeze).
         registerPoolCID func([]byte)
-        // v26.11.196: Persistent outbound conn (to Google). Survives Process
-        // restarts so the source port stays stable — Google doesn't see a
-        // connection migration and doesn't trigger path validation.
-        // Set by freedom.Process on first call, reused on subsequent calls.
-        outboundConn net.Conn
-        outboundMu   sync.Mutex
-        // v26.11.196: Track whether the Process goroutine is running.
-        // When Process returns, the goroutine exits. The next packet from
-        // Chrome must restart the goroutine to read from the pipe.
-        processRunning atomic.Bool
 }
 
 func (c *udpConn) setInactive() {
@@ -297,36 +287,12 @@ func (c *udpConn) Write(buf []byte) (int, error) {
         return total, nil
 }
 
-// v26.11.196: GetOutboundConn returns the persistent outbound conn (to Google).
-// Used by freedom.Process to reuse the same outbound socket across Process calls,
-// keeping the source port stable for Google's QUIC path validation.
-func (c *udpConn) GetOutboundConn() net.Conn {
-        c.outboundMu.Lock()
-        defer c.outboundMu.Unlock()
-        return c.outboundConn
-}
-
-// SetOutboundConn stores the persistent outbound conn. Called by freedom.Process
-// on first dial. Subsequent Process calls will reuse this conn.
-func (c *udpConn) SetOutboundConn(conn net.Conn) {
-        c.outboundMu.Lock()
-        defer c.outboundMu.Unlock()
-        c.outboundConn = conn
-}
-
 func (c *udpConn) Close() error {
         if c.cancel != nil {
                 c.cancel()
         }
         common.Must(c.done.Close())
         common.Must(common.Close(c.writer))
-        // v26.11.196: Close the persistent outbound conn too
-        c.outboundMu.Lock()
-        if c.outboundConn != nil {
-                c.outboundConn.Close()
-                c.outboundConn = nil
-        }
-        c.outboundMu.Unlock()
         return nil
 }
 
@@ -652,70 +618,54 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 common.Must(w.checker.Start())
         }
 
-        // v26.11.196: Start (or restart) the Process goroutine.
-        // If the goroutine was previously running but Process returned
-        // (e.g., due to a transient error or pipe close), we need to
-        // restart it so the pipe is read and data flows to Google.
-        // The outbound conn is persistent (stored in udpConn.outboundConn)
-        // so the source port stays stable across restarts.
-        if !conn.processRunning.Swap(true) {
-                // processRunning was false — goroutine not running. Start it.
-                go func() {
-                        startTime := time.Now()
-                        defer conn.processRunning.Store(false)
-                        ctx, cancel := context.WithCancel(w.ctx)
-                        conn.cancel = cancel
-                        sid := session.NewID()
-                        ctx = c.ContextWithID(ctx, sid)
+        // v26.11.210: Reverted to original Process goroutine (pre-v196).
+        // No processRunning flag, no persistent socket. Process runs once,
+        // then conn is closed and removed.
+        go func() {
+                ctx, cancel := context.WithCancel(w.ctx)
+                conn.cancel = cancel
+                sid := session.NewID()
+                ctx = c.ContextWithID(ctx, sid)
 
-                        outbounds := []*session.Outbound{{}}
-                        if originalDest.IsValid() {
-                                outbounds[0].Target = originalDest
-                        } else {
-                                // v26.11.118: When originalDest is invalid (no TPROXY),
-                                // the outbound Target defaults to Network_TCP (Go zero value).
-                                // This causes the dispatcher to route UDP QUIC traffic as TCP.
-                                // Fix: set a UDP destination so the dispatcher knows this is UDP.
-                                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
+                outbounds := []*session.Outbound{{}}
+                if originalDest.IsValid() {
+                        outbounds[0].Target = originalDest
+                } else {
+                        // v26.11.118: When originalDest is invalid (no TPROXY),
+                        // the outbound Target defaults to Network_TCP (Go zero value).
+                        // This causes the dispatcher to route UDP QUIC traffic as TCP.
+                        // Fix: set a UDP destination so the dispatcher knows this is UDP.
+                        outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
+                }
+                ctx = session.ContextWithOutbounds(ctx, outbounds)
+                local := net.DestinationFromAddr(w.hub.Addr())
+                if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
+                        if source.Address.Family().IsIPv4() {
+                                local.Address = net.AnyIP
+                        } else if source.Address.Family().IsIPv6() {
+                                local.Address = net.AnyIPv6
                         }
-                        ctx = session.ContextWithOutbounds(ctx, outbounds)
-                        local := net.DestinationFromAddr(w.hub.Addr())
-                        if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
-                                if source.Address.Family().IsIPv4() {
-                                        local.Address = net.AnyIP
-                                } else if source.Address.Family().IsIPv6() {
-                                        local.Address = net.AnyIPv6
-                                }
-                        }
+                }
 
-                        ctx = session.ContextWithInbound(ctx, &session.Inbound{
-                                Source:  source,
-                                Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
-                                Gateway: net.UDPDestination(w.address, w.port),
-                                Tag:     w.tag,
-                                Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
-                        })
-                        content := new(session.Content)
-                        content.SniffingRequest = w.sniffingRequest
-                        ctx = session.ContextWithContent(ctx, content)
-                        if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
-                        }
-                        // v26.11.197: Diagnostic — log when Process returns. This tells us
-                        // whether the persistent socket path is being exercised. If Process
-                        // returns and a new packet arrives, the goroutine should restart and
-                        // freedom should print "NPDIAG: REUSING outbound conn".
-                        errors.LogInfo(ctx, "NPDIAG: Process returned for ", source, " after=", time.Since(startTime).Round(time.Millisecond))
-                        // v26.11.196: Do NOT close conn or removeConn when Process returns.
-                        // The outbound socket (stored in conn.outboundConn) must survive
-                        // so the source port stays stable for Google's QUIC path validation.
-                        // clean() will retire the conn after idle timeout (SessionIdleSeconds).
-                        //
-                        // Old code (BROKEN — destroyed stable source port):
-                        //   conn.Close()
-                        //   if !conn.inactive { conn.setInactive(); w.removeConn(id) }
-                }()
-        }
+                ctx = session.ContextWithInbound(ctx, &session.Inbound{
+                        Source:  source,
+                        Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
+                        Gateway: net.UDPDestination(w.address, w.port),
+                        Tag:     w.tag,
+                        Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
+                })
+                content := new(session.Content)
+                content.SniffingRequest = w.sniffingRequest
+                ctx = session.ContextWithContent(ctx, content)
+                if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+                        errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
+                }
+                conn.Close()
+                if !conn.inactive {
+                        conn.setInactive()
+                        w.removeConn(id)
+                }
+        }()
 }
 
 func (w *udpWorker) removeConn(id connID) {
