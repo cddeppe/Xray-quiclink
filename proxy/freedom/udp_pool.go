@@ -668,7 +668,7 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
         //   falls back to TCP in ~1s. Video plays.
         // - When Chrome tries QUIC again (new video), xray handles it
         //   normally — QUIC gets another chance.
-        const stallTimeout = 3 * time.Second
+        const stallTimeout = 5 * time.Second
 
         // Check if we're stalled RIGHT NOW (before blocking on inbox).
         // This catches the case where we've been blocked for a while.
@@ -732,8 +732,9 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
 // is just idle, not stalled.
 func (c *pooledConn) isStalled(stallTimeout time.Duration) bool {
         now := time.Now()
-        lastReply := time.Unix(0, c.lastReplyTime.Load())
-        lastWrite := time.Unix(0, c.lastWriteTime.Load())
+        lastReplyNano := c.lastReplyTime.Load()
+        lastWriteNano := c.lastWriteTime.Load()
+        lastWrite := time.Unix(0, lastWriteNano)
 
         // Has Chrome sent us anything recently? (within 2x stall timeout)
         // If not, Chrome is idle — connection is not stalled, just idle.
@@ -741,14 +742,19 @@ func (c *pooledConn) isStalled(stallTimeout time.Duration) bool {
                 return false
         }
 
-        // Chrome is active. Has Google replied recently?
-        // If lastReply is zero (never received a reply) and we've been
-        // waiting for stallTimeout since the last write, we're stalled.
-        if lastReply.IsZero() {
+        // Chrome is active. Has Google ever replied?
+        // v26.11.0.6: check the raw int64, NOT lastReply.IsZero().
+        // time.Unix(0, 0) returns 1970-01-01, which is NOT the Go zero time.
+        // So lastReply.IsZero() returns false even when no reply was received.
+        if lastReplyNano == 0 {
+                // Never received a reply. Check if we've been waiting long enough
+                // since the last write. Give QUIC time to complete the handshake
+                // (Initial + Handshake can take 1-2 RTTs).
                 return now.Sub(lastWrite) > stallTimeout
         }
 
         // Google replied before but hasn't replied recently
+        lastReply := time.Unix(0, lastReplyNano)
         return now.Sub(lastReply) > stallTimeout
 }
 
