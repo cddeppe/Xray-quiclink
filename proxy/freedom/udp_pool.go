@@ -743,12 +743,14 @@ func (c *pooledConn) Close() error {
 // dead QUIC connection (permanent freeze that doesn't recover).
 func (c *pooledConn) sendICMPPortUnreachable() {
         if c.source == nil {
+                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP skip — c.source is nil")
                 return
         }
 
         // Only send for IPv4 Chrome sources (ICMPv4 is simpler)
         srcIP := c.source.IP.To4()
         if srcIP == nil {
+                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP skip — source is IPv6: ", c.source.IP)
                 return // IPv6 — would need ICMPv6, skip for now
         }
 
@@ -757,6 +759,7 @@ func (c *pooledConn) sendICMPPortUnreachable() {
         // the correct source IP when sending the ICMP packet via the raw socket.
         localAddr, ok := c.socket.conn.LocalAddr().(*stdnet.UDPAddr)
         if !ok || localAddr == nil {
+                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP skip — can't get local addr")
                 return
         }
         localPort := localAddr.Port
