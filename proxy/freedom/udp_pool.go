@@ -342,13 +342,11 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 }
 
 func (s *pooledSocket) readLoop() {
-        // v26.10.15-link: 65535 bytes to handle UDP GRO/GSO coalesced
-        // datagrams (Linux can deliver up to 64KB in a single recvmsg
-        // when GRO is enabled). The old 1500-byte buffer silently
-        // truncated coalesced QUIC packets, causing the DCID parser to
-        // see malformed packets and demux replies to sessions that
-        // couldn't read them. Memory cost: 64KB per pooled socket
-        // (dozens of sockets total = ~1MB).
+        defer func() {
+                if r := recover(); r != nil {
+                        xrayerrors.LogWarning(context.Background(), "recovered panic in readLoop: ", r)
+                }
+        }()
         b := make([]byte, 65535)
         for {
                 select {

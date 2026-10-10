@@ -585,6 +585,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 common.Must(w.checker.Start())
 
                 go func() {
+                        defer func() {
+                                if r := recover(); r != nil {
+                                        errors.LogWarning(context.Background(), "recovered panic: ", r)
+                                }
+                        }()
                         ctx, cancel := context.WithCancel(w.ctx)
                         conn.cancel = cancel
                         sid := session.NewID()
@@ -946,7 +951,14 @@ func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) 
 func (w *udpWorker) handlePackets() {
         receive := w.hub.Receive()
         for payload := range receive {
-                w.callback(payload.Payload, payload.Source, payload.Target)
+                func() {
+                        defer func() {
+                                if r := recover(); r != nil {
+                                        errors.LogWarning(context.Background(), "recovered panic in callback: ", r)
+                                }
+                        }()
+                        w.callback(payload.Payload, payload.Source, payload.Target)
+                }()
         }
 }
 
