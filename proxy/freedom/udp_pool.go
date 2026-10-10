@@ -38,23 +38,19 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
+        mu            sync.RWMutex // for refCount and dead flag only
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        // v26.10.43-link (audit P5): atomic timestamps to avoid
-        // mutex contention on the readLoop hot path.
         lastUsed      atomic.Int64 // UnixNano
         lastReplyTime atomic.Int64  // UnixNano
-        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
-        demuxSource   map[dcidKey]*stdnet.UDPAddr
+        // v26.11.234: Lock-free demux via sync.Map. Eliminates writer
+        // starvation when readLoop (Load) and RegisterCID (Store) contend.
+        demuxLF       sync.Map // dcidKey -> chan<- readResult
+        demuxSrcLF    sync.Map // dcidKey -> *stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
-        // v26.10.15-link: dropped reply packets counter for observability.
-        // Incremented when the inbox channel (cap 32) is full and the
-        // readLoop drops a reply packet. QUIC will retransmit, but
-        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
 }
 
@@ -296,8 +292,6 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
-                        demux:         make(map[dcidKey]chan<- readResult),
-                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
@@ -389,43 +383,34 @@ func (s *pooledSocket) readLoop() {
                 // per reply packet.
                 dk := makeDCIDKey(dcid)
 
-                // v26.10.16-link: use RLock for the demux read path (was
-                // Lock, blocking all RegisterCID calls which need write
-                // locks). The demux map is only mutated by RegisterCID
-                // and Close (which use Lock), so RLock is correct here.
-                s.mu.RLock()
-                ch, ok := s.demux[dk]
-                src := s.demuxSource[dk]
-                s.mu.RUnlock()
+                // v26.11.234: Lock-free demux lookup via sync.Map
+                var ch chan<- readResult
+                var src *stdnet.UDPAddr
+                if v, ok := s.demuxLF.Load(dk); ok {
+                        ch = v.(chan<- readResult)
+                }
+                if v, ok := s.demuxSrcLF.Load(dk); ok {
+                        src = v.(*stdnet.UDPAddr)
+                }
 
-                // Update timestamps under Lock. This is a short critical
-                // section but still serializes with RegisterCID. A future
-                // optimization could make these atomic.Int64 fields, but
-                // that requires updating evictStale to read them atomically
-                // too — defer to avoid risk.
-                // v26.10.43-link (audit P5): atomic stores, no mutex needed
                 nowNano := time.Now().UnixNano()
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
-                if !ok {
-                        // FIX: SCID-based fallback for 0-length SCID clients
-                        // (Chrome/Edge). The server's reply DCID = client's SCID
-                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
-                        // 0-length). But per RFC 9000 §7.3, the server's reply
-                        // SCID = client's Initial DCID, which WAS registered in
-                        // WriteTo. Parse the SCID and try demux[scid] as a
-                        // fallback before dropping.
+                if ch == nil {
+                        // SCID-based fallback for long headers
                         if n > 0 && packet[0]&0x80 != 0 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
-                                        s.mu.RLock()
-                                        ch, ok = s.demux[scidKey]
-                                        src = s.demuxSource[scidKey]
-                                        s.mu.RUnlock()
+                                        if v, ok := s.demuxLF.Load(scidKey); ok {
+                                                ch = v.(chan<- readResult)
+                                        }
+                                        if v, ok := s.demuxSrcLF.Load(scidKey); ok {
+                                                src = v.(*stdnet.UDPAddr)
+                                        }
                                 }
                         }
-                        if !ok {
+                        if ch == nil {
                                 putPacket(packet)
                                 continue
                         }
@@ -548,13 +533,8 @@ func (c *pooledConn) RegisterCID(cid []byte) {
         if len(cid) == 0 {
                 return
         }
-        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
-        // and the demux map. Eliminates hex.EncodeToString per SCID
-        // registration (was 1 string alloc; now zero).
         dk := makeDCIDKey(cid)
 
-        // v26.10.15-link: atomic closed check avoids acquiring mu
-        // when the conn is already closed.
         if c.closed.Load() {
                 return
         }
@@ -566,21 +546,14 @@ func (c *pooledConn) RegisterCID(cid []byte) {
         c.mu.Unlock()
 
         if !already {
-                // H4 fix: re-check closed under lock before mutating demux.
-                // Between the first closed check and here, another goroutine
-                // could call Close() which clears scidsDCID from demux.
-                c.mu.Lock()
                 if c.closed.Load() {
-                        c.mu.Unlock()
                         return
                 }
-                c.socket.mu.Lock()
-                c.socket.demux[dk] = c.inbox
+                // v26.11.234: Lock-free Store — no socket.mu needed
+                c.socket.demuxLF.Store(dk, c.inbox)
                 if c.source != nil {
-                        c.socket.demuxSource[dk] = c.source
+                        c.socket.demuxSrcLF.Store(dk, c.source)
                 }
-                c.socket.mu.Unlock()
-                c.mu.Unlock()
         }
 }
 
@@ -668,18 +641,13 @@ func (c *pooledConn) Close() error {
         close(c.done)
 
         c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
-        c.socket.mu.Lock()
+        // v26.11.234: Lock-free Delete from sync.Map
         for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
+                if v, ok := c.socket.demuxLF.Load(dk); ok && v == c.inbox {
+                        c.socket.demuxLF.Delete(dk)
+                        c.socket.demuxSrcLF.Delete(dk)
                 }
         }
-        c.socket.mu.Unlock()
         c.mu.Unlock()
 
         c.socket.release()

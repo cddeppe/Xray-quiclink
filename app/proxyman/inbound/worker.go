@@ -192,8 +192,7 @@ type udpConn struct {
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
-        // v26.11.232: Callback to register CIDs in the pool's demux.
-        // Called from tryQUICMigration when CID rotation is detected.
+        // v26.11.234: Callback to register CIDs in pool's lock-free demux
         registerPoolCID func([]byte)
 }
 
@@ -201,7 +200,7 @@ func (c *udpConn) setInactive() {
         c.inactive = true
 }
 
-// v26.11.232: SetRegisterPoolCID sets the callback for pool demux registration
+// v26.11.234: SetRegisterPoolCID sets the callback for pool demux registration
 func (c *udpConn) SetRegisterPoolCID(f func([]byte)) {
         c.registerPoolCID = f
 }
@@ -712,15 +711,8 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         newDk := makeDCIDKey(newDcid)
                                         if _, exists := w.dcidIndex[newDk]; !exists {
                                                 w.dcidIndex[newDk] = oldID
-                                                // v26.11.232: Also register in pool's demux
-                                                // (after Unlock to avoid nested locks)
-                                                poolCIDToRegister := newDcid
-                                                poolCIDRegistrar := oldConn.registerPoolCID
-                                                w.Unlock()
-                                                if poolCIDRegistrar != nil {
-                                                        poolCIDRegistrar(poolCIDToRegister)
-                                                }
-                                                return nil
+                                                // Don't overwrite conn.dcid —
+                                                // keep the original for cleanup.
                                         }
                                 }
                         }
@@ -787,13 +779,8 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         dcidHex := hex.EncodeToString(dcid)
                                         oldSrc := oldID2.src
                                         newSrc := id.src
-                                        poolCIDRegistrar := oldConn2.registerPoolCID
                                         w.Unlock()
                                         errors.LogInfo(context.Background(), "QUIC CID rotation detected: new DCID ", dcidHex, " from ", oldSrc, " to ", newSrc)
-                                        // v26.11.232: Register rotated DCID in pool's demux
-                                        if poolCIDRegistrar != nil {
-                                                poolCIDRegistrar(dcid)
-                                        }
                                         // v26.10.34-link (C2 fix): the original code
                                         // had a w.Unlock() at the fall-through case
                                         // AND a w.Unlock() at the end of the outer
@@ -931,20 +918,28 @@ func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) 
                 return
         }
         w.Lock()
-        defer w.Unlock()
         existingID, found := w.srcIndex[sk]
         if !found {
+                w.Unlock()
                 return
         }
         existingConn, ok := w.activeConn[existingID]
         if !ok || existingConn.done.Done() {
                 delete(w.srcIndex, sk)
+                w.Unlock()
                 return
         }
-        _ = existingConn
         dk := makeDCIDKey(serverSCID)
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = existingID
+        }
+        // v26.11.234: Capture callback before releasing lock
+        poolCIDRegistrar := existingConn.registerPoolCID
+        w.Unlock()
+        // v26.11.234: Register in pool's lock-free demux AFTER releasing
+        // the worker lock. No nested locks, no writer starvation.
+        if poolCIDRegistrar != nil {
+                poolCIDRegistrar(serverSCID)
         }
 }
 
