@@ -442,14 +442,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // UDP-only sticky restores v26.10.36's working behavior. The CLOSE-WAIT
         // fix (inputCloser) and tcpKeepAlive alias are kept; both are
         // independent of the sticky-TCP change.
-        // v26.11.0.10: capture the original hostname BEFORE the sticky resolver
-        // resolves it to an IP. This is needed for the stall detection's IPv6
-        // fallback — pooledConn.stallHostname must be the domain name, not the IP.
-        originalHostname := ""
-        if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() {
-                originalHostname = destination.Address.Domain()
-        }
-
         if destination.Network != net.Network_TCP && destination.Address.Family().IsDomain() && h.stickyResolver != nil {
                 if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil {
                         destination.Address = stickyIP
@@ -646,15 +638,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         IP:   inbound.Source.Address.IP(),
                                                         Port: int(inbound.Source.Port),
                                                 }
-                                        }
-                                        // v26.11.0.9: set stall resolver + hostname for IPv6 fallback.
-                                        // When a QUIC stall is detected, the sticky resolver will
-                                        // force IPv6 for this hostname on the next resolution.
-                                        // v26.11.0.10: use originalHostname (captured BEFORE sticky
-                                        // resolution), not destination.Address (which is now an IP).
-                                        if h.stickyResolver != nil && originalHostname != "" {
-                                                pooledConn.stallResolver = h.stickyResolver
-                                                pooledConn.stallHostname = originalHostname
                                         }
                                         defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
