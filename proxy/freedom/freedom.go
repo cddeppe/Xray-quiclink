@@ -591,9 +591,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else {
+        } else if destination.Network == net.Network_TCP {
                 defer conn.Close()
         }
+        // For UDP: no defer conn.Close() — the pool's pooledConn.Close()
+        // (deferred at Acquire) manages the socket lifecycle via refCount.
+        // Closing conn here would close the shared socket, killing all
+        // other connections sharing it.
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
