@@ -187,7 +187,6 @@ type udpConn struct {
         inactive         bool
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
-        srcMu            sync.RWMutex     // v26.11.206: per-conn lock for src, NOT worker lock
         dcid             []byte           // QUIC DCID, nil for non-QUIC
         // v26.11.117: Callback to register server SCID when seen in reply.
         // Set by freedom.Process when pool is OFF, so the per-session reader
@@ -446,13 +445,7 @@ type udpWorker struct {
         activeConn map[connID]*udpConn
         dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
         srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
-        // v26.11.207: Lock-free copies of dcidIndex and srcIndex for the hot path.
-        // These use sync.Map so the callback can look up DCIDs and srcKeys without
         // taking w.RLock() — which blocks when tryQUICMigration takes w.Lock().
-        // The maps are kept in sync: every write to dcidIndex/srcIndex also writes
-        // to the sync.Map. Reads on the hot path use the sync.Map.
-        dcidIndexLF sync.Map // dcidKey -> connID
-        srcIndexLF  sync.Map // srcKey   -> connID
 
         ctx  context.Context
         cone bool
@@ -499,17 +492,11 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 src:      &srcCopy,
         }
         conn.output = func(b []byte) (int, error) {
-                // v26.11.206: Use per-conn srcMu instead of worker's w.RLock().
-                // The worker's RLock blocks ALL connections' response writes when
-                // tryQUICMigration takes w.Lock() for ANY connection. This caused
-                // the video to stall for 1 second then die — the response path
-                // was blocked by the inbound path's lock contention.
-                //
-                // Per-conn lock only blocks THIS connection's writes during
-                // migration, not ALL connections'.
-                conn.srcMu.RLock()
+                // v26.11.209: Reverted to w.RLock() — the per-conn srcMu (v206)
+                // broke QUIC entirely. Go back to the working v205 behavior.
+                w.RLock()
                 srcCopy := *conn.src
-                conn.srcMu.RUnlock()
+                w.RUnlock()
                 return w.hub.WriteTo(b, srcCopy)
         }
         w.activeConn[id] = conn
@@ -578,37 +565,32 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // one conn for this source (safe for single-connection cases like h3
         // test sites).
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                // Try DCID lookup first — using lock-free sync.Map (v26.11.207)
+                // Try DCID lookup first
                 if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
                         dk := makeDCIDKey(dcid)
-                        // v26.11.207: Use lock-free sync.Map instead of w.RLock()
-                        if existingID, found := w.dcidIndexLF.Load(dk); found {
-                                cid := existingID.(connID)
-                                // Still need RLock for activeConn map, but only for a brief lookup
-                                w.RLock()
-                                existingConn, connFound := w.activeConn[cid]
-                                w.RUnlock()
-                                if connFound && !existingConn.done.Done() {
+                        w.RLock()
+                        if existingID, found := w.dcidIndex[dk]; found {
+                                if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                        w.RUnlock()
                                         existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                         existingConn.updateActivity()
                                         return
                                 }
                         }
+                        w.RUnlock()
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
-                // v26.11.207: Use lock-free sync.Map
-                if existingID, found := w.srcIndexLF.Load(id.srcKey); found {
-                        cid := existingID.(connID)
-                        w.RLock()
-                        existingConn, connFound := w.activeConn[cid]
-                        w.RUnlock()
-                        if connFound && !existingConn.done.Done() {
+                w.RLock()
+                if existingID, found := w.srcIndex[id.srcKey]; found {
+                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                w.RUnlock()
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
                                 return
                         }
                 }
+                w.RUnlock()
 
                 // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
                 b.Release()
@@ -656,9 +638,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         w.Lock()
                         if _, exists := w.dcidIndex[dk]; !exists {
                                 w.dcidIndex[dk] = connIDCopy
-                                w.dcidIndexLF.Store(dk, connIDCopy) // v26.11.207: lock-free
                                 // v26.11.207: also write to lock-free map
-                                w.dcidIndexLF.Store(dk, connIDCopy)
                         }
                         w.Unlock()
                 }
@@ -746,11 +726,9 @@ func (w *udpWorker) removeConn(id connID) {
                 for dk, dcidConnID := range w.dcidIndex {
                         if dcidConnID == id {
                                 delete(w.dcidIndex, dk)
-                                w.dcidIndexLF.Delete(dk) // v26.11.207: lock-free
                         }
                 }
                 delete(w.srcIndex, id.srcKey)
-                w.srcIndexLF.Delete(id.srcKey) // v26.11.207: lock-free
                 delete(w.activeConn, id)
         } else {
                 // H3 fix: conn was migrated and re-keyed under a new id.
@@ -818,7 +796,6 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         newDk := makeDCIDKey(newDcid)
                                         if _, exists := w.dcidIndex[newDk]; !exists {
                                                 w.dcidIndex[newDk] = oldID
-                                                w.dcidIndexLF.Store(newDk, oldID) // v26.11.207: lock-free
                                                 // v26.11.156: Also register in pool's demux so
                                                 // readLoop can route replies with the new DCID.
                                                 // Without this, Google's replies with the rotated
@@ -850,7 +827,6 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                                 // New DCID not in index → CID rotation.
                                                 // Register it for this conn + pool demux.
                                                 w.dcidIndex[newDk] = oldID
-                                                w.dcidIndexLF.Store(newDk, oldID) // v26.11.207: lock-free
                                                 if oldConn.registerPoolCID != nil {
                                                         oldConn.registerPoolCID(newDcid)
                                                 }
@@ -886,10 +862,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                 if dcidConn, dcidOk := w.activeConn[dcidID]; dcidOk && !dcidConn.done.Done() && dcidID == oldID2 {
                                         // Genuine CID rotation: DCID belongs to
                                         // the same src's existing conn. Update.
-                                        // v26.11.206: use per-conn srcMu, not worker lock
-                                        oldConn2.srcMu.Lock()
                                         *oldConn2.src = id.src
-                                        oldConn2.srcMu.Unlock()
                                         oldConn2.updateActivity()
                                         // v26.10.42-link (audit H1 from 2-b): delete the OLD dcidIndex
                                         // entry to prevent orphan accumulation. The old DCID is no
@@ -902,9 +875,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         delete(w.activeConn, oldID2)
                                         w.activeConn[id] = oldConn2
                                         w.srcIndex[sk] = id
-                                        w.srcIndexLF.Store(sk, id) // v26.11.207: lock-free
                                         w.dcidIndex[dk] = id
-                                        w.dcidIndexLF.Store(dk, id) // v26.11.207: lock-free
                                         // v26.10.34-link (M11 fix): defer log to
                                         // after w.Unlock() — errors.LogInfo does
                                         // formatted I/O and can block on a slow
@@ -961,10 +932,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         // since src was unknown, but defensive)
                 }
                 oldSK := oldID.srcKey
-                // v26.11.206: use per-conn srcMu, not worker lock
-                oldConn.srcMu.Lock()
                 *oldConn.src = id.src
-                oldConn.srcMu.Unlock()
                 oldConn.updateActivity()
                 // v26.10.43-link (audit H4 from 2-b): update remote
                 // so RemoteAddr() returns the post-migration source.
@@ -975,7 +943,6 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                 delete(w.activeConn, oldID)
                 w.activeConn[id] = oldConn
                 w.dcidIndex[dk] = id
-                w.dcidIndexLF.Store(dk, id) // v26.11.207: lock-free
                 delete(w.srcIndex, oldSK)
                 w.srcIndex[id.srcKey] = id
                 // v26.10.34-link (M11+L11 fix): defer log to after w.Unlock()
@@ -1003,7 +970,6 @@ func (w *udpWorker) recordSrc(id connID, conn *udpConn) {
         if _, exists := w.srcIndex[id.srcKey]; !exists {
                 w.srcIndex[id.srcKey] = id
                 // v26.11.207: also write to lock-free map
-                w.srcIndexLF.Store(id.srcKey, id)
         }
         w.Unlock()
 }
@@ -1030,9 +996,7 @@ func (w *udpWorker) recordDCID(packet []byte, id connID, conn *udpConn) {
         w.Lock()
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = id
-                w.dcidIndexLF.Store(dk, id) // v26.11.207: lock-free
                 // v26.11.207: also write to lock-free map
-                w.dcidIndexLF.Store(dk, id)
                 conn.dcid = dcid
         }
 }
@@ -1073,7 +1037,6 @@ func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) 
         dk := makeDCIDKey(serverSCID)
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = existingID
-                w.dcidIndexLF.Store(dk, existingID) // v26.11.207: lock-free
         }
 }
 
