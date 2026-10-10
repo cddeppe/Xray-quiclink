@@ -643,7 +643,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         Port: int(inbound.Source.Port),
                                                 }
                                         }
-                                        defer pooledConn.Close()
+                                        // v26.11.243: Do NOT defer pooledConn.Close().
+                                        // pooledConn.Close() closes c.done, which makes
+                                        // responseDone's ReadFrom return EOF, which
+                                        // causes Process to return prematurely.
+                                        // The pool's release() (via refCount) handles
+                                        // socket cleanup. The inbox stays registered
+                                        // in inboxesLF until the socket is reaped.
                                         // v26.11.234: Wire up registerPoolCID so
                                         // OnServerSCID can register server's SCID in
                                         // pool's lock-free demux without holding worker lock.
