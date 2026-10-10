@@ -34,7 +34,7 @@ type Hub struct {
 
 func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, options ...HubOption) (*Hub, error) {
         hub := &Hub{
-                capacity:     4096,
+                capacity:     256,
                 recvOrigDest: false,
         }
         for _, opt := range options {
