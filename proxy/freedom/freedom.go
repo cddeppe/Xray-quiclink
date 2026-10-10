@@ -1087,8 +1087,10 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                         }
                         n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
                         // NPDIAG 4: Chrome data sent to Google
+                        errors.LogInfo(context.Background(), "NPDIAG: Chrome->Google write n=", n, " dest=", destAddr)
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
+                        errors.LogInfo(context.Background(), "NPDIAG: Chrome->Google write (fixed dest) n=", n)
                 }
                 b.Release()
                 if err != nil {
