@@ -426,20 +426,14 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 return conn, true
         }
 
-        // v26.10.25-link: 256KB pipe with DiscardOverflow (not blocking).
-        //
-        // v26.10.24 tried removing DiscardOverflow (blocking writes) but
-        // this was wrong: if the outbound truly stalls (CDN edge rotation),
-        // the blocking pipe freezes the entire inbound worker's callback
-        // loop, preventing ANY new connections from being processed.
-        // That's a worse failure mode than dropping packets.
-        //
-        // The correct fix: keep DiscardOverflow but increase the size from
-        // 16KB to 256KB. 16KB was only ~14 QUIC packets — YouTube burst
-        // downloads overflowed it immediately. 256KB (~213 packets) absorbs
-        // most bursts. When it does overflow, the drop is far enough apart
-        // that QUIC retransmits recover quickly.
-        pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(256*1024))
+        // v26.11.211: Increase pipe from 256KB to 2MB and KEEP DiscardOverflow.
+        // The 256KB pipe (~213 packets) overflows during YouTube bursts (500+ packets).
+        // When it overflows, Chrome's ACKs are silently dropped via DiscardOverflow.
+        // QUIC interprets this as network loss and reduces sending rate → stall.
+        // 2MB (~1700 packets) absorbs the largest YouTube bursts.
+        // DiscardOverflow is kept because removing it (v26.10.24) froze the
+        // callback loop when the outbound stalled. With 2MB, overflow is rare.
+        pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(2*1024*1024))
         srcCopy := id.src
         conn := &udpConn{
                 reader: pReader,
