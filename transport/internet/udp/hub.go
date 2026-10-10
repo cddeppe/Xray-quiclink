@@ -82,6 +82,9 @@ func (h *Hub) Close() error {
 }
 
 func (h *Hub) WriteTo(payload []byte, dest net.Destination) (int, error) {
+        // v26.11.208: Removed 5µs delay (v204) — it wasn't helping and may
+        // interfere with QUIC timing. The real fix is the lock contention
+        // removal (v206 per-conn srcMu + v207 sync.Map for dcidIndex/srcIndex).
         return h.conn.WriteTo(payload, &net.UDPAddr{
                 IP:   dest.Address.IP(),
                 Port: int(dest.Port),

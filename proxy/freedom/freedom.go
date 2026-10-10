@@ -4,6 +4,7 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -33,6 +34,7 @@ import (
         "github.com/xtls/xray-core/proxy/freedom/udptimeout"
         "github.com/xtls/xray-core/transport"
         "github.com/xtls/xray-core/transport/internet"
+        "github.com/xtls/xray-core/transport/internet/finalmask"
         "github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -249,6 +251,11 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                                 h.socketConfig, // v26.10.17-link: pass sockopt for interface binding
                         )
                         errors.LogWarning(context.Background(), "freedom: UDP socket pool enabled (staleness=", staleness, "s idle=", idle, "s unused=", unused, "s)")
+                } else {
+                        // v26.11.198: Explicitly log when the pool is NOT enabled.
+                        // This helps diagnose why video stalls — without the pool,
+                        // each QUIC connection gets its own outbound socket.
+                        errors.LogWarning(context.Background(), "freedom: UDP socket pool DISABLED (enableSocketPool=false)")
                 }
                 if config.UdpConfig.EnableStickyResolver {
                         // v26.10.23-link: configurable sticky resolver TTL.
@@ -460,15 +467,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // the sticky resolver (if enabled), so the warm pool key matches the
         // actual IP:port the dialer would have used.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
-                // v26.11.132: SetDialFunc is now a no-op after the first call
-                // (checks for nil internally), so calling it every Process is cheap.
+                // v26.10.45-link: provide the dialer to the warm pool for
+                // pre-warming. Set once — the dialer is the same for all
+                // Process calls on this handler.
                 h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
                         return dialer.Dial(ctx, dest)
                 })
                 if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
-                        conn = warmConn
-                        warmAcquired = true
-                        errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        if warmConn.RemoteAddr() != nil {
+                                conn = warmConn
+                                warmAcquired = true
+                                errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        } else {
+                                warmConn.Close()
+                        }
                 }
         }
         var blockedDest *net.Destination
@@ -519,6 +531,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // v26.11.196: For UDP, check if the udpConn already has a persistent
+                // outbound conn from a previous Process call. If so, reuse it.
+                if destination.Network != net.Network_TCP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                type outboundConnHolder interface {
+                                        GetOutboundConn() stdnet.Conn
+                                }
+                                if holder, ok := inbound.Conn.(outboundConnHolder); ok {
+                                        if existingConn := holder.GetOutboundConn(); existingConn != nil {
+                                                conn = existingConn
+                                                return nil
+                                        }
+                                }
+                        }
+                }
+
                 rawConn, err := dialer.Dial(ctx, destination)
                 // v26.11.132: warmAcquired conns are now liveness-checked in
                 // Acquire (getsockopt SO_ERROR), so a dead warm conn is
@@ -558,6 +586,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if !warmAcquired {
                         conn = rawConn
                 }
+                // v26.11.196: Store the outbound conn in udpConn for reuse on
+                // subsequent Process calls.
+                if destination.Network != net.Network_TCP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                type outboundConnSetter interface {
+                                        SetOutboundConn(stdnet.Conn)
+                                }
+                                if setter, ok := inbound.Conn.(outboundConnSetter); ok {
+                                        setter.SetOutboundConn(conn)
+                                }
+                        }
+                }
                 return nil
         })
         if err != nil {
@@ -589,11 +629,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // to the warm pool instead of closing. The warm pool will close the
         // conn when it expires (default 5s) or when a new inbound reuses it.
         // For non-warm-pool paths, close normally.
+        // v26.11.213: For UDP, do NOT close the outbound conn — the original
+        // v191 code did NOT have defer conn.Close() for UDP. Adding it (v210)
+        // broke QUIC entirely. The worker's conn.Close() handles cleanup.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else {
+        } else if destination.Network == net.Network_TCP {
                 defer conn.Close()
         }
+        // For UDP: no defer conn.Close() — worker manages lifecycle
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
@@ -616,19 +660,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // v26.11.252 (Option 3): per-connection sockets.
-                                        // Capture the inbound client source IP:port BEFORE
-                                        // Acquire so the pool can key the socket by
-                                        // (dest, source). Each Chrome QUIC connection gets
-                                        // its own outbound socket — no demux ambiguity.
-                                        var clientSource *stdnet.UDPAddr
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                clientSource = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
-                                                }
-                                        }
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote, clientSource)
+                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
@@ -638,14 +671,36 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
-                                        // v26.11.252: source is now set inside Acquire from
-                                        // the clientSource parameter. The pooledConn.source
-                                        // field is still used by RegisterCID for demuxSource
-                                        // (NotifyServerSCID routing).
+                                        // v26.11.52-link (Solution B): bind the pooled socket's
+                                        // source to the inbound client's source IP:port so that
+                                        // pool reply packets (read via wildcard listen) are
+                                        // demuxed back to the originating client. Without this,
+                                        // all QUIC sessions sharing a pooled socket collapse to
+                                        // the socket's local (kernel-chosen) source and the
+                                        // 4-tuple-based reply routing breaks under NAT.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                pooledConn.source = &stdnet.UDPAddr{
+                                                        IP:   inbound.Source.Address.IP(),
+                                                        Port: int(inbound.Source.Port),
+                                                }
+                                        }
                                         defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
+                                        // v26.11.156: Set up pool CID registration callback.
+                                        // When the inbound worker detects CID rotation in a
+                                        // 1-RTT short header, it calls this to register the
+                                        // new DCID in the pool's demux. Without this, Google's
+                                        // replies with the rotated DCID get dropped.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
+                                                        pc := pooledConn
+                                                        uc.SetRegisterPoolCID(func(newDCID []byte) {
+                                                                pc.RegisterCID(newDCID)
+                                                        })
+                                                }
+                                        }
                                 }
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
@@ -670,6 +725,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pooledConn != nil)
 
                 var writer buf.Writer
                 if destination.Network == net.Network_TCP {
@@ -710,21 +766,26 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // NPDIAG 3: requestDone starting buf.Copy
                 if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
                         // v26.10.38-link: swallow ErrClosedPipe when inputCloser has
                         // fired (responseDone returned, so YouTube closed the outbound).
                         select {
                         case <-inputCloser:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (inputCloser) dest=", destination)
                                 return nil // graceful — let Dispatch Close(link.Writer)
                         default:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (error) dest=", destination, " err=", err)
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
+                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (copy done) dest=", destination)
                 return nil
         }
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil, " socketPool=", h.socketPool != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
@@ -749,11 +810,31 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
-                        // v26.11.251: Removed serverSCIDReader — causes stalls.
+                        // v26.11.117: Wrap reader to detect server SCID from
+                        // long-header replies. When Google's Initial reply
+                        // arrives, extract the SCID and register it in the
+                        // worker's dcidIndex via RegisterServerSCID.
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
+                                        var scidRegistered bool
+                                        baseReader := reader
+                                        reader = &serverSCIDReader{
+                                                base:       baseReader,
+                                                register:   reg.RegisterServerSCID,
+                                                registered: &scidRegistered,
+                                        }
+                                }
+                        }
+                        // v26.11.208: BufferedPacketReader reverted. The lock
+                        // contention fixes (v206 srcMu + v207 sync.Map) should
+                        // be the real fix. BufferedPacketReader adds complexity
+                        // and wasn't conclusively helping.
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+                        errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
                 return nil
         }
 
@@ -794,6 +875,26 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
                 }
         }
+        // v26.11.194: Detect finalmask.PacketConnWrapper
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                isOverridden := false
+                if UDPOverride.Address != nil || UDPOverride.Port != 0 {
+                        isOverridden = true
+                }
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                return &PacketReader{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        IsOverridden:      isOverridden,
+                        InitUnchangedAddr: DialDest.Address,
+                        InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
+                }
+        }
         return &buf.PacketReader{Reader: conn}
 }
 
@@ -813,15 +914,13 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         for {
                 n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
                 if err != nil {
-                        // v26.11.251: Retry transient UDP errors (ICMP unreachable
-                        // from CDN edge rotation) instead of killing Process.
-                        if isTransientUDPError(err) {
-                                time.Sleep(20 * time.Millisecond)
-                                continue
-                        }
                         b.Release()
                         return nil, err
                 }
+                // NPDIAG 1: Google reply received by outbound socket
+                // v26.11.201: REMOVED per-packet log — was causing the stall.
+                // 3 log lines per packet × 500+ packets/burst = logger mutex
+                // serialized all packet processing, pipe filled up, ACKs dropped.
                 udpAddr := d.(*net.UDPAddr)
                 sourceAddr := net.IPAddress(udpAddr.IP)
                 if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
@@ -860,6 +959,7 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                 counter = statConn.WriteCounter
         }
         if c, ok := iConn.(*internet.PacketConnWrapper); ok {
+                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (internet.PacketConnWrapper)")
                 // If DialDest is a domain, it will be resolved in dialer
                 // check this behavior and add it to map
                 resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
@@ -876,6 +976,28 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         OutGateway:        outGateway,
                 }
         }
+        // v26.11.194: Detect finalmask.PacketConnWrapper
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (finalmask.PacketConnWrapper)")
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
+                if DialDest.Address.Family().IsDomain() {
+                        resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
+                }
+                return &PacketWriter{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        UDPOverride:       UDPOverride,
+                        ResolvedUDPAddr:   resolvedUDPAddr,
+                        OutGateway:        outGateway,
+                }
+        }
+        errors.LogWarning(context.Background(), "NPDIAG: SequentialWriter fallback! conn type=", fmt.Sprintf("%T", iConn))
         return &buf.SequentialWriter{Writer: conn}
 }
 
@@ -952,15 +1074,12 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 continue
                         }
                         n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
+                        // NPDIAG 4: REMOVED per-packet log (v26.11.201) — was causing stalls
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
                 }
                 b.Release()
                 if err != nil {
-                        // v26.11.251: Retry transient UDP errors
-                        if isTransientUDPError(err) {
-                                continue
-                        }
                         buf.ReleaseMulti(mb)
                         return err
                 }
@@ -969,28 +1088,6 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                 }
         }
         return nil
-}
-
-// v26.11.251: isTransientUDPError checks if a UDP error is transient
-// (ICMP unreachable from CDN edge rotation) and should be retried
-// instead of killing the Process goroutine.
-func isTransientUDPError(err error) bool {
-        if err == nil {
-                return false
-        }
-        var errno syscall.Errno
-        if stderrors.As(err, &errno) {
-                switch errno {
-                case syscall.ECONNREFUSED, syscall.EHOSTUNREACH,
-                     syscall.ENETUNREACH, syscall.EAGAIN:
-                        return true
-                }
-        }
-        s := err.Error()
-        return strings.Contains(s, "connection refused") ||
-                strings.Contains(s, "host is unreachable") ||
-                strings.Contains(s, "network is unreachable") ||
-                strings.Contains(s, "resource temporarily unavailable")
 }
 
 type NoisePacketWriter struct {
@@ -1185,4 +1282,84 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         }
 
         return mb, nil
+}
+
+// v26.11.195: BufferedPacketReader wraps a buf.Reader with a dedicated
+// readLoop goroutine. This decouples the read from the write — the
+// readLoop always reads from the socket, even when the write path
+// (pipe to Chrome) is blocked. This prevents Google's replies from
+// being dropped when the pipe is full.
+//
+// This is the same architecture as the pool's readLoop, but for
+// single (non-pooled) connections. Without this, buf.Copy serializes
+// read and write — when output.WriteMultiBuffer blocks, the next
+// reader.ReadMultiBuffer doesn't happen, the socket buffer fills up,
+// and Google's replies are dropped by the kernel.
+type BufferedPacketReader struct {
+        base   buf.Reader
+        inbox  chan buf.MultiBuffer
+        done   chan struct{}
+}
+
+func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
+        r := &BufferedPacketReader{
+                base:  base,
+                inbox: make(chan buf.MultiBuffer, 256), // same as pool's inbox
+                done:  make(chan struct{}),
+        }
+        go r.readLoop()
+        return r
+}
+
+func (r *BufferedPacketReader) readLoop() {
+        for {
+                mb, err := r.base.ReadMultiBuffer()
+                if err != nil {
+                        buf.ReleaseMulti(mb)
+                        // Send EOF to unblock ReadMultiBuffer
+                        select {
+                        case r.inbox <- nil:
+                        case <-r.done:
+                        }
+                        return
+                }
+                // v26.11.202: NON-BLOCKING send. Never block the readLoop —
+                // if the inbox is full (consumer can't keep up), drop the
+                // packet. QUIC retransmission handles loss gracefully.
+                // Blocking here would cause the same bug as buf.Copy:
+                // socket reads stall, kernel buffer overflows, Google
+                // kills the connection.
+                select {
+                case r.inbox <- mb:
+                default:
+                        buf.ReleaseMulti(mb) // inbox full — drop packet
+                }
+                // Check if we should exit
+                select {
+                case <-r.done:
+                        return
+                default:
+                }
+        }
+}
+
+func (r *BufferedPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        select {
+        case mb, ok := <-r.inbox:
+                if !ok || mb == nil {
+                        return nil, io.EOF
+                }
+                return mb, nil
+        case <-r.done:
+                return nil, io.EOF
+        }
+}
+
+func (r *BufferedPacketReader) Close() error {
+        select {
+        case <-r.done:
+        default:
+                close(r.done)
+        }
+        return nil
 }
