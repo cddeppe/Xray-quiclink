@@ -595,10 +595,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // (fast swiping), causing a ~30 second stall until connections expire.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network == net.Network_TCP {
+        } else {
                 defer conn.Close()
         }
-        // For UDP: no defer conn.Close() — worker manages lifecycle
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
