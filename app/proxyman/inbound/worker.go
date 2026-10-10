@@ -710,8 +710,10 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                                 w.dcidIndex[newDk] = oldID
                                                 // v26.11.224: Also register lock-free
                                                 w.dcidConnLF.Store(newDk, oldConn)
-                                                // Don't overwrite conn.dcid —
-                                                // keep the original for cleanup.
+                                                // v26.11.227: Also register in pool's demux
+                                                if oldConn.registerPoolCID != nil {
+                                                        oldConn.registerPoolCID(newDcid)
+                                                }
                                         }
                                 }
                         }
