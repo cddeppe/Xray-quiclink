@@ -234,7 +234,10 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 // behind EnableSocketPool. Without this, multiple freedom
                 // outbounds (e.g. direct + wg) fight over the global — last
                 // Init wins, silently overriding the others.
-                if config.UdpConfig.EnableSocketPool {
+                // v26.11.221: Allow session_idle_timeout to be set without
+                // requiring enableSocketPool. This lets users tune how long
+                // stale UDP connections live before clean() removes them.
+                if config.UdpConfig.GetSessionIdleTimeout() > 0 {
                         udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
                 }
 
