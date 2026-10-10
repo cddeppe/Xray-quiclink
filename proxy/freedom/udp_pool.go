@@ -681,6 +681,8 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
+        // v26.11.0.16: log Close() calls to verify it's being called
+        xrayerrors.LogInfo(context.Background(), "udp_pool: Close() called, source=", c.source)
         // v26.10.15-link: atomic CAS to avoid double-close. The
         // CAS ensures only one caller proceeds to close(c.done)
         // and the scids cleanup.
