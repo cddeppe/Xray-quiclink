@@ -3,6 +3,7 @@ package freedom
 import (
         "context"
         "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strconv"
@@ -411,6 +412,13 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if ch == nil {
+                                // v26.11.235: Log demux misses for diagnosis
+                                isLong := n > 0 && packet[0]&0x80 != 0
+                                xrayerrors.LogWarning(context.Background(), "POOL MISS: from=", addr, " n=", n, " long=", isLong, " dcid=", fmt.Sprintf("%x", dcid), " demuxSize=", func() int {
+                                        count := 0
+                                        s.demuxLF.Range(func(_, _ interface{}) bool { count++; return true })
+                                        return count
+                                }())
                                 putPacket(packet)
                                 continue
                         }
