@@ -409,7 +409,13 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // SCID-based fallback for long headers
+                        // FIX: SCID-based fallback for 0-length SCID clients
+                        // (Chrome/Edge). The server's reply DCID = client's SCID
+                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
+                        // 0-length). But per RFC 9000 §7.3, the server's reply
+                        // SCID = client's Initial DCID, which WAS registered in
+                        // WriteTo. Parse the SCID and try demux[scid] as a
+                        // fallback before dropping.
                         if n > 0 && packet[0]&0x80 != 0 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
@@ -418,17 +424,6 @@ func (s *pooledSocket) readLoop() {
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
                                 }
-                        }
-                        // v26.11.250: Empty-key fallback for short headers.
-                        // 1-RTT packets from Google have DCID=∅ (Chrome's
-                        // 0-length SCID). ParseDCID extracts 8 garbage bytes
-                        // because it assumes 8-byte DCID. Try the empty key.
-                        if !ok {
-                                emptyKey := dcidKey{}
-                                s.mu.RLock()
-                                ch, ok = s.demux[emptyKey]
-                                src = s.demuxSource[emptyKey]
-                                s.mu.RUnlock()
                         }
                         if !ok {
                                 putPacket(packet)
@@ -550,9 +545,12 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-        // v26.11.250: Allow 0-length CID registration. Chrome uses 0-length
-        // SCID, so Google's replies have DCID=∅ (empty). Without registering
-        // the empty key, 100% of Google's replies miss the demux.
+        if len(cid) == 0 {
+                return
+        }
+        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
+        // and the demux map. Eliminates hex.EncodeToString per SCID
+        // registration (was 1 string alloc; now zero).
         dk := makeDCIDKey(cid)
 
         // v26.10.15-link: atomic closed check avoids acquiring mu
@@ -600,9 +598,7 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // mutex acquire for 99% of packets in a long-lived QUIC
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
-                // v26.11.250: Register SCID even if 0-length. Chrome uses
-                // 0-length SCID, so Google's replies have DCID=∅ (empty).
-                if scid, _, err := parseQUICSCID(b); err == nil {
+                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,

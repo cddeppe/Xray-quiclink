@@ -746,21 +746,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
-                        // v26.11.117: Wrap reader to detect server SCID from
-                        // long-header replies. When Google's Initial reply
-                        // arrives, extract the SCID and register it in the
-                        // worker's dcidIndex via RegisterServerSCID.
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
-                                        var scidRegistered bool
-                                        baseReader := reader
-                                        reader = &serverSCIDReader{
-                                                base:       baseReader,
-                                                register:   reg.RegisterServerSCID,
-                                                registered: &scidRegistered,
-                                        }
-                                }
-                        }
+                        // v26.11.251: Removed serverSCIDReader — causes stalls.
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         return errors.New("failed to process response").Base(err)
@@ -824,6 +810,12 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         for {
                 n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
                 if err != nil {
+                        // v26.11.251: Retry transient UDP errors (ICMP unreachable
+                        // from CDN edge rotation) instead of killing Process.
+                        if isTransientUDPError(err) {
+                                time.Sleep(20 * time.Millisecond)
+                                continue
+                        }
                         b.Release()
                         return nil, err
                 }
@@ -962,6 +954,10 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                 }
                 b.Release()
                 if err != nil {
+                        // v26.11.251: Retry transient UDP errors
+                        if isTransientUDPError(err) {
+                                continue
+                        }
                         buf.ReleaseMulti(mb)
                         return err
                 }
@@ -970,6 +966,28 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                 }
         }
         return nil
+}
+
+// v26.11.251: isTransientUDPError checks if a UDP error is transient
+// (ICMP unreachable from CDN edge rotation) and should be retried
+// instead of killing the Process goroutine.
+func isTransientUDPError(err error) bool {
+        if err == nil {
+                return false
+        }
+        var errno syscall.Errno
+        if stderrors.As(err, &errno) {
+                switch errno {
+                case syscall.ECONNREFUSED, syscall.EHOSTUNREACH,
+                     syscall.ENETUNREACH, syscall.EAGAIN:
+                        return true
+                }
+        }
+        s := err.Error()
+        return strings.Contains(s, "connection refused") ||
+                strings.Contains(s, "host is unreachable") ||
+                strings.Contains(s, "network is unreachable") ||
+                strings.Contains(s, "resource temporarily unavailable")
 }
 
 type NoisePacketWriter struct {
