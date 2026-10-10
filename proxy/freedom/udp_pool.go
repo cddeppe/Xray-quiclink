@@ -46,10 +46,9 @@ type pooledSocket struct {
         lastReplyTime atomic.Int64
         demux         map[dcidKey]chan<- readResult
         demuxSource   map[dcidKey]*stdnet.UDPAddr
-        // v26.11.246: Broadcast list — all inboxes for this socket.
-        // readLoop broadcasts every reply to ALL inboxes.
-        inboxes       sync.Map // int -> chan<- readResult
-        inboxCount    atomic.Int64
+        // v26.11.248: Fallback inbox — when demux misses, send to this
+        // inbox. Set to the most recently acquired conn's inbox.
+        fallbackInbox chan<- readResult
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -333,9 +332,8 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
-        // v26.11.246: Register inbox in broadcast list
-        idx := sock.inboxCount.Add(1)
-        sock.inboxes.Store(idx, inbox)
+        // v26.11.248: Set as fallback inbox for demux misses
+        sock.fallbackInbox = inbox
         return conn, nil
 }
 
@@ -380,28 +378,100 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                // v26.11.246: Broadcast to ALL inboxes — no demux lookup.
-                // Each connection's QUIC stack drops packets with wrong DCID.
+                dcid, _, err := quic.ParseDCID(packet[:n])
+                if err != nil {
+                        putPacket(packet)
+                        continue
+                }
+                // v26.10.16-link: zero-alloc dcidKey struct instead of
+                // hex.EncodeToString(dcid) which allocated a 16-char string
+                // per reply packet.
+                dk := makeDCIDKey(dcid)
+
+                // v26.10.16-link: use RLock for the demux read path (was
+                // Lock, blocking all RegisterCID calls which need write
+                // locks). The demux map is only mutated by RegisterCID
+                // and Close (which use Lock), so RLock is correct here.
+                s.mu.RLock()
+                ch, ok := s.demux[dk]
+                src := s.demuxSource[dk]
+                s.mu.RUnlock()
+
+                // Update timestamps under Lock. This is a short critical
+                // section but still serializes with RegisterCID. A future
+                // optimization could make these atomic.Int64 fields, but
+                // that requires updating evictStale to read them atomically
+                // too — defer to avoid risk.
+                // v26.10.43-link (audit P5): atomic stores, no mutex needed
                 nowNano := time.Now().UnixNano()
                 s.lastUsed.Store(nowNano)
                 s.lastReplyTime.Store(nowNano)
 
-                delivered := false
-                s.inboxes.Range(func(_, v interface{}) bool {
-                        ch := v.(chan<- readResult)
-                        pktCopy := getPacket()
-                        copy(pktCopy, packet[:n])
-                        select {
-                        case ch <- readResult{data: pktCopy[:n], addr: addr}:
-                                delivered = true
-                        default:
+                if !ok {
+                        // FIX: SCID-based fallback for 0-length SCID clients
+                        // (Chrome/Edge). The server's reply DCID = client's SCID
+                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
+                        // 0-length). But per RFC 9000 §7.3, the server's reply
+                        // SCID = client's Initial DCID, which WAS registered in
+                        // WriteTo. Parse the SCID and try demux[scid] as a
+                        // fallback before dropping.
+                        if n > 0 && packet[0]&0x80 != 0 {
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidKey := makeDCIDKey(scid)
+                                        s.mu.RLock()
+                                        ch, ok = s.demux[scidKey]
+                                        src = s.demuxSource[scidKey]
+                                        s.mu.RUnlock()
+                                }
                         }
-                        return true
-                })
-                if !delivered {
-                        s.droppedReplies.Add(1)
+                        if !ok {
+                                // v26.11.248: Demux miss — use fallback inbox
+                                // instead of dropping. This fixes 0-length SCID
+                                // and unregistered server SCID issues.
+                                if fb := s.fallbackInbox; fb != nil {
+                                        ch = fb
+                                        ok = true
+                                }
+                        }
+                        if !ok {
+                                putPacket(packet)
+                                continue
+                        }
                 }
-                putPacket(packet)
+
+                // v26.10.21-link: non-blocking send with large channel (256).
+                //
+                // The blocking send (v26.10.20) was WRONG for the shared-socket
+                // model: one slow/stale session's full channel would block the
+                // entire readLoop, starving ALL other sessions sharing the same
+                // socket. This made YouTube stalls WORSE when swiping quickly
+                // between videos (many sessions, one stale session blocks all).
+                //
+                // The correct approach for a shared readLoop:
+                // 1. Large channel (256) so drops are rare during bursts
+                // 2. Non-blocking send so one slow session doesn't starve others
+                // 3. Track drops for observability
+                sentOk := false
+                packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
+                select {
+                case ch <- readResult{data: packetToSend, addr: addr}:
+                        sentOk = true
+                default:
+                        s.droppedReplies.Add(1)
+                        // v26.10.42-link (audit P3): return the pooled buffer
+                        // when the inbox is full and we drop the packet.
+                        putPacket(packet)
+                }
+
+                if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        pktType := (packet[0] >> 4) & 0x03
+                        if pktType == 0x00 {
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidCopy := append([]byte(nil), scid...)
+                                        quic.NotifyServerSCID(scidCopy, src)
+                                }
+                        }
+                }
         }
 }
 
@@ -597,21 +667,19 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
+        // v26.10.15-link: atomic CAS to avoid double-close. The
+        // CAS ensures only one caller proceeds to close(c.done)
+        // and the scids cleanup.
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
         c.mu.Lock()
-        // v26.11.246: Remove from broadcast list
-        c.socket.inboxes.Range(func(k, v interface{}) bool {
-                if v.(chan<- readResult) == c.inbox {
-                        c.socket.inboxes.Delete(k)
-                        return false
-                }
-                return true
-        })
-        // v26.10.34-link: also clean up demux (kept for compatibility)
+        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
+        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
+        // delete here — Go's race detector flags it, and production can panic
+        // with "concurrent map read and map write".
         c.socket.mu.Lock()
         for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
