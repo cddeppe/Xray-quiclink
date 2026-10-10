@@ -639,6 +639,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         Port: int(inbound.Source.Port),
                                                 }
                                         }
+                                        // v26.11.0.9: set stall resolver + hostname for IPv6 fallback.
+                                        // When a QUIC stall is detected, the sticky resolver will
+                                        // force IPv6 for this hostname on the next resolution.
+                                        if h.stickyResolver != nil && destination.Address.Family().IsDomain() {
+                                                pooledConn.stallResolver = h.stickyResolver
+                                                pooledConn.stallHostname = destination.Address.Domain()
+                                        }
                                         defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).

@@ -33,6 +33,11 @@ type StickyResolver struct {
         refreshing   map[string]chan struct{}
         refreshingMu sync.Mutex
         stopCh       chan struct{}
+        // v26.11.0.9: forcePreferIPv6 temporarily forces IPv6 for a hostname
+        // after a stall is detected. Keyed by hostname, value is UnixNano
+        // until which IPv6 should be preferred. After the timeout, normal
+        // preference is restored.
+        forceIPv6   map[string]int64 // hostname → UnixNano until
 }
 
 type stickyEntry struct {
@@ -55,6 +60,7 @@ func NewStickyResolver(ttl time.Duration) *StickyResolver {
                 ttl:         ttl,
                 wildcardTTL: 60 * time.Second,
                 stopCh:      make(chan struct{}),
+                forceIPv6:   make(map[string]int64), // v26.11.0.9
         }
         go s.reaper()
         return s
@@ -414,6 +420,7 @@ func (s *StickyResolver) finishRefresh(hostname string) {
 
 // selectAddr applies IPv4/IPv6 preference to the address list and
 // returns the selected IP. If no preference is set, returns addrs[0].IP.
+// v26.11.0.9: also checks the forceIPv6 map for hostname-specific overrides.
 func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
         if preferIPv4 || preferIPv6 {
                 for _, addr := range addrs {
@@ -430,6 +437,43 @@ func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
                 return nil
         }
         return addrs[0].IP
+}
+
+// ForceIPv6AfterStall marks a hostname to prefer IPv6 for the given duration.
+// Called when a QUIC stall is detected on an IPv4 address. The next DNS
+// resolution for this hostname will prefer IPv6, and the cached IPv4 entry
+// is deleted so it re-resolves fresh.
+func (s *StickyResolver) ForceIPv6AfterStall(hostname string, duration time.Duration) {
+        s.mu.Lock()
+        // Delete the cached entry so it re-resolves on next use
+        delete(s.entries, hostname)
+        // Set the force-IPv6 deadline
+        s.forceIPv6[hostname] = time.Now().Add(duration).UnixNano()
+        // Also set it on the wildcard entry if it exists
+        if parent, ok := parentDomain(hostname); ok {
+                wildcardKey := "*." + parent
+                s.forceIPv6[wildcardKey] = time.Now().Add(duration).UnixNano()
+        }
+        s.mu.Unlock()
+        errors.LogInfo(context.Background(), "sticky: forcing IPv6 for ", hostname, " for ", duration, " after stall")
+}
+
+// isForceIPv6 checks if a hostname should prefer IPv6 due to a recent stall.
+func (s *StickyResolver) isForceIPv6(hostname string) bool {
+        s.mu.RLock()
+        until, ok := s.forceIPv6[hostname]
+        s.mu.RUnlock()
+        if !ok {
+                return false
+        }
+        if time.Now().UnixNano() > until {
+                // Expired — clean up
+                s.mu.Lock()
+                delete(s.forceIPv6, hostname)
+                s.mu.Unlock()
+                return false
+        }
+        return true
 }
 
 // resolveAndCache does a fresh DNS resolution and caches the result.
@@ -470,7 +514,16 @@ func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (
                 addrs[i] = net.IPAddr{IP: ip}
         }
 
-        selectedAddr := selectAddr(addrs, s.PreferIPv4, s.PreferIPv6)
+        // v26.11.0.9: if forceIPv6 is set for this hostname, prefer IPv6
+        // regardless of the global PreferIPv4/PreferIPv6 settings.
+        preferV4 := s.PreferIPv4
+        preferV6 := s.PreferIPv6
+        if s.isForceIPv6(hostname) {
+                preferV4 = false
+                preferV6 = true
+        }
+
+        selectedAddr := selectAddr(addrs, preferV4, preferV6)
         ip := net.IPAddress(selectedAddr)
         if ip == nil {
                 return nil, errors.New("sticky: resolved IP is nil for ", hostname)

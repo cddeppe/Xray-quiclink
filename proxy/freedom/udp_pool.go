@@ -112,6 +112,17 @@ type pooledConn struct {
         // pool can bind outbound packets to the originating client. nil
         // for non-QUIC / per-session paths.
         source *stdnet.UDPAddr
+        // v26.11.0.9: stall detection fields for IPv6 fallback.
+        // When a stall is detected, ForceIPv6AfterStall is called on the
+        // resolver with the hostname. The next QUIC connection will prefer IPv6.
+        stallResolver *StickyResolver
+        stallHostname string
+        // lastReplyTime tracks when we last received a reply from Google
+        lastReplyTime atomic.Int64 // UnixNano
+        // lastWriteTime tracks when Chrome last sent us a packet
+        lastWriteTime atomic.Int64 // UnixNano
+        // stallTriggered prevents calling ForceIPv6AfterStall multiple times
+        stallTriggered atomic.Bool
         // v26.10.16-link: scidsDCID stores the SCIDs we've registered
         // in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
         // so Close() can index demux directly without converting from
@@ -624,34 +635,123 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
-                // v26.10.15-link: only mark the socket dead on persistent
-                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
-                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
-                // will retry or the route will come back. Killing the socket
-                // on a transient error would kill all 50+ QUIC sessions
-                // sharing this socket, which is much worse than dropping one
-                // packet.
                 if !isTransientWriteError(err) {
                         c.socket.MarkDead()
                 }
         }
+        // v26.11.0.9: track write time for stall detection
+        c.lastWriteTime.Store(time.Now().UnixNano())
         return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
+        // v26.11.0.9: Stall detection with IPv6 fallback.
+        // If no reply from Google within 5 seconds AND Chrome is actively
+        // sending, call ForceIPv6AfterStall on the sticky resolver. This
+        // deletes the cached IPv4 entry and forces the next resolution to
+        // prefer IPv6. The next QUIC connection will use IPv6, which may
+        // have a different (working) path to Google.
+        const stallTimeout = 5 * time.Second
+
+        // Check if we're stalled RIGHT NOW (before blocking on inbox).
+        if c.isStalled(stallTimeout) {
+                c.triggerIPv6Fallback()
+                return 0, nil, io.EOF
+        }
+
+        // Calculate the remaining time until stall timeout.
+        now := time.Now()
+        lastReplyNano := c.lastReplyTime.Load()
+        lastWriteNano := c.lastWriteTime.Load()
+        lastWrite := time.Unix(0, lastWriteNano)
+
+        // If no write yet, use now as reference
+        if lastWriteNano == 0 {
+                lastWrite = now
+        }
+
+        var refTime time.Time
+        if lastReplyNano > 0 {
+                lastReply := time.Unix(0, lastReplyNano)
+                if lastReply.Before(lastWrite) {
+                        refTime = lastWrite
+                } else {
+                        refTime = lastReply
+                }
+        } else {
+                refTime = lastWrite
+        }
+
+        since := now.Sub(refTime)
+        remaining := stallTimeout - since
+        if remaining < 0 {
+                remaining = 0
+        }
+
+        timer := time.NewTimer(remaining)
+        defer timer.Stop()
+
         select {
         case rr, ok := <-c.inbox:
                 if !ok {
                         return 0, nil, io.EOF
                 }
                 n := copy(p, rr.data)
-                // v26.10.42-link (audit P3): return the pooled buffer
-                // after copying the data out.
                 putPacket(rr.data)
+                c.lastReplyTime.Store(time.Now().UnixNano())
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
+        case <-timer.C:
+                if c.isStalled(stallTimeout) {
+                        c.triggerIPv6Fallback()
+                        return 0, nil, io.EOF
+                }
+                // Chrome is idle — loop and wait again
+                return c.ReadFrom(p)
         }
+}
+
+// triggerIPv6Fallback calls ForceIPv6AfterStall on the sticky resolver
+// if one is set, then logs the event. This is called when a QUIC stall
+// is detected. The next DNS resolution for this hostname will prefer IPv6.
+func (c *pooledConn) triggerIPv6Fallback() {
+        if c.stallTriggered.Swap(true) {
+                return // already triggered for this connection
+        }
+        if c.stallResolver != nil && c.stallHostname != "" {
+                ip := ""
+                if c.socket != nil && c.socket.dest != nil {
+                        ip = c.socket.dest.IP.String()
+                }
+                xrayerrors.LogInfo(context.Background(), "udp_pool: QUIC stall on ", ip, " — forcing IPv6 for ", c.stallHostname)
+                c.stallResolver.ForceIPv6AfterStall(c.stallHostname, 5*time.Minute)
+        } else {
+                xrayerrors.LogInfo(context.Background(), "udp_pool: QUIC stall — no resolver, killing connection")
+        }
+}
+
+// isStalled returns true if Chrome is actively sending (lastWriteTime
+// within 2x stallTimeout) but Google hasn't replied within stallTimeout.
+func (c *pooledConn) isStalled(stallTimeout time.Duration) bool {
+        now := time.Now()
+        lastReplyNano := c.lastReplyTime.Load()
+        lastWriteNano := c.lastWriteTime.Load()
+        lastWrite := time.Unix(0, lastWriteNano)
+
+        // Chrome hasn't sent anything recently — idle, not stalled
+        if lastWriteNano == 0 || now.Sub(lastWrite) > 2*stallTimeout {
+                return false
+        }
+
+        // Chrome is active. Has Google ever replied?
+        if lastReplyNano == 0 {
+                return now.Sub(lastWrite) > stallTimeout
+        }
+
+        // Google replied before but hasn't replied recently
+        lastReply := time.Unix(0, lastReplyNano)
+        return now.Sub(lastReply) > stallTimeout
 }
 
 func (c *pooledConn) IsClosed() bool {
