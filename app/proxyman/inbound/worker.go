@@ -517,19 +517,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 if existingID, found := w.srcIndex[id.srcKey]; found {
                         if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
                                 w.RUnlock()
-                                // v26.11.222: Register this DCID for future lookups.
-                                // Without serverSCIDReader, the server's SCID is never
-                                // registered. So we register it here when we find the
-                                // conn via srcIndex. This way, subsequent packets with
-                                // the same DCID hit the DCID lookup directly.
-                                if dcid2, _, err2 := quic.ParseDCID(b.Bytes()); err2 == nil && len(dcid2) > 0 {
-                                        dk2 := makeDCIDKey(dcid2)
-                                        w.Lock()
-                                        if _, exists := w.dcidIndex[dk2]; !exists {
-                                                w.dcidIndex[dk2] = existingID
-                                        }
-                                        w.Unlock()
-                                }
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
                                 return
