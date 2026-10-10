@@ -926,8 +926,9 @@ func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                         return nil, err
                 }
                 // NPDIAG 1: Google reply received by outbound socket
-                // v26.11.198: Add diagnostic to confirm Google is replying.
-                errors.LogInfo(context.Background(), "NPDIAG: Google reply received n=", n, " from=", d)
+                // v26.11.201: REMOVED per-packet log — was causing the stall.
+                // 3 log lines per packet × 500+ packets/burst = logger mutex
+                // serialized all packet processing, pipe filled up, ACKs dropped.
                 udpAddr := d.(*net.UDPAddr)
                 sourceAddr := net.IPAddress(udpAddr.IP)
                 if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
@@ -1086,11 +1087,9 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                 continue
                         }
                         n, err = w.PacketConnWrapper.WriteTo(b.Bytes(), destAddr)
-                        // NPDIAG 4: Chrome data sent to Google
-                        errors.LogInfo(context.Background(), "NPDIAG: Chrome->Google write n=", n, " dest=", destAddr)
+                        // NPDIAG 4: REMOVED per-packet log (v26.11.201) — was causing stalls
                 } else {
                         n, err = w.PacketConnWrapper.Write(b.Bytes())
-                        errors.LogInfo(context.Background(), "NPDIAG: Chrome->Google write (fixed dest) n=", n)
                 }
                 b.Release()
                 if err != nil {
