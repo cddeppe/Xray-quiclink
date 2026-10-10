@@ -35,38 +35,27 @@ type UDPSocketPool struct {
         // WireGuard policy routing and QUIC traffic leaks outside the
         // tunnel. Set via NewUDPSocketPool from the freedom Handler.Init.
         sockopt *internet.SocketConfig
-        // v26.11.0.4 (from v38): source → client SCID cache.
-        // When Chrome sends a QUIC Initial with SCID=∅, we cache (source → ∅).
-        // When a short header arrives from the same source on a different
-        // socket (DNS rotation), we look up the cached SCID and register it
-        // on the current socket's demux.
-        sourceSCIDCache    map[string][]byte
-        sourceSCIDCacheMu sync.RWMutex
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex
+        mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        // v26.11.0.4 (from v38): back-reference to the owning pool, so WriteTo
-        // can access the pool's sourceSCIDCache via c.socket.pool.
-        pool          *UDPSocketPool
-        lastUsed      atomic.Int64
-        lastReplyTime atomic.Int64
-        demux         map[dcidKey]chan<- readResult
+        // v26.10.43-link (audit P5): atomic timestamps to avoid
+        // mutex contention on the readLoop hot path.
+        lastUsed      atomic.Int64 // UnixNano
+        lastReplyTime atomic.Int64  // UnixNano
+        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
         demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
+        // v26.10.15-link: dropped reply packets counter for observability.
+        // Incremented when the inbox channel (cap 32) is full and the
+        // readLoop drops a reply packet. QUIC will retransmit, but
+        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
-        // v26.11.158: Track all pooledConns so readLoop can check
-        // if a pooledConn is closed before sending to its inbox.
-        conns []*pooledConn
-        // v26.11.0.4 (from v38): shortHeaderCIDLen is the DCID length used by
-        // short-header (1-RTT) packets on this socket. Learned from the client's
-        // Initial SCID length. For Chrome (0-length SCID), this is 0.
-        shortHeaderCIDLen atomic.Int32
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -123,6 +112,16 @@ type pooledConn struct {
         // pool can bind outbound packets to the originating client. nil
         // for non-QUIC / per-session paths.
         source *stdnet.UDPAddr
+        // v26.11.0.5: lastReplyTime tracks when we last received a reply
+        // from Google. Used by ReadFrom's stall detection — if no reply
+        // arrives within stallTimeout, we return EOF to kill the QUIC
+        // connection and let Chrome fall back to TCP.
+        lastReplyTime atomic.Int64 // UnixNano
+        // v26.11.0.5: lastWriteTime tracks when Chrome last sent us a
+        // packet. If Chrome is actively sending but Google isn't replying,
+        // the connection is stalled. If Chrome is idle (paused video),
+        // we don't kill the connection.
+        lastWriteTime atomic.Int64 // UnixNano
         // v26.10.16-link: scidsDCID stores the SCIDs we've registered
         // in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
         // so Close() can index demux directly without converting from
@@ -137,7 +136,6 @@ func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.S
                 idleTimeout:      idle,
                 unusedTimeout:    unused,
                 sockopt:          sockopt,
-                sourceSCIDCache:  make(map[string][]byte), // v26.11.0.4 (from v38)
         }
         p.startReaper()
         return p
@@ -308,7 +306,6 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
-                                pool:          p, // v26.11.0.4 (from v38): back-ref for sourceSCIDCache
                         demux:         make(map[dcidKey]chan<- readResult),
                         demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
@@ -348,10 +345,6 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
-        // v26.11.158: Track this pooledConn so readLoop can check IsClosed
-        sock.mu.Lock()
-        sock.conns = append(sock.conns, conn)
-        sock.mu.Unlock()
         return conn, nil
 }
 
@@ -396,24 +389,7 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                // v26.11.0.4 (from v38): parse DCID. For short headers (1-RTT),
-                // use the socket's learned shortHeaderCIDLen (from the client's
-                // Initial SCID) instead of the global default (8). The server's
-                // short-header DCID = client's SCID, so the length must match.
-                // For Chrome (0-length SCID), this is 0.
-                var dcid []byte
-                if n > 0 && packet[0]&0x80 != 0 {
-                        // Long header — DCID length is encoded in the packet
-                        dcid, _, err = quic.ParseDCID(packet[:n])
-                } else {
-                        // Short header — use the socket's learned CID length
-                        cidLen := int(s.shortHeaderCIDLen.Load())
-                        if cidLen <= 0 {
-                                // Not learned yet (Initial not processed). Fall back to default.
-                                cidLen = quic.DefaultShortHeaderCIDLen
-                        }
-                        dcid, _, err = quic.ParseShortHeaderDCIDWithLen(packet[:n], cidLen)
-                }
+                dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
                         putPacket(packet)
                         continue
@@ -466,13 +442,17 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
-                // v26.11.159: Removed IsClosed check — it acquired RLock and
-                // iterated ALL conns per packet, blocking RegisterCID (which
-                // needs Lock). This delayed CID rotation registration, causing
-                // Google's replies with the new DCID to be dropped.
-                // The non-blocking send already handles dead conns: if the
-                // inbox is full (nobody reading), the packet is dropped (QUIC
-                // retransmits). No lock needed.
+                //
+                // The blocking send (v26.10.20) was WRONG for the shared-socket
+                // model: one slow/stale session's full channel would block the
+                // entire readLoop, starving ALL other sessions sharing the same
+                // socket. This made YouTube stalls WORSE when swiping quickly
+                // between videos (many sessions, one stale session blocks all).
+                //
+                // The correct approach for a shared readLoop:
+                // 1. Large channel (256) so drops are rare during bursts
+                // 2. Non-blocking send so one slow session doesn't starve others
+                // 3. Track drops for observability
                 sentOk := false
                 packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
                 select {
@@ -575,11 +555,12 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-        // v26.11.0.4 (from v38): register 0-length CIDs too. Chrome/Edge send a
-        // 0-length SCID in their QUIC Initial. The server's response uses the
-        // client's SCID as its DCID — which is also 0-length. If we skip
-        // 0-length CIDs, the server's response is never registered in the
-        // demux map, and the readLoop silently drops it.
+        if len(cid) == 0 {
+                return
+        }
+        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
+        // and the demux map. Eliminates hex.EncodeToString per SCID
+        // registration (was 1 string alloc; now zero).
         dk := makeDCIDKey(cid)
 
         // v26.10.15-link: atomic closed check avoids acquiring mu
@@ -627,72 +608,19 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // mutex acquire for 99% of packets in a long-lived QUIC
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
-                if scid, _, err := parseQUICSCID(b); err == nil {
-                        // v26.11.0.4 (from v38): register 0-length SCIDs too.
-                        // Chrome/Edge send a 0-length SCID. The server's reply
-                        // uses the client's SCID as DCID — also 0-length.
+                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
-                        // v26.11.0.4 (from v38): learn the short-header DCID length
-                        // from the client's SCID. The server's short-header DCID =
-                        // client's SCID, so the length must match. For Chrome, this
-                        // is 0. Store atomically for lock-free reads in readLoop.
-                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
-                        // v26.11.0.4 (from v38): cache (source → client SCID) so
-                        // subsequent short-header packets from the same source can
-                        // re-register the SCID on whatever socket they go to (DNS
-                        // rotation may send to a different IP → different socket).
-                        if c.source != nil {
-                                scidCopy := append([]byte(nil), scid...)
-                                pool := c.socket.pool
-                                if pool != nil {
-                                        pool.sourceSCIDCacheMu.Lock()
-                                        pool.sourceSCIDCache[c.source.String()] = scidCopy
-                                        pool.sourceSCIDCacheMu.Unlock()
-                                }
-                        }
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
                 // 0-length SCID clients (Chrome/Edge), RegisterCID(scid)
-                // registers demux[∅], and the DCID registration registers
-                // demux[clientDCID]. The readLoop's SCID-based fallback
-                // routes Initial replies via demux[serverSCID] = demux[clientDCID].
-                if dcid, _, err := quic.ParseDCID(b); err == nil {
+                // is skipped (len==0), so demux has no entry for the
+                // connection and the server's reply (DCID=∅) is silently
+                // dropped. By registering the DCID, the readLoop's
+                // SCID-based fallback can route the reply by looking up
+                // demux[serverSCID] = demux[clientDCID].
+                if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
                         c.RegisterCID(dcid)
-                }
-        } else if len(b) > 0 && b[0]&0x40 != 0 {
-                // v26.11.0.4 (from v38): short header (1-RTT) — register the DCID.
-                // Each UDP packet from the browser triggers a SEPARATE freedom.Process
-                // call, each creating a new pooledConn with its own inbox. The Initial's
-                // pooledConn registers the DCID → demux[dcid] = inbox1. When that
-                // freedom.Process returns, pooledConn1.Close() removes the DCID from
-                // the demux map. Subsequent short-header packets create new pooledConns
-                // but don't re-register → all server replies are demux misses → dropped.
-                // Fix: register the DCID from short headers too. Each new pooledConn
-                // that sends a short header re-registers demux[dcid] → its own inbox.
-                if dcid, _, err := quic.ParseDCID(b); err == nil {
-                        c.RegisterCID(dcid)
-                }
-
-                // v26.11.0.4 (from v38): THE KEY FIX for 0-length SCID demux miss.
-                // The short header's DCID is B' (server's SCID), NOT A (client's SCID).
-                // The server replies with DCID = A. So registering B' is useless —
-                // the server never replies with B'.
-                //
-                // For Chrome (0-length SCID): A = ∅. The server's 1-RTT replies have
-                // DCID = ∅. We need demux[∅] = this inbox. The sourceSCIDCache stores
-                // (source → A = ∅) when the Initial was processed. Look it up and
-                // register demux[∅] on THIS socket's demux.
-                if c.source != nil {
-                        pool := c.socket.pool
-                        if pool != nil {
-                                pool.sourceSCIDCacheMu.RLock()
-                                cachedA, ok := pool.sourceSCIDCache[c.source.String()]
-                                pool.sourceSCIDCacheMu.RUnlock()
-                                if ok {
-                                        c.RegisterCID(cachedA)
-                                }
-                        }
                 }
         }
 
@@ -717,10 +645,60 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.MarkDead()
                 }
         }
+        // v26.11.0.5: track write time for stall detection.
+        // This tells ReadFrom that Chrome is actively sending.
+        c.lastWriteTime.Store(time.Now().UnixNano())
         return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
+        // v26.11.0.5: Stall detection — if no reply from Google within
+        // stallTimeout AND Chrome is actively sending (lastWriteTime is
+        // recent), return EOF to kill the QUIC connection. This forces
+        // Chrome to fall back to TCP immediately instead of waiting for
+        // its own 30-second QUIC timeout.
+        //
+        // Why this works:
+        // - Chrome sends QUIC over UDP to xray (via DNS hijack)
+        // - Xray proxies to Google via pool
+        // - If Google's replies are lost (demux miss, socket issues),
+        //   Chrome waits ~30s then falls back to TCP — video stalls
+        // - With this fix: xray detects the stall after 3s and closes
+        //   the connection. Chrome detects QUIC failure immediately and
+        //   falls back to TCP in ~1s. Video plays.
+        // - When Chrome tries QUIC again (new video), xray handles it
+        //   normally — QUIC gets another chance.
+        const stallTimeout = 3 * time.Second
+
+        // Check if we're stalled RIGHT NOW (before blocking on inbox).
+        // This catches the case where we've been blocked for a while.
+        if c.isStalled(stallTimeout) {
+                xrayerrors.LogInfo(context.Background(), "udp_pool: QUIC stall detected — killing connection to force TCP fallback")
+                return 0, nil, io.EOF
+        }
+
+        // Calculate the remaining time until stall timeout.
+        // Use the lesser of lastReplyTime and lastWriteTime as the reference.
+        now := time.Now()
+        lastReply := time.Unix(0, c.lastReplyTime.Load())
+        lastWrite := time.Unix(0, c.lastWriteTime.Load())
+
+        // If we've never received a reply, use the write time as reference
+        refTime := lastReply
+        if lastReply.Before(lastWrite) {
+                refTime = lastWrite
+        }
+
+        // Time since we last heard from Google
+        since := now.Sub(refTime)
+        remaining := stallTimeout - since
+        if remaining < 0 {
+                remaining = 0
+        }
+
+        timer := time.NewTimer(remaining)
+        defer timer.Stop()
+
         select {
         case rr, ok := <-c.inbox:
                 if !ok {
@@ -730,10 +708,48 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
                 // v26.10.42-link (audit P3): return the pooled buffer
                 // after copying the data out.
                 putPacket(rr.data)
+                // v26.11.0.5: update last reply time
+                c.lastReplyTime.Store(time.Now().UnixNano())
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
+        case <-timer.C:
+                // v26.11.0.5: stall timeout — no reply from Google.
+                // Check if Chrome is still actively sending. If Chrome
+                // stopped sending (idle/paused), don't kill the connection.
+                if c.isStalled(stallTimeout) {
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: QUIC stall timeout — killing connection to force TCP fallback")
+                        return 0, nil, io.EOF
+                }
+                // Chrome is idle (not sending) — loop and wait again
+                return c.ReadFrom(p)
         }
+}
+
+// isStalled returns true if Chrome is actively sending (lastWriteTime
+// within 2x stallTimeout) but Google hasn't replied within stallTimeout.
+// If Chrome is idle (no recent writes), returns false — the connection
+// is just idle, not stalled.
+func (c *pooledConn) isStalled(stallTimeout time.Duration) bool {
+        now := time.Now()
+        lastReply := time.Unix(0, c.lastReplyTime.Load())
+        lastWrite := time.Unix(0, c.lastWriteTime.Load())
+
+        // Has Chrome sent us anything recently? (within 2x stall timeout)
+        // If not, Chrome is idle — connection is not stalled, just idle.
+        if now.Sub(lastWrite) > 2*stallTimeout {
+                return false
+        }
+
+        // Chrome is active. Has Google replied recently?
+        // If lastReply is zero (never received a reply) and we've been
+        // waiting for stallTimeout since the last write, we're stalled.
+        if lastReply.IsZero() {
+                return now.Sub(lastWrite) > stallTimeout
+        }
+
+        // Google replied before but hasn't replied recently
+        return now.Sub(lastReply) > stallTimeout
 }
 
 func (c *pooledConn) IsClosed() bool {
@@ -741,17 +757,19 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
+        // v26.10.15-link: atomic CAS to avoid double-close. The
+        // CAS ensures only one caller proceeds to close(c.done)
+        // and the scids cleanup.
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
-        // v26.11.160: RESTORE demux cleanup. The original code only deleted
-        // entries where existing == c.inbox (this pooledConn's own entries).
-        // It did NOT delete other connections' entries. This is safe and
-        // necessary — without it, stale entries accumulate and the readLoop
-        // wastes time sending to dead inboxes.
         c.mu.Lock()
+        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
+        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
+        // delete here — Go's race detector flags it, and production can panic
+        // with "concurrent map read and map write".
         c.socket.mu.Lock()
         for dk := range c.scidsDCID {
                 if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
