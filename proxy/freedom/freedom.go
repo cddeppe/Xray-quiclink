@@ -831,9 +831,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.203: Reverted BufferedPacketReader — it didn't fix the stall.
-                        // buf.Copy read/write coupling is NOT the root cause.
-                        // Reverted to match v166 behavior (which worked for 5+ min videos).
+                        // v26.11.205: Re-enable BufferedPacketReader. This is what
+                        // makes the POOL work better — the pool has a dedicated
+                        // readLoop that always drains the socket, even when the
+                        // pipe to Chrome is blocked. Without this, buf.Copy
+                        // couples read+write: when the pipe write blocks, the
+                        // socket read stalls, the kernel UDP buffer overflows,
+                        // and Google's replies are dropped at the kernel level.
+                        //
+                        // The readLoop uses non-blocking send (drops when inbox
+                        // is full) so it NEVER blocks. The socket is always
+                        // drained. This matches the pool's architecture.
+                        reader = NewBufferedPacketReader(reader)
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
