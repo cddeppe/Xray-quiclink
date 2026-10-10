@@ -254,6 +254,11 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
+        // v26.11.200: Diagnostic — confirm data reaches Chrome.
+        // This is the FINAL step in the response path: Google → VPS → Chrome.
+        // If we see this log but the video still stalls, the issue is between
+        // Chrome and the video player (not in our proxy).
+        errors.LogInfo(context.Background(), "NPDIAG: VPS->Chrome write n=", len(buf), " src=", *c.src)
         // v26.11.144: Re-add SplitCoalesced (from v26.11.55).
         // Packets > 1250 bytes are split into separate UDP datagrams.
         // This allows coalesced QUIC packets (Initial+Handshake) to be
