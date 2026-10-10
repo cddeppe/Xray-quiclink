@@ -616,7 +616,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        // v26.11.252 (Option 3): per-connection sockets.
+                                        // Capture the inbound client source IP:port BEFORE
+                                        // Acquire so the pool can key the socket by
+                                        // (dest, source). Each Chrome QUIC connection gets
+                                        // its own outbound socket — no demux ambiguity.
+                                        var clientSource *stdnet.UDPAddr
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                clientSource = &stdnet.UDPAddr{
+                                                        IP:   inbound.Source.Address.IP(),
+                                                        Port: int(inbound.Source.Port),
+                                                }
+                                        }
+                                        pooledConn, err = h.socketPool.Acquire(udpRemote, clientSource)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
@@ -626,19 +638,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
-                                        // v26.11.52-link (Solution B): bind the pooled socket's
-                                        // source to the inbound client's source IP:port so that
-                                        // pool reply packets (read via wildcard listen) are
-                                        // demuxed back to the originating client. Without this,
-                                        // all QUIC sessions sharing a pooled socket collapse to
-                                        // the socket's local (kernel-chosen) source and the
-                                        // 4-tuple-based reply routing breaks under NAT.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                pooledConn.source = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
-                                                }
-                                        }
+                                        // v26.11.252: source is now set inside Acquire from
+                                        // the clientSource parameter. The pooledConn.source
+                                        // field is still used by RegisterCID for demuxSource
+                                        // (NotifyServerSCID routing).
                                         defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).

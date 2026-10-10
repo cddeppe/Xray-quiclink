@@ -42,6 +42,16 @@ type pooledSocket struct {
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
+        // v26.11.252 (Option 3): per-connection sockets. When the pool key includes
+        // the client source IP:port (see destKey), each socket has exactly one
+        // pooledConn. defaultInbox is that conn's inbox, used as a fallback when
+        // DCID-based demux misses — which happens for every 1-RTT reply from
+        // Google when Chrome uses 0-length SCID (the DCID in Google's reply =
+        // Chrome's rotated SCID, which is inside encrypted 1-RTT packets and
+        // cannot be parsed). Without this fallback, 100% of post-handshake
+        // replies are dropped and Chrome falls back to TCP after ~500ms.
+        // Only set when source != nil (per-conn socket). nil for shared sockets.
+        defaultInbox   chan<- readResult
         // v26.10.43-link (audit P5): atomic timestamps to avoid
         // mutex contention on the readLoop hot path.
         lastUsed      atomic.Int64 // UnixNano
@@ -52,9 +62,6 @@ type pooledSocket struct {
         closeOnce     sync.Once
         dead          bool
         // v26.10.15-link: dropped reply packets counter for observability.
-        // Incremented when the inbox channel (cap 32) is full and the
-        // readLoop drops a reply packet. QUIC will retransmit, but
-        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
 }
 
@@ -224,7 +231,10 @@ func (p *UDPSocketPool) evictStale() {
 func (p *UDPSocketPool) InvalidateByIP(ip string) {
         p.mu.Lock()
         for key, sock := range p.sockets {
-                if strings.HasPrefix(key, ip+":") || strings.HasPrefix(key, "["+ip+"]:") {
+                // v26.11.252 (Option 3): pool key may now be "source|dest" or
+                // just "dest". Use keyDestPart to extract the dest portion.
+                destPart := keyDestPart(key)
+                if strings.HasPrefix(destPart, ip+":") || strings.HasPrefix(destPart, "["+ip+"]:") {
                         // v26.10.42-link (audit C1): use MarkStale instead of
                         // manually setting dead=true. Prevents the FD+goroutine
                         // leak when refCount reaches 0 after invalidation.
@@ -236,12 +246,35 @@ func (p *UDPSocketPool) InvalidateByIP(ip string) {
         p.mu.Unlock()
 }
 
-func destKey(dest *stdnet.UDPAddr) string {
+// destKey returns the pool map key for a given (dest, source) pair.
+// v26.11.252 (Option 3): when source is non-nil (QUIC traffic from a known
+// inbound client), the key includes the client source IP:port so each Chrome
+// QUIC connection gets its own outbound socket. This eliminates the demux
+// ambiguity that occurs when multiple 0-length-SCID connections share one
+// socket (Google's replies have empty DCID → demux can't route them).
+// When source is nil (non-QUIC or unknown source), falls back to dest-only
+// key (shared socket, DCID-based demux).
+func destKey(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) string {
+        if source != nil {
+                return source.String() + "|" + dest.String()
+        }
         return dest.String()
 }
 
-func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
-        key := destKey(dest)
+// keyDestPart extracts the destination IP:port portion from a pool key.
+// The key format is either "source|dest" (per-conn socket) or "dest"
+// (shared socket). The dest part is always after the last '|'.
+// v26.11.252 (Option 3): needed because InvalidateByIP must match on the
+// dest IP, not the source IP.
+func keyDestPart(key string) string {
+        if idx := strings.LastIndex(key, "|"); idx >= 0 {
+                return key[idx+1:]
+        }
+        return key
+}
+
+func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) (*pooledConn, error) {
+        key := destKey(dest, source)
 
         p.mu.Lock()
         sock, ok := p.sockets[key]
@@ -334,6 +367,17 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
+                source:    source, // v26.11.252: set source from inbound client
+        }
+        // v26.11.252 (Option 3): for per-connection sockets (source != nil),
+        // set defaultInbox so readLoop can route DCID-miss replies (1-RTT
+        // short headers from Google to Chrome's rotated SCID) to this one
+        // and only inbox. Without this, 100% of post-handshake replies are
+        // dropped for 0-length-SCID clients (Chrome/Edge).
+        if source != nil {
+                sock.mu.Lock()
+                sock.defaultInbox = inbox
+                sock.mu.Unlock()
         }
         return conn, nil
 }
@@ -423,6 +467,28 @@ func (s *pooledSocket) readLoop() {
                                         ch, ok = s.demux[scidKey]
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
+                                }
+                        }
+                        if !ok {
+                                // v26.11.252 (Option 3): per-connection socket fallback.
+                                // For per-conn sockets (source was set at Acquire time),
+                                // defaultInbox points to the one and only pooledConn's
+                                // inbox. This catches ALL replies that DCID+SCID demux
+                                // can't route — specifically 1-RTT short-header replies
+                                // from Google to Chrome's rotated SCID (which is inside
+                                // encrypted 1-RTT packets and cannot be parsed). Without
+                                // this, 100% of post-handshake replies are dropped for
+                                // 0-length-SCID clients (Chrome/Edge), causing TCP fallback.
+                                s.mu.RLock()
+                                di := s.defaultInbox
+                                s.mu.RUnlock()
+                                if di != nil {
+                                        ch = di
+                                        ok = true
+                                        // src is unknown for the defaultInbox path — skip
+                                        // NotifyServerSCID for this packet. This only affects
+                                        // 1-RTT packets (short headers), where NotifyServerSCID
+                                        // is irrelevant anyway (it only fires for Initial).
                                 }
                         }
                         if !ok {
@@ -678,6 +744,12 @@ func (c *pooledConn) Close() error {
                         delete(c.socket.demux, dk)
                         delete(c.socket.demuxSource, dk)
                 }
+        }
+        // v26.11.252 (Option 3): clear defaultInbox if it points to this conn.
+        // Prevents readLoop from sending to a dead inbox (buffer fills, drops).
+        // The next Acquire for this (dest, source) key will set it again.
+        if c.socket.defaultInbox == c.inbox {
+                c.socket.defaultInbox = nil
         }
         c.socket.mu.Unlock()
         c.mu.Unlock()

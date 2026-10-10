@@ -41,7 +41,7 @@ func Test_SCIDFallback_Chrome0LengthSCID(t *testing.T) {
 	}
 	defer serverConn.Close()
 
-	pconn, err := pool.Acquire(serverAddr)
+	pconn, err := pool.Acquire(serverAddr, nil)
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
@@ -162,14 +162,14 @@ func Test_SCIDFallback_ParallelChromeConnections(t *testing.T) {
 	browserSrc1 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 50001}
 	browserSrc2 := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 50002}
 
-	pconn1, err := pool.Acquire(serverAddr)
+	pconn1, err := pool.Acquire(serverAddr, nil)
 	if err != nil {
 		t.Fatalf("Acquire1 failed: %v", err)
 	}
 	defer pconn1.Close()
 	pconn1.source = browserSrc1
 
-	pconn2, err := pool.Acquire(serverAddr)
+	pconn2, err := pool.Acquire(serverAddr, nil)
 	if err != nil {
 		t.Fatalf("Acquire2 failed: %v", err)
 	}

@@ -60,7 +60,7 @@ func Test_DelayedClose_ReplyAfterClose(t *testing.T) {
         defer serverConn.Close()
         serverAddr = serverConn.LocalAddr().(*net.UDPAddr)
 
-        pconn, err := pool.Acquire(serverAddr)
+        pconn, err := pool.Acquire(serverAddr, nil)
         if err != nil {
                 t.Fatalf("Acquire: %v", err)
         }
@@ -147,7 +147,7 @@ func Test_DelayedClose_ActualCloseAfter5s(t *testing.T) {
         pool := NewUDPSocketPool(30*time.Second, 600*time.Second, 300*time.Second, nil)
 
         serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-        pconn, err := pool.Acquire(serverAddr)
+        pconn, err := pool.Acquire(serverAddr, nil)
         if err != nil {
                 t.Fatalf("Acquire: %v", err)
         }
@@ -209,7 +209,7 @@ func Test_DelayedClose_ParallelConnections(t *testing.T) {
         var conns [5]*pooledConn
         var dcids [5][]byte
         for i := 0; i < 5; i++ {
-                pconn, err := pool.Acquire(serverAddr)
+                pconn, err := pool.Acquire(serverAddr, nil)
                 if err != nil {
                         t.Fatalf("Acquire %d: %v", i, err)
                 }
@@ -277,7 +277,7 @@ func Test_DelayedClose_WriteAfterClose(t *testing.T) {
         pool := NewUDPSocketPool(30*time.Second, 600*time.Second, 300*time.Second, nil)
 
         serverAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-        pconn, err := pool.Acquire(serverAddr)
+        pconn, err := pool.Acquire(serverAddr, nil)
         if err != nil {
                 t.Fatalf("Acquire: %v", err)
         }
@@ -330,7 +330,7 @@ func Test_DelayedClose_StressNoLeak(t *testing.T) {
         for i := 0; i < N; i++ {
                 go func(idx int) {
                         defer wg.Done()
-                        pconn, err := pool.Acquire(serverAddr)
+                        pconn, err := pool.Acquire(serverAddr, nil)
                         if err != nil {
                                 t.Errorf("Acquire %d: %v", idx, err)
                                 return
@@ -375,7 +375,7 @@ func Test_DelayedClose_SCIDFallback(t *testing.T) {
         defer serverConn.Close()
         serverAddr = serverConn.LocalAddr().(*net.UDPAddr)
 
-        pconn, err := pool.Acquire(serverAddr)
+        pconn, err := pool.Acquire(serverAddr, nil)
         if err != nil {
                 t.Fatalf("Acquire: %v", err)
         }
