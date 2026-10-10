@@ -3,7 +3,6 @@ package freedom
 import (
         "context"
         "errors"
-        "fmt"
         "io"
         stdnet "net"
         "strconv"
@@ -39,16 +38,19 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex // for refCount and dead flag only
+        mu            sync.RWMutex
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        lastUsed      atomic.Int64 // UnixNano
-        lastReplyTime atomic.Int64  // UnixNano
-        // v26.11.234: Lock-free demux via sync.Map. Eliminates writer
-        // starvation when readLoop (Load) and RegisterCID (Store) contend.
-        demuxLF       sync.Map // dcidKey -> chan<- readResult
-        demuxSrcLF    sync.Map // dcidKey -> *stdnet.UDPAddr
+        lastUsed      atomic.Int64
+        lastReplyTime atomic.Int64
+        demuxLF       sync.Map
+        demuxSrcLF    sync.Map
+        // v26.11.236: When refCount==1, route ALL replies to this single inbox.
+        // No demux needed — one connection per socket means CID parsing is
+        // unnecessary and error-prone (0-length SCIDs, server SCID never
+        // registered, etc).
+        singleInbox   chan<- readResult
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -323,13 +325,24 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 p.mu.Unlock()
         }
 
-        inbox := make(chan readResult, 256) // v26.10.20-link: was 32, increased to 256 to absorb YouTube reply bursts
+        inbox := make(chan readResult, 256)
         conn := &pooledConn{
                 socket:    sock,
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
+        // v26.11.236: Set singleInbox for fast-path routing.
+        // When refCount==1, readLoop routes ALL replies to this inbox
+        // without DCID parsing — fixes 0-length SCID and unregistered
+        // server SCID issues.
+        sock.mu.Lock()
+        if sock.refCount == 1 {
+                sock.singleInbox = inbox
+        } else {
+                sock.singleInbox = nil // multiple conns, use demux
+        }
+        sock.mu.Unlock()
         return conn, nil
 }
 
@@ -374,14 +387,27 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
+                // v26.11.236: Fast path — if there's a single inbox, route
+                // ALL replies to it without parsing DCID. This is the fix
+                // for 0-length SCID and unregistered server SCID issues.
+                if inbox := s.singleInbox; inbox != nil {
+                        nowNano := time.Now().UnixNano()
+                        s.lastUsed.Store(nowNano)
+                        s.lastReplyTime.Store(nowNano)
+                        select {
+                        case inbox <- readResult{data: packet[:n], addr: addr}:
+                        default:
+                                s.droppedReplies.Add(1)
+                                putPacket(packet)
+                        }
+                        continue
+                }
+
                 dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
                         putPacket(packet)
                         continue
                 }
-                // v26.10.16-link: zero-alloc dcidKey struct instead of
-                // hex.EncodeToString(dcid) which allocated a 16-char string
-                // per reply packet.
                 dk := makeDCIDKey(dcid)
 
                 // v26.11.234: Lock-free demux lookup via sync.Map
@@ -412,13 +438,6 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if ch == nil {
-                                // v26.11.235: Log demux misses for diagnosis
-                                isLong := n > 0 && packet[0]&0x80 != 0
-                                xrayerrors.LogWarning(context.Background(), "POOL MISS: from=", addr, " n=", n, " long=", isLong, " dcid=", fmt.Sprintf("%x", dcid), " demuxSize=", func() int {
-                                        count := 0
-                                        s.demuxLF.Range(func(_, _ interface{}) bool { count++; return true })
-                                        return count
-                                }())
                                 putPacket(packet)
                                 continue
                         }
@@ -640,15 +659,16 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
-        // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
         c.mu.Lock()
+        // v26.11.236: Clear singleInbox if it points to us
+        if c.socket.singleInbox == c.inbox {
+                c.socket.singleInbox = nil
+        }
         // v26.11.234: Lock-free Delete from sync.Map
         for dk := range c.scidsDCID {
                 if v, ok := c.socket.demuxLF.Load(dk); ok && v == c.inbox {
