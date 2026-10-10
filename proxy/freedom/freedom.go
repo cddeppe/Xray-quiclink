@@ -234,10 +234,7 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 // behind EnableSocketPool. Without this, multiple freedom
                 // outbounds (e.g. direct + wg) fight over the global — last
                 // Init wins, silently overriding the others.
-                // v26.11.221: Allow session_idle_timeout to be set without
-                // requiring enableSocketPool. This lets users tune how long
-                // stale UDP connections live before clean() removes them.
-                if config.UdpConfig.GetSessionIdleTimeout() > 0 {
+                if config.UdpConfig.EnableSocketPool {
                         udptimeout.SetSessionIdleSeconds(int64(config.UdpConfig.GetSessionIdleTimeout()))
                 }
 
@@ -592,10 +589,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // to the warm pool instead of closing. The warm pool will close the
         // conn when it expires (default 5s) or when a new inbound reuses it.
         // For non-warm-pool paths, close normally.
-        // v26.11.218: For UDP, do NOT close the outbound conn when Process
-        // returns. The worker's clean() handles cleanup after idle timeout.
-        // Closing here kills the QUIC connection during rapid connection churn
-        // (fast swiping), causing a ~30 second stall until connections expire.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
         } else {
@@ -647,19 +640,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 }
                                         }
                                         defer pooledConn.Close()
-                                        // v26.11.227: Set up registerPoolCID callback so
-                                        // OnServerSCID can register the server's SCID in
-                                        // the pool's demux. Without this, 1-RTT short
-                                        // headers with DCID=server_SCID are dropped.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                                type poolCIDRegistrar interface {
-                                                        SetRegisterPoolCID(func([]byte))
-                                                }
-                                                if reg, ok := inbound.Conn.(poolCIDRegistrar); ok {
-                                                        pc := pooledConn
-                                                        reg.SetRegisterPoolCID(pc.RegisterCID)
-                                                }
-                                        }
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
@@ -766,10 +746,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         reader = NewPooledPacketReader(pooledConn)
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
-                        // v26.11.225: No serverSCIDReader — it causes stalls even
-                        // with lock-free registration. The lock-free dcidConnLF
-                        // still gets DCIDs from: initial DCID, srcIndex fallback,
-                        // and tryQUICMigration CID rotation.
+                        // v26.11.117: Wrap reader to detect server SCID from
+                        // long-header replies. When Google's Initial reply
+                        // arrives, extract the SCID and register it in the
+                        // worker's dcidIndex via RegisterServerSCID.
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
+                                        var scidRegistered bool
+                                        baseReader := reader
+                                        reader = &serverSCIDReader{
+                                                base:       baseReader,
+                                                register:   reg.RegisterServerSCID,
+                                                registered: &scidRegistered,
+                                        }
+                                }
+                        }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         return errors.New("failed to process response").Base(err)

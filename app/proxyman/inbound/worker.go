@@ -187,17 +187,11 @@ type udpConn struct {
         inactive         bool
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
-        srcMu            sync.RWMutex     // v26.11.226: per-conn lock for src reads
         dcid             []byte           // QUIC DCID, nil for non-QUIC
         // v26.11.117: Callback to register server SCID when seen in reply.
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
-        // v26.11.227: Callback to register server SCID in the pool's demux.
-        // Set by freedom.Process when pool is ON. Without this, the pool's
-        // readLoop drops 1-RTT short headers because the server's SCID was
-        // never registered in the pool's demux map.
-        registerPoolCID func([]byte)
 }
 
 func (c *udpConn) setInactive() {
@@ -249,11 +243,6 @@ func (c *udpConn) Write(buf []byte) (int, error) {
                 c.updateActivity()
         }
         return n, err
-}
-
-// v26.11.227: SetRegisterPoolCID sets the callback for pool demux registration
-func (c *udpConn) SetRegisterPoolCID(f func([]byte)) {
-        c.registerPoolCID = f
 }
 
 func (c *udpConn) Close() error {
@@ -380,11 +369,6 @@ type udpWorker struct {
         activeConn map[connID]*udpConn
         dcidIndex  map[dcidKey]connID // v26.10.16-link: struct key, zero-alloc
         srcIndex   map[srcKey]connID  // v26.10.16-link: struct key, zero-alloc
-        // v26.11.224: Lock-free DCID → *udpConn map. Used by the callback's
-        // short-header fast path and by serverSCIDReader's register callback.
-        // This eliminates ALL lock contention on the DCID lookup/registration
-        // path — no w.RLock() for lookups, no w.Lock() for registration.
-        dcidConnLF sync.Map // dcidKey -> *udpConn
 
         ctx  context.Context
         cone bool
@@ -431,12 +415,20 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 src:      &srcCopy,
         }
         conn.output = func(b []byte) (int, error) {
-                // v26.11.226: Use per-conn srcMu instead of worker's w.RLock().
-                // The worker's RLock blocks ALL connections' response writes when
-                // tryQUICMigration/getConnection takes w.Lock() for ANY connection.
-                conn.srcMu.RLock()
+                // Snapshot src under w.Lock() so we race-free against
+                // tryQUICMigration()'s `*conn.src = id.src` reassignment. The
+                // outbound hub.WriteTo call is performed outside the lock so
+                // a slow network write does not block the inbound worker's
+                // packet-processing loop.
+                //
+                // v26.10.34-link (M10 fix): use RLock instead of Lock. The
+                // closure only READS *conn.src; the writer (*oldConn.src =
+                // id.src in tryQUICMigration) already uses w.Lock(). RLock
+                // allows multiple outbound packets to snapshot concurrently
+                // instead of serializing against every inbound packet.
+                w.RLock()
                 srcCopy := *conn.src
-                conn.srcMu.RUnlock()
+                w.RUnlock()
                 return w.hub.WriteTo(b, srcCopy)
         }
         w.activeConn[id] = conn
@@ -505,17 +497,19 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // one conn for this source (safe for single-connection cases like h3
         // test sites).
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                // v26.11.224: Lock-free DCID lookup via sync.Map
+                // Try DCID lookup first
                 if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
                         dk := makeDCIDKey(dcid)
-                        if existingConn, found := w.dcidConnLF.Load(dk); found {
-                                conn := existingConn.(*udpConn)
-                                if !conn.done.Done() {
-                                        conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                        conn.updateActivity()
+                        w.RLock()
+                        if existingID, found := w.dcidIndex[dk]; found {
+                                if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                        w.RUnlock()
+                                        existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                                        existingConn.updateActivity()
                                         return
                                 }
                         }
+                        w.RUnlock()
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
@@ -523,10 +517,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 if existingID, found := w.srcIndex[id.srcKey]; found {
                         if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
                                 w.RUnlock()
-                                // v26.11.224: Register this DCID lock-free for future lookups
-                                if dcid2, _, err2 := quic.ParseDCID(b.Bytes()); err2 == nil && len(dcid2) > 0 {
-                                        w.dcidConnLF.Store(makeDCIDKey(dcid2), existingConn)
-                                }
                                 existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                 existingConn.updateActivity()
                                 return
@@ -561,17 +551,23 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         if !existing {
                 w.recordDCID(b.Bytes(), id, conn)
                 w.recordSrc(id, conn)
-                // v26.11.224: Register the initial DCID in the lock-free map too
-                if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
-                        w.dcidConnLF.Store(makeDCIDKey(dcid), conn)
-                }
-                // v26.11.224: Server SCID registration — LOCK-FREE via sync.Map
+                // v26.11.117: Set up server SCID registration callback.
+                // When freedom.Process sees a long-header reply from Google,
+                // it extracts the server's SCID and calls this callback.
+                // The callback registers the SCID in dcidIndex so subsequent
+                // 1-RTT short headers (which carry DCID=server_SCID) can be
+                // routed to the correct conn.
+                connIDCopy := id
                 conn.registerServerCID = func(serverSCID []byte) {
                         if len(serverSCID) == 0 {
                                 return
                         }
-                        // No w.Lock() — this is on the response hot path
-                        w.dcidConnLF.Store(makeDCIDKey(serverSCID), conn)
+                        dk := makeDCIDKey(serverSCID)
+                        w.Lock()
+                        if _, exists := w.dcidIndex[dk]; !exists {
+                                w.dcidIndex[dk] = connIDCopy
+                        }
+                        w.Unlock()
                 }
         }
 
@@ -708,12 +704,8 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                         newDk := makeDCIDKey(newDcid)
                                         if _, exists := w.dcidIndex[newDk]; !exists {
                                                 w.dcidIndex[newDk] = oldID
-                                                // v26.11.224: Also register lock-free
-                                                w.dcidConnLF.Store(newDk, oldConn)
-                                                // v26.11.227: Also register in pool's demux
-                                                if oldConn.registerPoolCID != nil {
-                                                        oldConn.registerPoolCID(newDcid)
-                                                }
+                                                // Don't overwrite conn.dcid —
+                                                // keep the original for cleanup.
                                         }
                                 }
                         }
@@ -758,9 +750,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                 if dcidConn, dcidOk := w.activeConn[dcidID]; dcidOk && !dcidConn.done.Done() && dcidID == oldID2 {
                                         // Genuine CID rotation: DCID belongs to
                                         // the same src's existing conn. Update.
-                                        oldConn2.srcMu.Lock()
                                         *oldConn2.src = id.src
-                                        oldConn2.srcMu.Unlock()
                                         oldConn2.updateActivity()
                                         // v26.10.42-link (audit H1 from 2-b): delete the OLD dcidIndex
                                         // entry to prevent orphan accumulation. The old DCID is no
@@ -830,9 +820,7 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         // since src was unknown, but defensive)
                 }
                 oldSK := oldID.srcKey
-                oldConn.srcMu.Lock()
                 *oldConn.src = id.src
-                oldConn.srcMu.Unlock()
                 oldConn.updateActivity()
                 // v26.10.43-link (audit H4 from 2-b): update remote
                 // so RemoteAddr() returns the post-migration source.
@@ -937,12 +925,6 @@ func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) 
         dk := makeDCIDKey(serverSCID)
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = existingID
-                // v26.11.227: Also register lock-free
-                w.dcidConnLF.Store(dk, existingConn)
-        }
-        // v26.11.227: Register in pool's demux too
-        if existingConn.registerPoolCID != nil {
-                existingConn.registerPoolCID(serverSCID)
         }
 }
 
