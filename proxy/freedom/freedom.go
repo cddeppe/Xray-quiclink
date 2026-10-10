@@ -34,7 +34,6 @@ import (
         "github.com/xtls/xray-core/proxy/freedom/udptimeout"
         "github.com/xtls/xray-core/transport"
         "github.com/xtls/xray-core/transport/internet"
-        "github.com/xtls/xray-core/transport/internet/finalmask"
         "github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -832,21 +831,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.202: Re-enable BufferedPacketReader with NON-BLOCKING
-                        // drop. This decouples the socket read from the pipe write.
-                        // Without this, buf.Copy serializes read+write: when the
-                        // write to the downlink pipe blocks, the next socket read
-                        // doesn't happen, Google's replies pile up in the kernel
-                        // UDP buffer, overflow, and get dropped. Google sees no
-                        // ACKs and kills the connection after ~1-2 seconds.
-                        //
-                        // v195's mistake: the readLoop blocked on channel send
-                        // when the inbox was full — same problem as buf.Copy.
-                        // v202 fix: non-blocking send with drop. The readLoop
-                        // NEVER blocks — always reads from the socket immediately.
-                        // When the consumer can't keep up, packets are dropped
-                        // (QUIC retransmission handles this gracefully).
-                        reader = NewBufferedPacketReader(reader)
+                        // v26.11.203: Reverted BufferedPacketReader — it didn't fix the stall.
+                        // buf.Copy read/write coupling is NOT the root cause.
+                        // Reverted to match v166 behavior (which worked for 5+ min videos).
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
@@ -893,27 +880,9 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
                 }
         }
-        // v26.11.194: Also check for finalmask.PacketConnWrapper
-        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
-                isOverridden := false
-                if UDPOverride.Address != nil || UDPOverride.Port != 0 {
-                        isOverridden = true
-                }
-                // Wrap in internet.PacketConnWrapper so existing PacketReader works
-                wrapper := &internet.PacketConnWrapper{
-                        PacketConn: c.PacketConn,
-                        Dest:       c.RemoteAddr(),
-                }
-                return &PacketReader{
-                        PacketConnWrapper: wrapper,
-                        Counter:           counter,
-                        Handler:           h,
-                        DefaultRule:       defaultRule,
-                        IsOverridden:      isOverridden,
-                        InitUnchangedAddr: DialDest.Address,
-                        InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
-                }
-        }
+        // v26.11.203: Reverted finalmask.PacketConnWrapper detection (v194).
+        // Pre-v194, finalmask.PacketConnWrapper fell through to buf.PacketReader
+        // (the simple reader that calls readOneUDP). v166 used this path.
         return &buf.PacketReader{Reader: conn}
 }
 
@@ -995,32 +964,11 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         OutGateway:        outGateway,
                 }
         }
-        // v26.11.194: Also check for finalmask.PacketConnWrapper — the finalmask
-        // transport layer wraps UDP connections in its own PacketConnWrapper type.
-        // Without this check, the non-pool UDP path falls back to SequentialWriter,
-        // which doesn't handle UDP source address routing correctly.
-        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
-                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (finalmask.PacketConnWrapper)")
-                // Extract the underlying net.PacketConn and wrap it in an internet.PacketConnWrapper
-                // so the existing PacketReader/PacketWriter code works unchanged.
-                wrapper := &internet.PacketConnWrapper{
-                        PacketConn: c.PacketConn,
-                        Dest:       c.RemoteAddr(),
-                }
-                resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
-                if DialDest.Address.Family().IsDomain() {
-                        resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
-                }
-                return &PacketWriter{
-                        PacketConnWrapper: wrapper,
-                        Counter:           counter,
-                        Handler:           h,
-                        DefaultRule:       defaultRule,
-                        UDPOverride:       UDPOverride,
-                        ResolvedUDPAddr:   resolvedUDPAddr,
-                        OutGateway:        outGateway,
-                }
-        }
+        // v26.11.203: Reverted finalmask.PacketConnWrapper detection (v194).
+        // Pre-v194, finalmask.PacketConnWrapper fell through to SequentialWriter.
+        // v166 (which worked for 5+ min videos) used SequentialWriter for this type.
+        // The v194 change to use PacketReader/PacketWriter may have introduced a subtle
+        // bug in the non-pool path. Reverting to SequentialWriter to match v166.
         errors.LogWarning(context.Background(), "NPDIAG: SequentialWriter fallback! conn type=", fmt.Sprintf("%T", iConn))
         return &buf.SequentialWriter{Writer: conn}
 }
