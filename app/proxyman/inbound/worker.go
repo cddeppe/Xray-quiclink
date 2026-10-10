@@ -193,6 +193,11 @@ type udpConn struct {
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
         registerServerCID func([]byte)
+        // v26.11.227: Callback to register server SCID in the pool's demux.
+        // Set by freedom.Process when pool is ON. Without this, the pool's
+        // readLoop drops 1-RTT short headers because the server's SCID was
+        // never registered in the pool's demux map.
+        registerPoolCID func([]byte)
 }
 
 func (c *udpConn) setInactive() {
@@ -244,6 +249,11 @@ func (c *udpConn) Write(buf []byte) (int, error) {
                 c.updateActivity()
         }
         return n, err
+}
+
+// v26.11.227: SetRegisterPoolCID sets the callback for pool demux registration
+func (c *udpConn) SetRegisterPoolCID(f func([]byte)) {
+        c.registerPoolCID = f
 }
 
 func (c *udpConn) Close() error {
@@ -925,6 +935,12 @@ func (w *udpWorker) OnServerSCID(serverSCID []byte, browserSrc *stdnet.UDPAddr) 
         dk := makeDCIDKey(serverSCID)
         if _, exists := w.dcidIndex[dk]; !exists {
                 w.dcidIndex[dk] = existingID
+                // v26.11.227: Also register lock-free
+                w.dcidConnLF.Store(dk, existingConn)
+        }
+        // v26.11.227: Register in pool's demux too
+        if existingConn.registerPoolCID != nil {
+                existingConn.registerPoolCID(serverSCID)
         }
 }
 
