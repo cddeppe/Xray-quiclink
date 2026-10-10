@@ -589,11 +589,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // to the warm pool instead of closing. The warm pool will close the
         // conn when it expires (default 5s) or when a new inbound reuses it.
         // For non-warm-pool paths, close normally.
+        // v26.11.218: For UDP, do NOT close the outbound conn when Process
+        // returns. The worker's clean() handles cleanup after idle timeout.
+        // Closing here kills the QUIC connection during rapid connection churn
+        // (fast swiping), causing a ~30 second stall until connections expire.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else {
+        } else if destination.Network == net.Network_TCP {
                 defer conn.Close()
         }
+        // For UDP: no defer conn.Close() — worker manages lifecycle
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
         // For UDP pool: peek at the first packet to determine if it's QUIC.
