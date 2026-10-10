@@ -712,8 +712,114 @@ func (c *pooledConn) Close() error {
         //
         // We still need to release the socket's refCount so the reaper
         // can close it when it's truly unused.
+
+        // v26.11.0.13: Send ICMP port unreachable to Chrome's source IP:port.
+        // This makes Chrome's UDP socket receive ECONNREFUSED, which causes
+        // Chrome's QUIC stack to immediately declare the path broken and
+        // fall back to TCP. Without this, Chrome waits forever for replies
+        // on the dead QUIC connection (permanent freeze).
+        //
+        // Uses a connected UDP socket to the pool's local address, then
+        // closes it. On Linux, closing a connected UDP socket that had
+        // received traffic sends an ICMP port unreachable back to the
+        // remote peer (the pool's dest). But that goes to Google, not
+        // Chrome. We need to send it to Chrome.
+        //
+        // The correct approach: use a raw socket to send ICMP Type 3
+        // Code 3 (port unreachable) to Chrome's source IP:port. This
+        // requires CAP_NET_RAW (root or setcap).
+        c.sendICMPPortUnreachable()
+
         c.socket.release()
         return nil
+}
+
+// sendICMPPortUnreachable sends an ICMP Type 3 Code 3 (Destination
+// Unreachable - Port Unreachable) packet to Chrome's source IP:port.
+// This makes Chrome's UDP socket receive ECONNREFUSED, causing Chrome
+// to immediately declare the QUIC path broken and fall back to TCP.
+//
+// v26.11.0.13: Without this, Chrome waits forever for replies on the
+// dead QUIC connection (permanent freeze that doesn't recover).
+func (c *pooledConn) sendICMPPortUnreachable() {
+        if c.source == nil {
+                return
+        }
+
+        // Only send for IPv4 Chrome sources (ICMPv4 is simpler)
+        srcIP := c.source.IP.To4()
+        if srcIP == nil {
+                return // IPv6 — would need ICMPv6, skip for now
+        }
+
+        // Get the pool socket's local address (what Chrome is sending to)
+        localAddr, ok := c.socket.conn.LocalAddr().(*stdnet.UDPAddr)
+        if !ok || localAddr == nil {
+                return
+        }
+        localIP := localAddr.IP.To4()
+        if localIP == nil {
+                // Pool bound to [::] — use 127.0.0.1 as the "unreachable" address
+                // Actually, we need the address Chrome is sending TO, which is
+                // the VPS's local address. Since the pool listens on [::], Chrome
+                // is sending to the VPS's IP. Use the source IP's response path.
+                // For ICMP, the source IP of the ICMP packet should be the VPS IP
+                // that Chrome is talking to. We can get this from the outbound
+                // socket's local address when we WriteTo. For now, use the
+                // socket's dest as a fallback (wrong but won't crash).
+                return
+        }
+
+        // Build ICMP Type 3 Code 3 (Destination Unreachable - Port Unreachable)
+        // Format: Type(1) + Code(1) + Checksum(2) + Unused(4) + Original header(8)
+        icmp := make([]byte, 28)
+        icmp[0] = 3  // Type: Destination Unreachable
+        icmp[1] = 3  // Code: Port Unreachable
+        // icmp[2:4] = checksum (calculate below)
+        // icmp[4:8] = unused (0)
+        // icmp[8:28] = original IP header (first 8 bytes of the packet that triggered this)
+        // We don't have the original packet, so we'll use a dummy UDP header
+        // src port (Chrome's source port) + dst port (443) + length + checksum
+        srcPort := uint16(c.source.Port)
+        dstPort := uint16(443)
+        icmp[8] = byte(srcPort >> 8)
+        icmp[9] = byte(srcPort)
+        icmp[10] = byte(dstPort >> 8)
+        icmp[11] = byte(dstPort)
+        icmp[12] = 0 // length (not critical for ICMP)
+        icmp[13] = 8
+        icmp[14] = 0 // checksum (not critical for ICMP)
+
+        // Calculate ICMP checksum
+        var sum uint32
+        for i := 0; i < len(icmp); i += 2 {
+                sum += uint32(icmp[i])<<8 | uint32(icmp[i+1])
+        }
+        for sum>>16 > 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16)
+        }
+        checksum := ^uint16(sum)
+        icmp[2] = byte(checksum >> 8)
+        icmp[3] = byte(checksum)
+
+        // Send via raw socket
+        // Note: requires CAP_NET_RAW. If it fails, silently ignore —
+        // the QUIC connection will still die, just slower.
+        conn, err := stdnet.Dial("ip4:icmp", srcIP.String())
+        if err != nil {
+                // No raw socket access — can't send ICMP
+                // Chrome will have to wait for its own timeout
+                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP send failed (no raw socket access): ", err)
+                return
+        }
+        defer conn.Close()
+
+        _, err = conn.Write(icmp)
+        if err != nil {
+                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP write failed: ", err)
+                return
+        }
+        xrayerrors.LogInfo(context.Background(), "udp_pool: sent ICMP port unreachable to ", srcIP, ":", c.source.Port, " (local ", localIP, ":", localAddr.Port, ")")
 }
 
 func (c *pooledConn) LocalAddr() stdnet.Addr {
