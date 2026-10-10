@@ -38,20 +38,23 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex
+        mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        lastUsed      atomic.Int64
-        lastReplyTime atomic.Int64
-        demux         map[dcidKey]chan<- readResult
+        // v26.10.43-link (audit P5): atomic timestamps to avoid
+        // mutex contention on the readLoop hot path.
+        lastUsed      atomic.Int64 // UnixNano
+        lastReplyTime atomic.Int64  // UnixNano
+        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
         demuxSource   map[dcidKey]*stdnet.UDPAddr
-        // v26.11.248: Fallback inbox — when demux misses, send to this
-        // inbox. Set to the most recently acquired conn's inbox.
-        fallbackInbox chan<- readResult
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
+        // v26.10.15-link: dropped reply packets counter for observability.
+        // Incremented when the inbox channel (cap 32) is full and the
+        // readLoop drops a reply packet. QUIC will retransmit, but
+        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
 }
 
@@ -325,15 +328,13 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 p.mu.Unlock()
         }
 
-        inbox := make(chan readResult, 256)
+        inbox := make(chan readResult, 256) // v26.10.20-link: was 32, increased to 256 to absorb YouTube reply bursts
         conn := &pooledConn{
                 socket:    sock,
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
-        // v26.11.248: Set as fallback inbox for demux misses
-        sock.fallbackInbox = inbox
         return conn, nil
 }
 
@@ -408,13 +409,7 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // FIX: SCID-based fallback for 0-length SCID clients
-                        // (Chrome/Edge). The server's reply DCID = client's SCID
-                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
-                        // 0-length). But per RFC 9000 §7.3, the server's reply
-                        // SCID = client's Initial DCID, which WAS registered in
-                        // WriteTo. Parse the SCID and try demux[scid] as a
-                        // fallback before dropping.
+                        // SCID-based fallback for long headers
                         if n > 0 && packet[0]&0x80 != 0 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
@@ -424,14 +419,16 @@ func (s *pooledSocket) readLoop() {
                                         s.mu.RUnlock()
                                 }
                         }
+                        // v26.11.250: Empty-key fallback for short headers.
+                        // 1-RTT packets from Google have DCID=∅ (Chrome's
+                        // 0-length SCID). ParseDCID extracts 8 garbage bytes
+                        // because it assumes 8-byte DCID. Try the empty key.
                         if !ok {
-                                // v26.11.248: Demux miss — use fallback inbox
-                                // instead of dropping. This fixes 0-length SCID
-                                // and unregistered server SCID issues.
-                                if fb := s.fallbackInbox; fb != nil {
-                                        ch = fb
-                                        ok = true
-                                }
+                                emptyKey := dcidKey{}
+                                s.mu.RLock()
+                                ch, ok = s.demux[emptyKey]
+                                src = s.demuxSource[emptyKey]
+                                s.mu.RUnlock()
                         }
                         if !ok {
                                 putPacket(packet)
@@ -553,12 +550,9 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-        if len(cid) == 0 {
-                return
-        }
-        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
-        // and the demux map. Eliminates hex.EncodeToString per SCID
-        // registration (was 1 string alloc; now zero).
+        // v26.11.250: Allow 0-length CID registration. Chrome uses 0-length
+        // SCID, so Google's replies have DCID=∅ (empty). Without registering
+        // the empty key, 100% of Google's replies miss the demux.
         dk := makeDCIDKey(cid)
 
         // v26.10.15-link: atomic closed check avoids acquiring mu
@@ -606,7 +600,9 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // mutex acquire for 99% of packets in a long-lived QUIC
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
-                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
+                // v26.11.250: Register SCID even if 0-length. Chrome uses
+                // 0-length SCID, so Google's replies have DCID=∅ (empty).
+                if scid, _, err := parseQUICSCID(b); err == nil {
                         c.RegisterCID(scid)
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
