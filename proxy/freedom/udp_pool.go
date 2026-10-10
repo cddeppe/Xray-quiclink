@@ -752,23 +752,14 @@ func (c *pooledConn) sendICMPPortUnreachable() {
                 return // IPv6 — would need ICMPv6, skip for now
         }
 
-        // Get the pool socket's local address (what Chrome is sending to)
+        // v26.11.0.15: Get the pool socket's local port (what Chrome is sending to).
+        // The local IP is [::] (wildcard) — we don't need it. The kernel fills in
+        // the correct source IP when sending the ICMP packet via the raw socket.
         localAddr, ok := c.socket.conn.LocalAddr().(*stdnet.UDPAddr)
         if !ok || localAddr == nil {
                 return
         }
-        localIP := localAddr.IP.To4()
-        if localIP == nil {
-                // Pool bound to [::] — use 127.0.0.1 as the "unreachable" address
-                // Actually, we need the address Chrome is sending TO, which is
-                // the VPS's local address. Since the pool listens on [::], Chrome
-                // is sending to the VPS's IP. Use the source IP's response path.
-                // For ICMP, the source IP of the ICMP packet should be the VPS IP
-                // that Chrome is talking to. We can get this from the outbound
-                // socket's local address when we WriteTo. For now, use the
-                // socket's dest as a fallback (wrong but won't crash).
-                return
-        }
+        localPort := localAddr.Port
 
         // Build ICMP Type 3 Code 3 (Destination Unreachable - Port Unreachable)
         // Format: Type(1) + Code(1) + Checksum(2) + Unused(4) + Original header(8)
@@ -819,7 +810,7 @@ func (c *pooledConn) sendICMPPortUnreachable() {
                 xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP write failed: ", err)
                 return
         }
-        xrayerrors.LogInfo(context.Background(), "udp_pool: sent ICMP port unreachable to ", srcIP, ":", c.source.Port, " (local ", localIP, ":", localAddr.Port, ")")
+        xrayerrors.LogInfo(context.Background(), "udp_pool: sent ICMP port unreachable to ", srcIP, ":", c.source.Port, " (local :", localPort, ")")
 }
 
 func (c *pooledConn) LocalAddr() stdnet.Addr {
