@@ -187,6 +187,7 @@ type udpConn struct {
         inactive         bool
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
+        srcMu            sync.RWMutex     // v26.11.226: per-conn lock for src reads
         dcid             []byte           // QUIC DCID, nil for non-QUIC
         // v26.11.117: Callback to register server SCID when seen in reply.
         // Set by freedom.Process when pool is OFF, so the per-session reader
@@ -420,20 +421,12 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 src:      &srcCopy,
         }
         conn.output = func(b []byte) (int, error) {
-                // Snapshot src under w.Lock() so we race-free against
-                // tryQUICMigration()'s `*conn.src = id.src` reassignment. The
-                // outbound hub.WriteTo call is performed outside the lock so
-                // a slow network write does not block the inbound worker's
-                // packet-processing loop.
-                //
-                // v26.10.34-link (M10 fix): use RLock instead of Lock. The
-                // closure only READS *conn.src; the writer (*oldConn.src =
-                // id.src in tryQUICMigration) already uses w.Lock(). RLock
-                // allows multiple outbound packets to snapshot concurrently
-                // instead of serializing against every inbound packet.
-                w.RLock()
+                // v26.11.226: Use per-conn srcMu instead of worker's w.RLock().
+                // The worker's RLock blocks ALL connections' response writes when
+                // tryQUICMigration/getConnection takes w.Lock() for ANY connection.
+                conn.srcMu.RLock()
                 srcCopy := *conn.src
-                w.RUnlock()
+                conn.srcMu.RUnlock()
                 return w.hub.WriteTo(b, srcCopy)
         }
         w.activeConn[id] = conn
@@ -753,7 +746,9 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                                 if dcidConn, dcidOk := w.activeConn[dcidID]; dcidOk && !dcidConn.done.Done() && dcidID == oldID2 {
                                         // Genuine CID rotation: DCID belongs to
                                         // the same src's existing conn. Update.
+                                        oldConn2.srcMu.Lock()
                                         *oldConn2.src = id.src
+                                        oldConn2.srcMu.Unlock()
                                         oldConn2.updateActivity()
                                         // v26.10.42-link (audit H1 from 2-b): delete the OLD dcidIndex
                                         // entry to prevent orphan accumulation. The old DCID is no
@@ -823,7 +818,9 @@ func (w *udpWorker) tryQUICMigration(packet []byte, id connID) *udpConn {
                         // since src was unknown, but defensive)
                 }
                 oldSK := oldID.srcKey
+                oldConn.srcMu.Lock()
                 *oldConn.src = id.src
+                oldConn.srcMu.Unlock()
                 oldConn.updateActivity()
                 // v26.10.43-link (audit H4 from 2-b): update remote
                 // so RemoteAddr() returns the post-migration source.
