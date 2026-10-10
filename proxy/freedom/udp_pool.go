@@ -61,6 +61,15 @@ type pooledSocket struct {
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
+        // v26.11.253: perConn=true means this socket is for a single QUIC
+        // connection (keyed by source|dest). These sockets are NOT reusable —
+        // Chrome picks a new ephemeral source port for each QUIC connection.
+        // When refCount reaches 0, release() must close the socket immediately
+        // to prevent FD/goroutine exhaustion. Without this, each finished QUIC
+        // connection leaks a socket + readLoop goroutine for up to 300s
+        // (unusedTimeout). At 10 connections/sec, that's 3000 leaked sockets
+        // → FD exhaustion → Acquire fails → TCP fallback.
+        perConn bool
         // v26.10.15-link: dropped reply packets counter for observability.
         droppedReplies atomic.Int64
 }
@@ -334,6 +343,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr, source *stdnet.UDPAddr) (*
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
+                                perConn:       source != nil, // v26.11.253: per-conn sockets are closed immediately on release
                 }
 
                 p.mu.Lock()
@@ -601,7 +611,14 @@ func (s *pooledSocket) release() {
         // removed from the pool map (staleness or InvalidateByIP),
         // close it now. The socket is not in the map so no new
         // sessions will find it — safe to close.
-        if s.refCount == 0 && s.dead {
+        // v26.11.253: per-connection sockets (perConn=true) are NOT reusable.
+        // Chrome picks a new ephemeral source port for each QUIC connection,
+        // so this socket will never be acquired again. Close it immediately
+        // when refCount reaches 0 to prevent FD/goroutine exhaustion.
+        // Without this, each finished QUIC connection leaks a socket + readLoop
+        // goroutine for up to 300s (unusedTimeout). At ~10 conns/sec, that's
+        // 3000 leaked sockets → FD exhaustion → Acquire fails → TCP fallback.
+        if s.refCount == 0 && (s.dead || s.perConn) {
                 s.closeOnce.Do(func() {
                         close(s.closed)
                         _ = s.conn.Close()
