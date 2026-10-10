@@ -34,6 +34,7 @@ import (
         "github.com/xtls/xray-core/proxy/freedom/udptimeout"
         "github.com/xtls/xray-core/transport"
         "github.com/xtls/xray-core/transport/internet"
+        "github.com/xtls/xray-core/transport/internet/finalmask"
         "github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -530,6 +531,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // v26.11.196: For UDP, check if the udpConn already has a persistent
+                // outbound conn from a previous Process call. If so, reuse it.
+                if destination.Network != net.Network_TCP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                type outboundConnHolder interface {
+                                        GetOutboundConn() stdnet.Conn
+                                }
+                                if holder, ok := inbound.Conn.(outboundConnHolder); ok {
+                                        if existingConn := holder.GetOutboundConn(); existingConn != nil {
+                                                conn = existingConn
+                                                return nil
+                                        }
+                                }
+                        }
+                }
+
                 rawConn, err := dialer.Dial(ctx, destination)
                 // v26.11.132: warmAcquired conns are now liveness-checked in
                 // Acquire (getsockopt SO_ERROR), so a dead warm conn is
@@ -568,6 +585,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 // v26.10.44-link: only set conn from rawConn if we actually dialed
                 if !warmAcquired {
                         conn = rawConn
+                }
+                // v26.11.196: Store the outbound conn in udpConn for reuse on
+                // subsequent Process calls.
+                if destination.Network != net.Network_TCP {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                type outboundConnSetter interface {
+                                        SetOutboundConn(stdnet.Conn)
+                                }
+                                if setter, ok := inbound.Conn.(outboundConnSetter); ok {
+                                        setter.SetOutboundConn(conn)
+                                }
+                        }
                 }
                 return nil
         })
@@ -846,12 +875,26 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
                 }
         }
-        // v26.11.212: Reverted finalmask.PacketConnWrapper detection (v194).
-        // v194 broke QUIC entirely — Chrome falls back to TCP.
-        // Pre-v194, finalmask.PacketConnWrapper fell through to buf.PacketReader
-        // (simple reader) and SequentialWriter (simple writer). These work.
-        // The v194 PacketReader/PacketWriter may have a subtle bug.
-        // Going back to the simpler path that at least lets Chrome try QUIC.
+        // v26.11.194: Detect finalmask.PacketConnWrapper
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                isOverridden := false
+                if UDPOverride.Address != nil || UDPOverride.Port != 0 {
+                        isOverridden = true
+                }
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                return &PacketReader{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        IsOverridden:      isOverridden,
+                        InitUnchangedAddr: DialDest.Address,
+                        InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
+                }
+        }
         return &buf.PacketReader{Reader: conn}
 }
 
@@ -933,7 +976,27 @@ func NewPacketWriter(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
                         OutGateway:        outGateway,
                 }
         }
-        // v26.11.212: Reverted finalmask.PacketConnWrapper detection (v194).
+        // v26.11.194: Detect finalmask.PacketConnWrapper
+        if c, ok := iConn.(*finalmask.PacketConnWrapper); ok {
+                errors.LogWarning(context.Background(), "NPDIAG: PacketWriter created (finalmask.PacketConnWrapper)")
+                wrapper := &internet.PacketConnWrapper{
+                        PacketConn: c.PacketConn,
+                        Dest:       c.RemoteAddr(),
+                }
+                resolvedUDPAddr := utils.NewTypedSyncMap[string, net.Address]()
+                if DialDest.Address.Family().IsDomain() {
+                        resolvedUDPAddr.Store(DialDest.Address.Domain(), net.DestinationFromAddr(conn.RemoteAddr()).Address)
+                }
+                return &PacketWriter{
+                        PacketConnWrapper: wrapper,
+                        Counter:           counter,
+                        Handler:           h,
+                        DefaultRule:       defaultRule,
+                        UDPOverride:       UDPOverride,
+                        ResolvedUDPAddr:   resolvedUDPAddr,
+                        OutGateway:        outGateway,
+                }
+        }
         errors.LogWarning(context.Background(), "NPDIAG: SequentialWriter fallback! conn type=", fmt.Sprintf("%T", iConn))
         return &buf.SequentialWriter{Writer: conn}
 }

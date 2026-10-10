@@ -188,6 +188,12 @@ type udpConn struct {
         cancel           context.CancelFunc
         src              *net.Destination // pointer for migration
         dcid             []byte           // QUIC DCID, nil for non-QUIC
+        // v26.11.196: Persistent outbound conn (to Google). Survives Process
+        // restarts so the source port stays stable.
+        outboundConn net.Conn
+        outboundMu   sync.Mutex
+        // v26.11.196: Track whether the Process goroutine is running.
+        processRunning atomic.Bool
         // v26.11.117: Callback to register server SCID when seen in reply.
         // Set by freedom.Process when pool is OFF, so the per-session reader
         // can learn the server's SCID and register it in dcidIndex.
@@ -287,12 +293,34 @@ func (c *udpConn) Write(buf []byte) (int, error) {
         return total, nil
 }
 
+// v26.11.196: GetOutboundConn returns the persistent outbound conn (to Google).
+func (c *udpConn) GetOutboundConn() net.Conn {
+        c.outboundMu.Lock()
+        defer c.outboundMu.Unlock()
+        return c.outboundConn
+}
+
+// SetOutboundConn stores the persistent outbound conn. Called by freedom.Process
+// on first dial. Subsequent Process calls will reuse this conn.
+func (c *udpConn) SetOutboundConn(conn net.Conn) {
+        c.outboundMu.Lock()
+        defer c.outboundMu.Unlock()
+        c.outboundConn = conn
+}
+
 func (c *udpConn) Close() error {
         if c.cancel != nil {
                 c.cancel()
         }
         common.Must(c.done.Close())
         common.Must(common.Close(c.writer))
+        // v26.11.196: Close the persistent outbound conn too
+        c.outboundMu.Lock()
+        if c.outboundConn != nil {
+                c.outboundConn.Close()
+                c.outboundConn = nil
+        }
+        c.outboundMu.Unlock()
         return nil
 }
 
@@ -426,14 +454,8 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 return conn, true
         }
 
-        // v26.11.211: Increase pipe from 256KB to 2MB and KEEP DiscardOverflow.
-        // The 256KB pipe (~213 packets) overflows during YouTube bursts (500+ packets).
-        // When it overflows, Chrome's ACKs are silently dropped via DiscardOverflow.
-        // QUIC interprets this as network loss and reduces sending rate → stall.
-        // 2MB (~1700 packets) absorbs the largest YouTube bursts.
-        // DiscardOverflow is kept because removing it (v26.10.24) froze the
-        // callback loop when the outbound stalled. With 2MB, overflow is rare.
-        pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(2*1024*1024))
+        // 256KB pipe with DiscardOverflow
+        pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(256*1024))
         srcCopy := id.src
         conn := &udpConn{
                 reader: pReader,
@@ -612,54 +634,49 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 common.Must(w.checker.Start())
         }
 
-        // v26.11.210: Reverted to original Process goroutine (pre-v196).
-        // No processRunning flag, no persistent socket. Process runs once,
-        // then conn is closed and removed.
-        go func() {
-                ctx, cancel := context.WithCancel(w.ctx)
-                conn.cancel = cancel
-                sid := session.NewID()
-                ctx = c.ContextWithID(ctx, sid)
+        // v26.11.196: Start (or restart) the Process goroutine.
+        if !conn.processRunning.Swap(true) {
+                go func() {
+                        defer conn.processRunning.Store(false)
+                        ctx, cancel := context.WithCancel(w.ctx)
+                        conn.cancel = cancel
+                        sid := session.NewID()
+                        ctx = c.ContextWithID(ctx, sid)
 
-                outbounds := []*session.Outbound{{}}
-                if originalDest.IsValid() {
-                        outbounds[0].Target = originalDest
-                } else {
-                        // v26.11.118: When originalDest is invalid (no TPROXY),
-                        // the outbound Target defaults to Network_TCP (Go zero value).
-                        // This causes the dispatcher to route UDP QUIC traffic as TCP.
-                        // Fix: set a UDP destination so the dispatcher knows this is UDP.
-                        outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
-                }
-                ctx = session.ContextWithOutbounds(ctx, outbounds)
-                local := net.DestinationFromAddr(w.hub.Addr())
-                if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
-                        if source.Address.Family().IsIPv4() {
-                                local.Address = net.AnyIP
-                        } else if source.Address.Family().IsIPv6() {
-                                local.Address = net.AnyIPv6
+                        outbounds := []*session.Outbound{{}}
+                        if originalDest.IsValid() {
+                                outbounds[0].Target = originalDest
+                        } else {
+                                outbounds[0].Target = net.UDPDestination(net.AnyIP, 0)
                         }
-                }
+                        ctx = session.ContextWithOutbounds(ctx, outbounds)
+                        local := net.DestinationFromAddr(w.hub.Addr())
+                        if local.Address == net.AnyIP || local.Address == net.AnyIPv6 {
+                                if source.Address.Family().IsIPv4() {
+                                        local.Address = net.AnyIP
+                                } else if source.Address.Family().IsIPv6() {
+                                        local.Address = net.AnyIPv6
+                                }
+                        }
 
-                ctx = session.ContextWithInbound(ctx, &session.Inbound{
-                        Source:  source,
-                        Local:   local, // Due to some limitations, in UDP connections, localIP is always equal to listen interface IP
-                        Gateway: net.UDPDestination(w.address, w.port),
-                        Tag:     w.tag,
-                        Conn:    conn, // v26.11.117: expose udpConn so freedom can call RegisterServerSCID
-                })
-                content := new(session.Content)
-                content.SniffingRequest = w.sniffingRequest
-                ctx = session.ContextWithContent(ctx, content)
-                if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
-                        errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
-                }
-                conn.Close()
-                if !conn.inactive {
-                        conn.setInactive()
-                        w.removeConn(id)
-                }
-        }()
+                        ctx = session.ContextWithInbound(ctx, &session.Inbound{
+                                Source:  source,
+                                Local:   local,
+                                Gateway: net.UDPDestination(w.address, w.port),
+                                Tag:     w.tag,
+                                Conn:    conn,
+                        })
+                        content := new(session.Content)
+                        content.SniffingRequest = w.sniffingRequest
+                        ctx = session.ContextWithContent(ctx, content)
+                        if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
+                                errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
+                        }
+                        // v26.11.196: Do NOT close conn or removeConn when Process returns.
+                        // The outbound socket (stored in conn.outboundConn) must survive.
+                        // clean() will retire the conn after idle timeout.
+                }()
+        }
 }
 
 func (w *udpWorker) removeConn(id connID) {
