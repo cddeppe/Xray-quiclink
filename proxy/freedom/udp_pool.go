@@ -1059,7 +1059,7 @@ type BufferedPacketReader struct {
 func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
         r := &BufferedPacketReader{
                 base:   base,
-                buffer: make(chan buf.MultiBuffer, 256),
+                buffer: make(chan buf.MultiBuffer, 1024), // v26.11.236: was 256, increased to reduce backpressure
                 done:   make(chan struct{}),
         }
         go r.readLoop()
@@ -1092,12 +1092,13 @@ func (r *BufferedPacketReader) readLoop() {
                         buf.ReleaseMulti(mb)
                         return
                 default:
-                        // Buffer full — drop oldest to make room
-                        select {
-                        case old := <-r.buffer:
-                                buf.ReleaseMulti(old)
-                        default:
-                        }
+                        // v26.11.236: DON'T drop oldest — BLOCK instead.
+                        // Dropping old packets causes Chrome to see packet loss
+                        // → declares path degraded → connection breaks after
+                        // ~52 requests. Blocking is better: the readLoop waits
+                        // for the buffer to drain, which naturally applies
+                        // backpressure. If the inbox fills up because of this,
+                        // the readLoop drops at the inbox level (which IS logged).
                         select {
                         case r.buffer <- mb:
                         case <-r.done:
