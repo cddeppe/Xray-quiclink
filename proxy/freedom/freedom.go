@@ -597,10 +597,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
-                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
-                // Store the outbound conn in udpConn for reuse across Process
-                // restarts. Keeps source port stable → no Google path validation.
+        } else if destination.Network != net.Network_TCP {
+                // v26.11.226: Persist UDP conn across Process restarts for ALL UDP paths
+                // (not just non-pool). For pool path (YouTube), conn is unused for data
+                // (pconn is) — persisted harmlessly. For 0-length SCID (h3), pconn is
+                // nil so conn IS used for data — persisting it keeps the source port
+                // stable so server replies aren't lost on Process restart.
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -608,6 +610,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }); ok {
                                 existingConn := udpConn.GetOutboundConn()
                                 if existingConn != nil {
+                                        conn.Close()
                                         conn = existingConn
                                         errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
                                 } else {
@@ -672,6 +675,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
+                                        // v26.11.226: Skip pool for 0-length SCID (Chrome h3).
+                                        // These connections CANNOT be demuxed on the shared pool
+                                        // socket because all server replies have DCID=∅ (0 bytes).
+                                        // Use the per-session path instead — each connection gets
+                                        // its own socket with its own source port. No demux needed.
+                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
+                                        if scidErr == nil && len(scid) == 0 {
+                                                // 0-length SCID: skip pool, use per-session path
+                                        } else {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -749,6 +761,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 }
                                         }
                                 }
+                        }
+                        // v26.11.226: close else block for 0-length SCID skip
                         }
                         // If not QUIC, pconn stays nil — existing per-session path is used.
                 }
@@ -882,6 +896,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 registered: &scidRegistered,
                                         }
                                 }
+                        }
+                        // v26.11.226: Set 30s read deadline so Process can return
+                        // after inactivity. The persisted conn (SetOutboundConn)
+                        // is reused when the next packet arrives. Without this,
+                        // conn.ReadFrom() blocks forever → Process gets stuck.
+                        if udpConn, ok := conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+                                _ = udpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
                         }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {

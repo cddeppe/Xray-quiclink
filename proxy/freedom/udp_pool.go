@@ -501,12 +501,6 @@ func (s *pooledSocket) readLoop() {
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
-                                        // v26.11.225: Learn shortHeaderCIDLen from the SERVER's
-                                        // Initial reply SCID. This is the correct value for parsing
-                                        // 1-RTT short header DCIDs (which = server's SCID).
-                                        // For Chrome (0-length client SCID), this fixes the bug where
-                                        // shortHeaderCIDLen was 0 → 1-RTT replies dropped.
-                                        s.shortHeaderCIDLen.Store(int32(len(scid)))
                                         scidCopy := append([]byte(nil), scid...)
                                         quic.NotifyServerSCID(scidCopy, src)
                                 }
@@ -646,20 +640,14 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil {
-                        // v26.11.225: Don't set shortHeaderCIDLen from the CLIENT's SCID.
-                        // For Chrome (0-length SCID), this would store 0, but the SERVER's
-                        // 1-RTT replies have DCID = server's SCID (typically 8 bytes).
-                        // With shortHeaderCIDLen=0, the readLoop reads 0 bytes → DCID=∅
-                        // → demux miss → packets DROPPED → ~1/3 of requests fail.
-                        // Instead, shortHeaderCIDLen is learned from the SERVER's Initial
-                        // reply in the readLoop (see below).
+                        // v26.11.217: Don't register 0-length SCIDs in demux —
+                        // they collide across connections. Instead, set lastActiveInbox
+                        // so the readLoop can route DCID=∅ replies to the most recently
+                        // active connection.
                         if len(scid) > 0 {
                                 c.RegisterCID(scid)
-                                // Only set shortHeaderCIDLen for non-zero SCIDs.
-                                // For 0-length SCID (Chrome), leave it at the default (8)
-                                // until the server's reply teaches us the actual length.
-                                c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         }
+                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         // v26.11.217: Update lastActiveInbox on every WriteTo call
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
