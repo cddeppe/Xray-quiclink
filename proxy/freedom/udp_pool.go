@@ -54,6 +54,9 @@ type pooledSocket struct {
         // v26.11.158: Track all pooledConns so readLoop can check
         // if a pooledConn is closed before sending to its inbox.
         conns []*pooledConn
+        // v26.11.216: shortHeaderCIDLen learned from the first connection's
+        // Initial SCID length. For Chrome (0-length SCID), this is 0.
+        shortHeaderCIDLen atomic.Int32
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -369,7 +372,23 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                dcid, _, err := quic.ParseDCID(packet[:n])
+                // v26.11.216: Use shortHeaderCIDLen for short headers instead
+                // of the default 8. Chrome uses 0-length SCID, so the server's
+                // 1-RTT replies have DCID=∅ (0 bytes). ParseDCID defaults to 8,
+                // reading garbage. With shortHeaderCIDLen=0, we read 0 bytes
+                // → demux[∅] → matches the 0-length SCID registration.
+                var dcid []byte
+                if n > 0 && packet[0]&0x80 != 0 {
+                        // Long header — DCID length is in the packet
+                        dcid, _, err = quic.ParseDCID(packet[:n])
+                } else {
+                        // Short header — use learned CID length
+                        cidLen := int(s.shortHeaderCIDLen.Load())
+                        if cidLen <= 0 {
+                                cidLen = quic.DefaultShortHeaderCIDLen
+                        }
+                        dcid, _, err = quic.ParseShortHeaderDCIDWithLen(packet[:n], cidLen)
+                }
                 if err != nil {
                         putPacket(packet)
                         continue
@@ -610,9 +629,9 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil {
                         // v26.11.216: Register 0-length SCIDs too (Chrome/Edge).
-                        // This creates demux[∅] = inbox, which routes the server's
-                        // reply (DCID=∅ = client's SCID) to the correct connection.
                         c.RegisterCID(scid)
+                        // Learn shortHeaderCIDLen from the client's SCID length
+                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
