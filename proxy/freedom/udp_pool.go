@@ -57,6 +57,11 @@ type pooledSocket struct {
         // v26.11.216: shortHeaderCIDLen learned from the first connection's
         // Initial SCID length. For Chrome (0-length SCID), this is 0.
         shortHeaderCIDLen atomic.Int32
+        // v26.11.217: lastActiveInbox is the inbox of the connection that
+        // most recently sent a packet via WriteTo. When a reply arrives with
+        // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
+        // of using demux[∅] (which would collide across connections).
+        lastActiveInbox chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -426,13 +431,23 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // FIX: SCID-based fallback for 0-length SCID clients
-                        // (Chrome/Edge). The server's reply DCID = client's SCID
-                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
-                        // 0-length). But per RFC 9000 §7.3, the server's reply
-                        // SCID = client's Initial DCID, which WAS registered in
-                        // WriteTo. Parse the SCID and try demux[scid] as a
-                        // fallback before dropping.
+                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
+                        // instead of demux[∅]. This avoids collisions when multiple
+                        // connections share the pool socket (all Chrome connections
+                        // have 0-length SCID → all replies have DCID=∅).
+                        if len(dcid) == 0 {
+                                s.mu.RLock()
+                                li := s.lastActiveInbox
+                                s.mu.RUnlock()
+                                if li != nil {
+                                        ch = li
+                                        ok = true
+                                }
+                        }
+                }
+                if !ok {
+                        // SCID fallback for long headers: server's reply SCID =
+                        // client's Initial DCID, which was registered in WriteTo.
                         if n > 0 && packet[0]&0x80 != 0 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
@@ -440,12 +455,6 @@ func (s *pooledSocket) readLoop() {
                                         ch, ok = s.demux[scidKey]
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
-                                        xrayerrors.LogInfo(context.Background(), "DIAG: SCID fallback scidLen=", len(scid),
-                                                " scid=0x", fmt.Sprintf("%x", scid),
-                                                " found=", ok)
-                                } else {
-                                        xrayerrors.LogInfo(context.Background(), "DIAG: SCID fallback FAILED perr=", perr,
-                                                " scidLen=", func() int { if scid, _, _ := quic.ParseSCID(packet[:n]); scid != nil { return len(scid) }; return 0 }())
                                 }
                         }
                         if !ok {
@@ -631,10 +640,18 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil {
-                        // v26.11.216: Register 0-length SCIDs too (Chrome/Edge).
-                        c.RegisterCID(scid)
-                        // Learn shortHeaderCIDLen from the client's SCID length
+                        // v26.11.217: Don't register 0-length SCIDs in demux —
+                        // they collide across connections. Instead, set lastActiveInbox
+                        // so the readLoop can route DCID=∅ replies to the most recently
+                        // active connection.
+                        if len(scid) > 0 {
+                                c.RegisterCID(scid)
+                        }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
+                        // v26.11.217: Update lastActiveInbox on every WriteTo call
+                        c.socket.mu.Lock()
+                        c.socket.lastActiveInbox = c.inbox
+                        c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
