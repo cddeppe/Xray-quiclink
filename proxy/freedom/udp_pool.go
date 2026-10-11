@@ -900,7 +900,11 @@ func isQUICLongHeader(b []byte) bool {
         if len(b) < 1 {
                 return false
         }
-        return b[0]&0x80 != 0 && b[0]&0x40 != 0
+        // v26.11.214: Support both QUIC v1 (0xc0) and v2 (0x80) long headers.
+        // QUIC v1: bit 7=1 (long header), bit 6=1 (fixed bit)
+        // QUIC v2: bit 7=1 (long header), bit 6=0 (fixed bit inverted per RFC 9369)
+        // Both have bit 7=1 for long header.
+        return b[0]&0x80 != 0
 }
 
 // ============================================================
