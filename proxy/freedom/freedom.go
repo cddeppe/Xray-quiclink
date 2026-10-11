@@ -681,9 +681,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         }
                                                 }
                                         }
-                                        defer pooledConn.Close()
+                                        // v26.11.200: DON'T close pooledConn on Process return.
+                                        // The goroutine restart (worker.go callback) will reuse it.
+                                        // Closing it kills the inbox → Google's replies panic → stall.
+                                        // The pool's reaper (300s unused timeout) cleans up the socket.
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
-                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
                                         // v26.11.156: Set up pool CID registration callback.
                                         // When the inbound worker detects CID rotation in a
