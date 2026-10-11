@@ -597,12 +597,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP {
-                // v26.11.221: Persist UDP conn across Process restarts for ALL UDP paths
-                // (not just non-pool). For pool path (YouTube), conn is created but not
-                               // used for data (pconn is used) — persisted harmlessly. For 0-length
-                // SCID (h3), pconn is nil so conn IS used for data, and persisting it
-                // keeps the source port stable → no reply loss on Process restart.
+        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
+                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
+                // Store the outbound conn in udpConn for reuse across Process
+                // restarts. Keeps source port stable → no Google path validation.
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -610,7 +608,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }); ok {
                                 existingConn := udpConn.GetOutboundConn()
                                 if existingConn != nil {
-                                        conn.Close()
                                         conn = existingConn
                                         errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
                                 } else {
@@ -675,16 +672,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
-                                        // v26.11.221: Skip pool for 0-length SCID (Chrome h3).
-                                        // These connections use the per-session socket (persisted via
-                                        // SetOutboundConn above). The per-session socket has its own
-                                        // source port and ReadFrom directly — no demux needed.
-                                        // YouTube (non-zero SCID) enters the pool with DCID demux.
-                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
-                                        if scidErr == nil && len(scid) == 0 {
-                                                errors.LogWarning(context.Background(), "DIAG: 0-length SCID — using per-session socket (persisted)")
-                                        } else
-                                        {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -763,11 +750,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.221: If not QUIC or 0-length SCID, pconn stays nil
+                        // If not QUIC, pconn stays nil — existing per-session path is used.
                 }
                 }
                 // If peek failed, proceed with existing path (pconn stays nil).
-        }
         }
 
         var newCtx context.Context
@@ -881,19 +867,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // BufferedPacketReader for the same pooledConn's inbox.
                         defer bpr.Close()
                 } else {
-                        // v26.11.223: Wrap per-session reader with BOTH a timeout
-                        // AND BufferedPacketReader — exactly like the pool path.
-                        //
-                        // The timeout makes Process return after 30s of inactivity
-                        // (so the goroutine doesn't get stuck). But when Process
-                        // returns, nobody reads from conn → kernel UDP buffer fills
-                        // → server replies are DROPPED → Chrome sees packet loss
-                        // → ~1000/3000 failures.
-                        //
-                        // BufferedPacketReader fixes this: its readLoop keeps
-                        // draining the underlying reader (via timeoutPacketReader)
-                        // even after Process returns. When Process restarts, the
-                        // buffered replies are immediately available — no loss.
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                         // v26.11.117: Wrap reader to detect server SCID from
                         // long-header replies. When Google's Initial reply
@@ -910,12 +883,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        reader = &timeoutPacketReader{base: reader, conn: conn, timeout: 30 * time.Second}
-                        // v26.11.223: Wrap with BufferedPacketReader so replies
-                        // are continuously drained even when Process isn't running.
-                        bpr := NewBufferedPacketReader(reader)
-                        reader = bpr
-                        defer bpr.Close()
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
