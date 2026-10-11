@@ -208,11 +208,7 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
           "enableTcpWarmPool": true,
           "tcpWarmPoolTimeout": 30,
           "preWarmFirstN": 10,
-          "preWarmLearnVisits": 3,
-          "enableTcpWarmPoolHealthCheck": true,
-          "tcpWarmPoolMaxIdle": 120,
-          "tcpConnectTimeout": 10,
-          "edgeHealthCooldown": 30
+          "preWarmLearnVisits": 3
         }
       }
     },
@@ -244,10 +240,6 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
 | tcpWarmPoolTimeout | 10 | 30 | Warm connection timeout (seconds) |
 | preWarmFirstN | 5 | 10 | Number of connections to pre-warm |
 | preWarmLearnVisits | 3 | 3 | Visits before pre-warming |
-| enableTcpWarmPoolHealthCheck | false | true | Health check warm connections |
-| tcpWarmPoolMaxIdle | 60 | 120 | Max idle warm connections |
-| tcpConnectTimeout | 10 | 10 | TCP connect timeout (seconds) |
-| edgeHealthCooldown | 30 | 30 | Edge health cooldown (seconds) |
 
 > **Note:** `poolStalenessTimeout`, `poolIdleTimeout`, and `poolUnusedTimeout` are no longer used — the pool socket is never evicted (v26.11.206-207). They can be omitted from the config.
 
