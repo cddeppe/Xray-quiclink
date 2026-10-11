@@ -62,6 +62,12 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // v26.11.235: lastActiveSource is the source address of the connection
+        // that most recently sent a packet. Used by NotifyServerSCID when the
+        // reply has DCID=∅ (src from demuxSource[∅] would be nil). Without this,
+        // the server's SCID is never registered → 1-RTT packets from Chrome
+        // can't be routed by dcidIndex → fall to 127.0.0.1:443 → TCP fallback.
+        lastActiveSource *stdnet.UDPAddr
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -544,6 +550,16 @@ func (s *pooledSocket) readLoop() {
                     s.mu.Unlock()
                 }
 
+                // v26.11.235: If src is nil (DCID=∅ reply, demuxSource[∅] misses),
+                // use lastActiveSource. This is critical for Chrome h3 (0-length SCID):
+                // without it, NotifyServerSCID is skipped → server's SCID never
+                // registered in dcidIndex → Chrome's 1-RTT packets can't be routed
+                // → fall to 127.0.0.1:443 → TCP fallback.
+                if src == nil {
+                        s.mu.RLock()
+                        src = s.lastActiveSource
+                        s.mu.RUnlock()
+                }
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
@@ -696,8 +712,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         // v26.11.217: Update lastActiveInbox on every WriteTo call
+                        // v26.11.235: Also update lastActiveSource for NotifyServerSCID
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
+                        c.socket.lastActiveSource = c.source
                         c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
