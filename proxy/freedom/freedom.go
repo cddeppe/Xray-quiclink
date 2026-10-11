@@ -867,6 +867,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return errors.New("failed to process response").Base(err)
                 }
                 errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
+                // v26.11.209: Cancel the context so requestDone also returns.
+                // Without this, responseDone exits (30s timeout) but requestDone
+                // keeps blocking on input → Process never returns → goroutine
+                // never restarts → new packets from Chrome go to the dead pipe → stall.
+                cancel()
                 return nil
         }
 
