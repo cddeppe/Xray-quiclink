@@ -672,6 +672,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
+                                        // v26.11.218: Skip pool for 0-length SCID (Chrome to h3 test sites)
+                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
+                                        if scidErr == nil && len(scid) == 0 {
+                                                errors.LogWarning(context.Background(), "DIAG: 0-length SCID — using per-session socket")
+                                        } else
+                                        {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -750,7 +756,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // If not QUIC, pconn stays nil — existing per-session path is used.
+                        } // close else (pool path)
+                        // If not QUIC or 0-length SCID, pconn stays nil
                 }
                 }
                 // If peek failed, proceed with existing path (pconn stays nil).
