@@ -1220,6 +1220,15 @@ func (r *BufferedPacketReader) Close() error {
                 return nil
         }
         close(r.done)
+        // v26.11.224: Immediately unblock the readLoop if the base reader
+        // supports Interrupt(). Without this, the readLoop stays blocked in
+        // conn.ReadFrom for up to 30 seconds. A new Process may start a new
+        // BufferedPacketReader on the same persisted conn in the meantime,
+        // causing two readLoops to race on the same conn → packet stealing →
+        // QUIC failure after ~6000 requests (test 3 full HTTP fallback).
+        if interrupter, ok := r.base.(interface{ Interrupt() }); ok {
+                interrupter.Interrupt()
+        }
         // Drain and release any buffered packets
         for {
                 select {
@@ -1240,8 +1249,10 @@ func (r *BufferedPacketReader) Close() error {
 // Process return. The goroutine restarts on the next packet, reusing the
 // persisted conn (via SetOutboundConn).
 //
-// This is the per-session-path equivalent of pooledConn.ReadFrom's 30-second
-// timeout. Without it, conn.ReadFrom() blocks forever and Process gets stuck.
+// v26.11.224: Added Interrupt() method to immediately unblock a pending
+// ReadFrom. This is called by BufferedPacketReader.Close() to ensure the
+// readLoop exits promptly — preventing two readLoops from racing on the
+// same conn when Process restarts.
 type timeoutPacketReader struct {
         base    buf.Reader
         conn    stdnet.Conn
@@ -1253,4 +1264,17 @@ func (r *timeoutPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
                 _ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
         }
         return r.base.ReadMultiBuffer()
+}
+
+// v26.11.224: Interrupt immediately unblocks any pending ReadFrom on the conn.
+// Sets the read deadline to the past, causing ReadFrom to return a timeout
+// error right away. This is critical for preventing goroutine leaks: when
+// BufferedPacketReader.Close() fires, the readLoop is blocked in ReadFrom.
+// Without Interrupt, it stays blocked for up to 30 seconds — and a new
+// Process may start a new readLoop on the same conn in the meantime,
+// causing packet stealing and eventual QUIC failure.
+func (r *timeoutPacketReader) Interrupt() {
+        if r.conn != nil {
+                _ = r.conn.SetReadDeadline(time.Now().Add(-1 * time.Second))
+        }
 }
