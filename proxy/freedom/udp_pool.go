@@ -556,12 +556,11 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-        if len(cid) == 0 {
-                return
-        }
-        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
-        // and the demux map. Eliminates hex.EncodeToString per SCID
-        // registration (was 1 string alloc; now zero).
+        // v26.11.216: Register 0-length CIDs too. Chrome uses 0-length SCID.
+        // The server's reply has DCID = client's SCID = ∅. We need demux[∅]
+        // to route the reply. This is safe because with port-only keying,
+        // there's typically one connection per pool socket at handshake time.
+        // When a new Initial arrives (different DCID), it overwrites demux[∅].
         dk := makeDCIDKey(cid)
 
         // v26.10.15-link: atomic closed check avoids acquiring mu
@@ -609,7 +608,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // mutex acquire for 99% of packets in a long-lived QUIC
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
-                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
+                if scid, _, err := parseQUICSCID(b); err == nil {
+                        // v26.11.216: Register 0-length SCIDs too (Chrome/Edge).
+                        // This creates demux[∅] = inbox, which routes the server's
+                        // reply (DCID=∅ = client's SCID) to the correct connection.
                         c.RegisterCID(scid)
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
