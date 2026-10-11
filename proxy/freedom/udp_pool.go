@@ -38,24 +38,21 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
+        mu            sync.RWMutex
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        // v26.10.43-link (audit P5): atomic timestamps to avoid
-        // mutex contention on the readLoop hot path.
-        lastUsed      atomic.Int64 // UnixNano
-        lastReplyTime atomic.Int64  // UnixNano
-        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
+        lastUsed      atomic.Int64
+        lastReplyTime atomic.Int64
+        demux         map[dcidKey]chan<- readResult
         demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
-        // v26.10.15-link: dropped reply packets counter for observability.
-        // Incremented when the inbox channel (cap 32) is full and the
-        // readLoop drops a reply packet. QUIC will retransmit, but
-        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
+        // v26.11.158: Track all pooledConns so readLoop can check
+        // if a pooledConn is closed before sending to its inbox.
+        conns []*pooledConn
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -117,24 +114,6 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
-        // v26.11.0.18: timestamps for stall detection.
-        // lastWriteTime is updated on every WriteTo call (Chrome→Google direction).
-        // lastReplyTime is updated when a packet is delivered to the inbox (Google→Chrome).
-        // If Chrome is actively sending but Google hasn't replied within stallTimeout,
-        // the connection is considered stalled and we send ICMP to force Chrome fallback.
-        // Atomic to avoid mutex contention on the hot path.
-        lastWriteTime atomic.Int64 // UnixNano
-        lastReplyTime atomic.Int64 // UnixNano
-        // v26.11.0.18: ensure ICMP is only sent once per stall (avoid spamming Chrome
-        // with multiple ICMPs if ReadFrom is called multiple times during shutdown).
-        icmpSent atomic.Bool
-        // v26.11.0.18: the inbound LOCAL port Chrome is sending to (typically 443).
-        // Captured in freedom.go from inbound.Local.Port and used by
-        // sendICMPPortUnreachable to build a valid ICMP packet whose embedded
-        // UDP dst port matches Chrome's connected peer port — without this, the
-        // kernel won't match the ICMP back to Chrome's socket and Chrome won't
-        // see ECONNREFUSED. Defaults to 443 if not set.
-        localPort int
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -353,6 +332,10 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
+        // v26.11.158: Track this pooledConn so readLoop can check IsClosed
+        sock.mu.Lock()
+        sock.conns = append(sock.conns, conn)
+        sock.mu.Unlock()
         return conn, nil
 }
 
@@ -450,49 +433,23 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
-                //
-                // The blocking send (v26.10.20) was WRONG for the shared-socket
-                // model: one slow/stale session's full channel would block the
-                // entire readLoop, starving ALL other sessions sharing the same
-                // socket. This made YouTube stalls WORSE when swiping quickly
-                // between videos (many sessions, one stale session blocks all).
-                //
-                // The correct approach for a shared readLoop:
-                // 1. Large channel (256) so drops are rare during bursts
-                // 2. Non-blocking send so one slow session doesn't starve others
-                // 3. Track drops for observability
+                // v26.11.159: Removed IsClosed check — it acquired RLock and
+                // iterated ALL conns per packet, blocking RegisterCID (which
+                // needs Lock). This delayed CID rotation registration, causing
+                // Google's replies with the new DCID to be dropped.
+                // The non-blocking send already handles dead conns: if the
+                // inbox is full (nobody reading), the packet is dropped (QUIC
+                // retransmits). No lock needed.
                 sentOk := false
                 packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
-                // v26.11.0.12: recover from panic — the inbox channel may be
-                // closed (pooledConn.Close() no longer deletes from demux,
-                // so stale entries point to closed channels). When we recover,
-                // DELETE the stale entry so future replies with the same DCID
-                // don't trigger another panic. Panics are expensive in Go
-                // (~1us each), and accumulated stale entries would cause the
-                // readLoop to slow down, delaying replies to active connections.
-                panicked := false
-                func() {
-                        defer func() {
-                                if r := recover(); r != nil {
-                                        panicked = true
-                                        s.droppedReplies.Add(1)
-                                        putPacket(packet)
-                                }
-                        }()
-                        select {
-                        case ch <- readResult{data: packetToSend, addr: addr}:
-                                sentOk = true
-                        default:
-                                s.droppedReplies.Add(1)
-                                putPacket(packet)
-                        }
-                }()
-                // v26.11.0.12: clean up stale demux entry on panic
-                if panicked {
-                        s.mu.Lock()
-                        delete(s.demux, dk)
-                        delete(s.demuxSource, dk)
-                        s.mu.Unlock()
+                select {
+                case ch <- readResult{data: packetToSend, addr: addr}:
+                        sentOk = true
+                default:
+                        s.droppedReplies.Add(1)
+                        // v26.10.42-link (audit P3): return the pooled buffer
+                        // when the inbox is full and we drop the packet.
+                        putPacket(packet)
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
@@ -662,364 +619,36 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if udp, ok := addr.(*stdnet.UDPAddr); ok {
                 dest = udp
         }
-        // v26.11.0.18: CRITICAL FIX — retry transient write errors internally
-        // and swallow them if all retries fail. A single transient error
-        // (EAGAIN, ENOBUFS, EHOSTUNREACH, ECONNREFUSED from CDN edge rotation)
-        // must NOT kill the QUIC connection — QUIC handles packet loss via
-        // retransmission. Previously, returning the error to the caller
-        // (PooledPacketWriter.WriteMultiBuffer → buf.Copy → requestDone)
-        // caused:
-        //   1. buf.Copy in requestDone returns error
-        //   2. task.Run cancels → Process returns → pooledConn.Close()
-        //   3. QUIC connection dies, Chrome retries, may give up → TCP fallback
-        // This was identified as a root cause of UDP stalls in v26.11.255
-        // (for per-conn sockets); the same fix applies to pooled sockets.
-        // Hot path overhead: zero on success (no extra syscall).
-        for retry := 0; retry < 3; retry++ {
-                n, err := c.socket.conn.WriteTo(b, dest)
-                if err == nil {
-                        c.lastWriteTime.Store(time.Now().UnixNano())
-                        return n, nil
-                }
+        n, err := c.socket.conn.WriteTo(b, dest)
+        if err != nil {
+                // v26.10.15-link: only mark the socket dead on persistent
+                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
+                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
+                // will retry or the route will come back. Killing the socket
+                // on a transient error would kill all 50+ QUIC sessions
+                // sharing this socket, which is much worse than dropping one
+                // packet.
                 if !isTransientWriteError(err) {
-                        // Persistent error — socket is broken. Mark dead and return
-                        // the error so the caller can clean up.
                         c.socket.MarkDead()
-                        c.lastWriteTime.Store(time.Now().UnixNano())
-                        return n, err
-                }
-                // Transient error — retry after brief backoff (1ms, 2ms).
-                // Only sleep between retries, not after the last attempt.
-                if retry < 2 {
-                        time.Sleep(time.Millisecond * time.Duration(1<<retry))
                 }
         }
-        // All retries exhausted — swallow the error to prevent Process from
-        // dying. QUIC will retransmit if the packet was lost. Returning nil
-        // here is intentional: one transient write failure should NOT kill
-        // a long-lived QUIC connection.
-        c.lastWriteTime.Store(time.Now().UnixNano())
-        return len(b), nil
+        return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
-        // v26.11.0.18: Stall detection + ICMP trigger.
-        //
-        // When Chrome is actively sending packets (lastWriteTime is recent) but
-        // Google hasn't replied within stallTimeout, the connection is stalled.
-        // This happens when:
-        //   - Google's CDN edge rotated (Google stopped serving this conn)
-        //   - The destination IP is silently dropping packets
-        //   - Some other path issue between xray and Google
-        //
-        // Previous fixes (v0.11 + v0.12) keep the demux entry and clean up stale
-        // entries on panic, but Chrome's QUIC stack still has to wait for its
-        // own ~25-30s timeout to fall back to TCP. This makes video stall for
-        // 25-30s every time the CDN edge rotates or the conn dies.
-        //
-        // Fix: detect the stall after stallTimeout (5s) and send an ICMP port
-        // unreachable to Chrome's source IP:port. This makes Chrome's UDP socket
-        // receive ECONNREFUSED, causing Chrome's QUIC stack to immediately
-        // declare the path broken and fall back to TCP (~1s).
-        //
-        // Key insight from v0.13-v0.17: ICMP must be triggered from STALL
-        // DETECTION (which fires when the conn is genuinely stalled), NOT from
-        // Close() (which never fires for active QUIC connections because Process
-        // blocks on input/inbox forever).
-        const stallTimeout = 5 * time.Second
-
-        for {
-                // Check if we're stalled RIGHT NOW (before blocking on inbox).
-                // This catches the case where we've been stalled for a while.
-                if c.isStalled(stallTimeout) {
-                        c.handleStall()
+        select {
+        case rr, ok := <-c.inbox:
+                if !ok {
                         return 0, nil, io.EOF
                 }
-
-                // Calculate the remaining time until stall timeout.
-                // Use the more recent of lastReplyTime and lastWriteTime as the reference.
-                now := time.Now()
-                lastReplyNano := c.lastReplyTime.Load()
-                lastWriteNano := c.lastWriteTime.Load()
-
-                var refTime time.Time
-                switch {
-                case lastWriteNano == 0:
-                        // No write yet — wait for the full timeout. Don't penalize the
-                        // connection before Chrome has sent anything.
-                        refTime = now
-                case lastReplyNano > lastWriteNano:
-                        // Google replied more recently than Chrome wrote. Use reply time.
-                        refTime = time.Unix(0, lastReplyNano)
-                default:
-                        // Chrome wrote more recently than Google replied (or no reply yet).
-                        // Use write time so the timer starts when Chrome last sent.
-                        refTime = time.Unix(0, lastWriteNano)
-                }
-
-                remaining := stallTimeout - now.Sub(refTime)
-                if remaining < 0 {
-                        remaining = 0
-                }
-
-                timer := time.NewTimer(remaining)
-
-                select {
-                case rr, ok := <-c.inbox:
-                        timer.Stop()
-                        if !ok {
-                                return 0, nil, io.EOF
-                        }
-                        n := copy(p, rr.data)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // after copying the data out.
-                        putPacket(rr.data)
-                        // v26.11.0.18: update reply timestamp for stall detection.
-                        c.lastReplyTime.Store(time.Now().UnixNano())
-                        return n, rr.addr, nil
-                case <-c.done:
-                        timer.Stop()
-                        return 0, nil, io.EOF
-                case <-timer.C:
-                        // v26.11.0.18: stall timeout — no reply from Google.
-                        // Check if Chrome is still actively sending. If Chrome
-                        // stopped sending (idle/paused), don't kill the connection.
-                        if c.isStalled(stallTimeout) {
-                                c.handleStall()
-                                return 0, nil, io.EOF
-                        }
-                        // Chrome is idle (not sending) — loop and wait again.
-                        // Don't recurse — use a loop to avoid stack growth if Chrome
-                        // oscillates between active and idle.
-                }
+                n := copy(p, rr.data)
+                // v26.10.42-link (audit P3): return the pooled buffer
+                // after copying the data out.
+                putPacket(rr.data)
+                return n, rr.addr, nil
+        case <-c.done:
+                return 0, nil, io.EOF
         }
-}
-
-// isStalled returns true if Chrome is actively sending (lastWriteTime is recent)
-// AND Google has NOT replied since the last write within stallTimeout.
-//
-// v26.11.0.18: This is the precise stall condition — Chrome sent a packet that
-// Google never acknowledged. The previous implementation had a bug: it checked
-// `now - lastReply > stallTimeout` even when Chrome had just written (e.g.,
-// Chrome writes at T+6s after 6s idle; at T+7s the old logic declared stall
-// because lastReply was 6.9s old, even though Google might have been about to
-// reply to the brand-new write). That caused premature ICMP sends and killed
-// healthy connections that were just resuming after a pause.
-//
-// Correct logic: only declare stall if Google has NOT replied SINCE the last
-// write (lastReply < lastWrite) AND enough time has passed since that write.
-// If lastReply >= lastWrite, Google acknowledged the last write — healthy.
-//
-// If Chrome hasn't written in 2x stallTimeout, the connection is just idle
-// (user paused the video or is reading comments) — not stalled. We must NOT
-// kill idle connections or we'd interrupt legitimate pauses.
-func (c *pooledConn) isStalled(stallTimeout time.Duration) bool {
-        now := time.Now()
-        lastWriteNano := c.lastWriteTime.Load()
-        lastReplyNano := c.lastReplyTime.Load()
-
-        // No writes at all, or Chrome hasn't written in 2x stallTimeout → idle.
-        if lastWriteNano == 0 || now.Sub(time.Unix(0, lastWriteNano)) > 2*stallTimeout {
-                return false
-        }
-
-        // Chrome has written recently. If Google replied AT OR AFTER the last
-        // write, the connection is healthy — the last packet was acked.
-        if lastReplyNano > 0 && lastReplyNano >= lastWriteNano {
-                return false
-        }
-
-        // Google has NOT replied to the last write. Wait stallTimeout from the
-        // write before declaring stall (gives Google time to process + reply).
-        return now.Sub(time.Unix(0, lastWriteNano)) > stallTimeout
-}
-
-// handleStall is called when a QUIC stall is detected. It sends an ICMP
-// port unreachable to Chrome's source IP:port, which makes Chrome's UDP
-// socket receive ECONNREFUSED. Chrome's QUIC stack then declares the path
-// broken and falls back to TCP immediately (within ~1s) instead of waiting
-// for its own 25-30s timeout.
-//
-// v26.11.0.18: This is the key fix. Previous attempts (v0.13-v0.17) tried
-// to send ICMP from Close(), but Close() never fires for active QUIC
-// connections (Process blocks on input/inbox forever). This version triggers
-// ICMP from stall detection in ReadFrom, which DOES fire when the connection
-// is genuinely stalled.
-//
-// After sending ICMP, we return EOF from ReadFrom. This causes:
-//   1. responseDone's buf.Copy returns EOF
-//   2. task.Run returns → Process returns → defer pooledConn.Close() fires
-//   3. With v0.11 fix, demux entries are kept (stale) → readLoop drops
-//      subsequent Google packets via panic recovery (v0.12 fix)
-//   4. Chrome receives ICMP → ECONNREFUSED → declares path broken
-//   5. Chrome falls back to TCP within ~1s
-//   6. When Chrome retries QUIC (next video), xray handles it normally
-func (c *pooledConn) handleStall() {
-        // v26.11.0.18: ensure ICMP is only sent once per connection stall.
-        // Multiple ReadFrom calls might detect the stall concurrently.
-        if !c.icmpSent.CompareAndSwap(false, true) {
-                // Already sent — just return EOF.
-                return
-        }
-        lastWrite := time.Unix(0, c.lastWriteTime.Load())
-        lastReply := time.Unix(0, c.lastReplyTime.Load())
-        xrayerrors.LogInfo(context.Background(),
-                "udp_pool: QUIC stall detected — sending ICMP port unreachable to force Chrome fallback; source=",
-                c.source, " lastWrite=", lastWrite, " lastReply=", lastReply)
-        c.sendICMPPortUnreachable()
-}
-
-// sendICMPPortUnreachable sends an ICMP Type 3 Code 3 (Destination
-// Unreachable - Port Unreachable) packet to Chrome's source IP:port.
-// This makes Chrome's UDP socket receive ECONNREFUSED, causing Chrome's
-// QUIC stack to immediately declare the path broken and fall back to TCP.
-//
-// v26.11.0.18: The ICMP packet format follows RFC 792:
-//   - ICMP header (8 bytes): Type=3, Code=3, Checksum, Unused
-//   - Original IP header (20 bytes): Chrome's IP → VPS IP (looks like a packet Chrome sent)
-//   - Original UDP header (8 bytes): Chrome's src port → VPS port (443)
-//
-// The kernel at Chrome's side matches the embedded IP+UDP headers to Chrome's
-// connected UDP socket (LOCAL=Chrome:port, PEER=VPS:443) and sets ECONNREFUSED
-// on it. Chrome's QUIC stack sees the error and declares the path broken.
-//
-// CRITICAL (v26.11.0.18 fix): the embedded IP dst and UDP dst port MUST match
-// Chrome's socket PEER (VPS_IP, 443). Linux's __udp4_lib_lookup for connected
-// UDP sockets requires inet_daddr == embedded IP dst AND inet_dport == embedded
-// UDP dst port, otherwise the lookup fails silently and Chrome never sees the
-// ECONNREFUSED. Previous versions used 0.0.0.0 for the IP dst (placeholder)
-// and the pool socket's random local port for the UDP dst port — both WRONG.
-//
-// We get the VPS IP from the raw ICMP socket's LocalAddr after Dial: the
-// kernel picks the source IP based on routing to Chrome's IP, which is the
-// same VPS IP that Chrome is sending to (assuming symmetric routing).
-//
-// Requires CAP_NET_RAW (xray runs as root via systemd, so this is available).
-// Silently fails if raw socket access is unavailable — Chrome will fall back
-// to TCP via its own ~25s timeout in that case.
-func (c *pooledConn) sendICMPPortUnreachable() {
-        if c.source == nil {
-                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP skip — c.source is nil")
-                return
-        }
-
-        // Only send for IPv4 Chrome sources (ICMPv4 is simpler; ICMPv6 needs
-        // different format and router solicitation, skip for now).
-        srcIP := c.source.IP.To4()
-        if srcIP == nil {
-                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP skip — source is IPv6: ", c.source.IP)
-                return
-        }
-
-        // The inbound LOCAL port Chrome is sending to (typically 443).
-        // This MUST match Chrome's connected PEER port or the kernel won't
-        // match the ICMP back to Chrome's socket.
-        dstPort := uint16(c.localPort)
-        if dstPort == 0 {
-                dstPort = 443 // sensible default for QUIC/HTTP3
-        }
-        srcPort := uint16(c.source.Port)
-
-        // Open the raw ICMP socket FIRST. The kernel picks the source IP
-        // based on routing to Chrome's IP — this is the VPS IP that Chrome
-        // is sending to. We need this for the embedded IP dst.
-        conn, err := stdnet.Dial("ip4:icmp", srcIP.String())
-        if err != nil {
-                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP send failed (no raw socket access): ", err)
-                return
-        }
-        defer conn.Close()
-
-        // Extract the kernel-chosen source IP (= VPS IP Chrome sends to).
-        var vpsIP stdnet.IP
-        switch la := conn.LocalAddr().(type) {
-        case *stdnet.IPAddr:
-                vpsIP = la.IP.To4()
-        case *stdnet.UDPAddr:
-                vpsIP = la.IP.To4()
-        }
-        if vpsIP == nil {
-                // Could not determine VPS IP — without it, the kernel won't
-                // match the ICMP to Chrome's connected socket. Log and bail.
-                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP skip — can't determine VPS local IP from raw socket")
-                return
-        }
-
-        // Build ICMP Type 3 Code 3 packet.
-        // Format per RFC 792:
-        //   ICMP header (8 bytes): Type, Code, Checksum, Unused
-        //   Original IP header (20 bytes): Chrome_IP → VPS_IP
-        //   Original UDP header (8 bytes): Chrome_port → 443
-        //
-        // Total: 36 bytes. The kernel uses the embedded IP+UDP header to match
-        // the ICMP back to Chrome's UDP socket.
-        icmp := make([]byte, 36)
-        // ICMP header
-        icmp[0] = 3 // Type: Destination Unreachable
-        icmp[1] = 3 // Code: Port Unreachable
-        // icmp[2:4] = checksum (calculated below)
-        // icmp[4:8] = unused (4 bytes, all zero)
-
-        // Original IP header (20 bytes) — fabricated to look like a packet
-        // from Chrome's IP:port to VPS's IP:port (i.e., the packet that
-        // "triggered" this ICMP). Linux matches this against Chrome's
-        // connected UDP socket.
-        icmp[8] = 0x45 // Version (4) + IHL (5 = 20 bytes)
-        icmp[9] = 0    // DSCP + ECN
-        // Total length (2 bytes) = 28 (20 IP + 8 UDP)
-        icmp[10] = 0
-        icmp[11] = 28
-        // Identification (2 bytes) = 0
-        icmp[12] = 0
-        icmp[13] = 0
-        // Flags + Fragment offset (2 bytes) = 0
-        icmp[14] = 0
-        icmp[15] = 0
-        icmp[16] = 64 // TTL
-        icmp[17] = 17 // Protocol: UDP
-        // Header checksum (2 bytes) = 0 (kernel doesn't validate the embedded checksum)
-        icmp[18] = 0
-        icmp[19] = 0
-        // Source IP (4 bytes) = Chrome's IP (matches Chrome's socket LOCAL IP)
-        copy(icmp[20:24], srcIP.To4())
-        // Destination IP (4 bytes) = VPS's IP (matches Chrome's socket PEER IP).
-        // v26.11.0.18 FIX: was 0.0.0.0 — that broke kernel socket matching for
-        // connected UDP sockets. Now uses the actual VPS IP from the raw socket.
-        copy(icmp[24:28], vpsIP)
-
-        // Original UDP header (8 bytes)
-        icmp[28] = byte(srcPort >> 8)
-        icmp[29] = byte(srcPort)
-        icmp[30] = byte(dstPort >> 8)
-        icmp[31] = byte(dstPort)
-        // UDP length (2 bytes) = 8 (just the header)
-        icmp[32] = 0
-        icmp[33] = 8
-        // UDP checksum (2 bytes) = 0 (UDP checksum is optional for IPv4)
-        icmp[34] = 0
-        icmp[35] = 0
-
-        // Calculate ICMP checksum (over the entire 36-byte packet)
-        var sum uint32
-        for i := 0; i < len(icmp); i += 2 {
-                sum += uint32(icmp[i])<<8 | uint32(icmp[i+1])
-        }
-        for sum>>16 > 0 {
-                sum = (sum & 0xFFFF) + (sum >> 16)
-        }
-        checksum := ^uint16(sum)
-        icmp[2] = byte(checksum >> 8)
-        icmp[3] = byte(checksum)
-
-        // Send via raw ICMP socket. The kernel adds the outer IP header.
-        _, err = conn.Write(icmp)
-        if err != nil {
-                xrayerrors.LogInfo(context.Background(), "udp_pool: ICMP write failed: ", err)
-                return
-        }
-        xrayerrors.LogInfo(context.Background(),
-                "udp_pool: sent ICMP port unreachable to ", srcIP, ":", c.source.Port,
-                " (vps ", vpsIP, ":", dstPort, ")")
 }
 
 func (c *pooledConn) IsClosed() bool {
@@ -1027,37 +656,27 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
-        // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
-        // v26.11.0.11: DON'T delete DCIDs from the socket's demux map.
-        // Previously, Close() removed the DCID entries (lines 676-680).
-        // This caused the fast-swipe stall:
-        // - Video A's Process returns → Close() → demux[A] deleted
-        // - Google sends more packets with DCID A (retransmissions, ACKs)
-        // - readLoop sees demux miss → drops them
-        // - Chrome's QUIC stack never gets ACKs → declares path dead
-        // - Chrome falls back to TCP after ~25s
-        //
-        // Fix: leave the DCID in the demux map as a stale entry. The inbox
-        // channel is closed (close(c.done) above), so readLoop's non-blocking
-        // send will panic — but we recover from the panic (in the send path)
-        // and silently drop the packet. When a new connection registers the
-        // same DCID (Chrome reuses DCIDs, or a new Initial overwrites it),
-        // the stale entry is replaced with the new inbox.
-        //
-        // Memory impact: one stale demux entry per closed connection.
-        // The pool's reaper (300s unused timeout) cleans up the socket
-        // entirely, including all demux entries. So at most ~300s of
-        // stale entries, which is negligible (a few hundred entries).
-        //
-        // We still need to release the socket's refCount so the reaper
-        // can close it when it's truly unused.
+        // v26.11.160: RESTORE demux cleanup. The original code only deleted
+        // entries where existing == c.inbox (this pooledConn's own entries).
+        // It did NOT delete other connections' entries. This is safe and
+        // necessary — without it, stale entries accumulate and the readLoop
+        // wastes time sending to dead inboxes.
+        c.mu.Lock()
+        c.socket.mu.Lock()
+        for dk := range c.scidsDCID {
+                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
+                        delete(c.socket.demux, dk)
+                        delete(c.socket.demuxSource, dk)
+                }
+        }
+        c.socket.mu.Unlock()
+        c.mu.Unlock()
+
         c.socket.release()
         return nil
 }

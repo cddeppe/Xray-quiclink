@@ -460,15 +460,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // the sticky resolver (if enabled), so the warm pool key matches the
         // actual IP:port the dialer would have used.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
-                // v26.11.132: SetDialFunc is now a no-op after the first call
-                // (checks for nil internally), so calling it every Process is cheap.
+                // v26.10.45-link: provide the dialer to the warm pool for
+                // pre-warming. Set once — the dialer is the same for all
+                // Process calls on this handler.
                 h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
                         return dialer.Dial(ctx, dest)
                 })
                 if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
-                        conn = warmConn
-                        warmAcquired = true
-                        errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        if warmConn.RemoteAddr() != nil {
+                                conn = warmConn
+                                warmAcquired = true
+                                errors.LogInfo(ctx, "tcp warm pool: reused connection to ", destination)
+                        } else {
+                                warmConn.Close()
+                        }
                 }
         }
         var blockedDest *net.Destination
@@ -591,6 +596,35 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
+        } else if destination.Network != net.Network_TCP {
+                // v26.11.196: For UDP (non-pool path), check if the inbound udpConn
+                // has a persistent outbound conn from a previous Process call. If so,
+                // reuse it instead of dialing a new one. This keeps the source port
+                // stable across Process restarts, preventing Google from seeing a
+                // connection migration (which triggers path validation → stall).
+                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                        if udpConn, ok := inbound.Conn.(interface {
+                                GetOutboundConn() net.Conn
+                                SetOutboundConn(net.Conn, net.Destination)
+                        }); ok {
+                                existingConn := udpConn.GetOutboundConn()
+                                if existingConn != nil {
+                                        // Reuse the persistent outbound conn
+                                        conn = existingConn
+                                        errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
+                                } else {
+                                        // First call — store the conn for reuse by future Process calls
+                                        // We'll set it after the dial succeeds
+                                        defer func() {
+                                                udpConn.SetOutboundConn(conn, destination)
+                                        }()
+                                }
+                        } else {
+                                defer conn.Close()
+                        }
+                } else {
+                        defer conn.Close()
+                }
         } else {
                 defer conn.Close()
         }
@@ -617,6 +651,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 }
                                 if udpRemote != nil {
                                         pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
@@ -650,16 +685,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                                 Port: int(inbound.Source.Port),
                                                         }
                                                 }
-                                                if inbound.Local.IsValid() && inbound.Local.Port != 0 {
-                                                        pooledConn.localPort = int(inbound.Local.Port)
-                                                } else {
-                                                        pooledConn.localPort = 443 // sensible default for QUIC/HTTP3
-                                                }
                                         }
                                         defer pooledConn.Close()
                                         // Pool uses wildcard socket; clear outGateway for QUIC path.
                                         // Non-QUIC UDP keeps outGateway (sendThrough honored).
                                         outGateway = nil
+                                        // v26.11.156: Set up pool CID registration callback.
+                                        // When the inbound worker detects CID rotation in a
+                                        // 1-RTT short header, it calls this to register the
+                                        // new DCID in the pool's demux. Without this, Google's
+                                        // replies with the rotated DCID get dropped.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
+                                                        pc := pooledConn
+                                                        uc.SetRegisterPoolCID(func(newDCID []byte) {
+                                                                pc.RegisterCID(newDCID)
+                                                        })
+                                                }
+                                        }
                                 }
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
@@ -684,6 +727,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pooledConn != nil)
 
                 var writer buf.Writer
                 if destination.Network == net.Network_TCP {
@@ -729,16 +773,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // fired (responseDone returned, so YouTube closed the outbound).
                         select {
                         case <-inputCloser:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (inputCloser) dest=", destination)
                                 return nil // graceful — let Dispatch Close(link.Writer)
                         default:
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (error) dest=", destination, " err=", err)
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
+                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (copy done) dest=", destination)
                 return nil
         }
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
@@ -780,8 +828,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
+                        errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
                 return nil
         }
 
