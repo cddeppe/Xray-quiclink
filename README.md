@@ -205,9 +205,6 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
           "preferIpv4": true,
           "sessionIdleTimeout": 1800,
           "stickyResolverTtl": 300,
-          "poolStalenessTimeout": 300,
-          "poolIdleTimeout": 600,
-          "poolUnusedTimeout": 300,
           "enableTcpWarmPool": true,
           "tcpWarmPoolTimeout": 30,
           "preWarmFirstN": 10,
@@ -243,9 +240,6 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
 | preferIpv4 | false | true | Prefer IPv4 from DNS results |
 | sessionIdleTimeout | 300 | 1800 | UDP session idle timeout (seconds) |
 | stickyResolverTtl | 60 | 300 | DNS cache TTL (seconds) |
-| poolStalenessTimeout | 300 | 300 | Socket staleness check (seconds) — disabled in v26.11.207+ |
-| poolIdleTimeout | 600 | 600 | Socket idle timeout (seconds) — disabled in v26.11.207+ |
-| poolUnusedTimeout | 300 | 300 | Unused socket timeout (seconds) — disabled in v26.11.207+ |
 | enableTcpWarmPool | false | true | Pre-warm TCP connections |
 | tcpWarmPoolTimeout | 10 | 30 | Warm connection timeout (seconds) |
 | preWarmFirstN | 5 | 10 | Number of connections to pre-warm |
@@ -254,6 +248,8 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
 | tcpWarmPoolMaxIdle | 60 | 120 | Max idle warm connections |
 | tcpConnectTimeout | 10 | 10 | TCP connect timeout (seconds) |
 | edgeHealthCooldown | 30 | 30 | Edge health cooldown (seconds) |
+
+> **Note:** `poolStalenessTimeout`, `poolIdleTimeout`, and `poolUnusedTimeout` are no longer used — the pool socket is never evicted (v26.11.206-207). They can be omitted from the config.
 
 ---
 
