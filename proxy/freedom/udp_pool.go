@@ -384,9 +384,12 @@ func (s *pooledSocket) readLoop() {
                 } else {
                         // Short header — use learned CID length
                         cidLen := int(s.shortHeaderCIDLen.Load())
-                        if cidLen <= 0 {
+                        if cidLen < 0 {
+                                // Not learned yet — fall back to default
                                 cidLen = quic.DefaultShortHeaderCIDLen
                         }
+                        // v26.11.216: cidLen can be 0 (Chrome uses 0-length SCID).
+                        // Don't fall back to 8 when cidLen=0 — that reads garbage.
                         dcid, _, err = quic.ParseShortHeaderDCIDWithLen(packet[:n], cidLen)
                 }
                 if err != nil {
