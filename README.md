@@ -473,6 +473,11 @@ git rebase upstream/main
 # - common/protocol/quic/sniff.go
 ```
 
+### Known TODOs
+
+- **dcidIndex growth** — `clean()` no longer deletes `dcidIndex` entries (v26.11.213) so Chrome can resume after being away. Over weeks of uptime, entries accumulate (~30 bytes each). Not a problem for normal usage (restart clears them), but could add a TTL-based cleanup if long uptime becomes an issue. Consider a weekly cron restart (`0 4 * * 0 systemctl restart xray`) as a simple mitigation.
+- **DIAG logging** — `requestDone START`, `responseDone START/EXIT` logs are at Warning level. Set `"loglevel": "error"` in production to suppress them. Consider stripping them from the code for a clean production build.
+
 ---
 
 ## Support
