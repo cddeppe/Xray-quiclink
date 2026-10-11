@@ -418,6 +418,12 @@ func (s *pooledSocket) readLoop() {
                                         ch, ok = s.demux[scidKey]
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
+                                        xrayerrors.LogInfo(context.Background(), "DIAG: SCID fallback scidLen=", len(scid),
+                                                " scid=0x", fmt.Sprintf("%x", scid),
+                                                " found=", ok)
+                                } else {
+                                        xrayerrors.LogInfo(context.Background(), "DIAG: SCID fallback FAILED perr=", perr,
+                                                " scidLen=", func() int { if scid, _, _ := quic.ParseSCID(packet[:n]); scid != nil { return len(scid) }; return 0 }())
                                 }
                         }
                         if !ok {
