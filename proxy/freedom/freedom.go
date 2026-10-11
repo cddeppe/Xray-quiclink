@@ -4,7 +4,6 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
-        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -663,14 +662,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         mb, peekErr := input.ReadMultiBuffer()
                         if peekErr == nil && len(mb) > 0 {
                                 peekedPackets = mb
-                                // v26.11.215: Debug log to see first byte of peeked packet
-                                firstByte := byte(0)
-                                if len(mb[0].Bytes()) > 0 {
-                                        firstByte = mb[0].Bytes()[0]
-                                }
-                                errors.LogInfo(ctx, "peek firstByte=0x", fmt.Sprintf("%02x", firstByte),
-                                        " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
-                                        " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
@@ -680,14 +671,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // v26.11.242: Use shared socket for ALL QUIC traffic
-                                        // (including 0-length SCID / Chrome h3).
-                                        // Per-connection sockets (v229) caused the server to see
-                                        // different source ports → connection migration → degraded.
-                                        // The shared socket uses ONE source port for ALL connections,
-                                        // same as YouTube. DCID=∅ replies use lastActiveInbox.
                                         pconn, err = h.socketPool.Acquire(udpRemote)
-                                        errors.LogInfo(ctx, "pool ACQUIRE dest=", destination, " pool=", pconn != nil, " err=", err)
+                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pconn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
                                                 // before returning. Without this, every Acquire
@@ -779,7 +764,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-                errors.LogInfo(ctx, "requestDone START dest=", destination, " pool=", pconn != nil)
+                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pconn != nil)
 
                 var writer buf.Writer
                 if destination.Network == net.Network_TCP {
@@ -825,20 +810,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // fired (responseDone returned, so YouTube closed the outbound).
                         select {
                         case <-inputCloser:
-                                errors.LogInfo(ctx, "requestDone EXIT (inputCloser) dest=", destination)
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (inputCloser) dest=", destination)
                                 return nil // graceful — let Dispatch Close(link.Writer)
                         default:
-                                errors.LogInfo(ctx, "requestDone EXIT (error) dest=", destination, " err=", err)
+                                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (error) dest=", destination, " err=", err)
                                 return errors.New("failed to process request").Base(err)
                         }
                 }
-                errors.LogInfo(ctx, "requestDone EXIT (copy done) dest=", destination)
+                errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (copy done) dest=", destination)
                 return nil
         }
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-                errors.LogInfo(ctx, "responseDone START dest=", destination, " pool=", pconn != nil)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pconn != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
@@ -891,10 +876,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-                        errors.LogInfo(ctx, "responseDone EXIT (error) dest=", destination, " err=", err)
+                        errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
-                errors.LogInfo(ctx, "responseDone EXIT (copy done) dest=", destination)
+                errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
                 // v26.11.209: Cancel the context so requestDone also returns.
                 // Without this, responseDone exits (30s timeout) but requestDone
                 // keeps blocking on input → Process never returns → goroutine

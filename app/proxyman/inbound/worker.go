@@ -350,17 +350,6 @@ func (c *udpConn) Close() error {
                 c.outboundConn = nil
         }
         c.outboundMu.Unlock()
-        // v26.11.231: Close the persistent pooledConn too. Without this,
-        // per-connection pool sockets (0-length SCID / Chrome h3) are never
-        // closed when Chrome's QUIC connection ends. They accumulate → fd
-        // exhaustion → "overwhelmed" → TCP fallback.
-        if c.pooledConnPtr != nil {
-                type closer interface{ Close() error }
-                if pc, ok := c.pooledConnPtr.(closer); ok {
-                        pc.Close()
-                }
-                c.pooledConnPtr = nil
-        }
         return nil
 }
 
@@ -635,9 +624,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 w.RUnlock()
 
                 // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
-                // of h3 failures. If 1-RTT packets are dropped here, the server
-                // never sees them → no reply → Chrome retransmits → eventually
-                // gives up → "Unknown error" → request fails.
                 b.Release()
                 return
         }

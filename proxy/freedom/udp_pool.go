@@ -54,9 +54,6 @@ type pooledSocket struct {
         // v26.11.158: Track all pooledConns so readLoop can check
         // if a pooledConn is closed before sending to its inbox.
         conns []*pooledConn
-        // v26.11.216: shortHeaderCIDLen learned from the first connection's
-        // Initial SCID length. For Chrome (0-length SCID), this is 0.
-        shortHeaderCIDLen atomic.Int32
         // v26.11.217: lastActiveInbox is the inbox of the connection that
         // most recently sent a packet via WriteTo. When a reply arrives with
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
@@ -190,9 +187,7 @@ func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
 }
 
 func (p *UDPSocketPool) startReaper() {
-        // v26.11.230: Run every 30 seconds (was 2 minutes). Per-connection
-        // sockets for 0-length SCID need prompt cleanup to avoid fd exhaustion.
-        p.reaper = time.NewTicker(30 * time.Second)
+        p.reaper = time.NewTicker(2 * time.Minute)
         go func() {
                 for range p.reaper.C {
                         p.evictStale()
@@ -215,34 +210,18 @@ func (p *UDPSocketPool) evictStale() {
         // the source port stability. The socket is wildcard-bound and
         // receives from any IP — it should never be evicted.
         //
-        // v26.11.230: For per-connection sockets (0-length SCID, keyed by
-        // ":port:sourcePort"), evict if idle for > 2 minutes with refCount=0.
-        // These sockets are created per Chrome connection and must be cleaned
-        // up when the connection closes. Without this, idle sockets accumulate
-        // → fd exhaustion → "overwhelmed" → TCP fallback.
+        // Only evict if the socket is dead AND refCount == 0 (truly abandoned).
         p.mu.Lock()
         defer p.mu.Unlock()
-        nowNano := time.Now().UnixNano()
-        idleThreshold := int64(2 * time.Minute)
         for key, sock := range p.sockets {
                 sock.mu.Lock()
                 isDead := sock.dead && sock.refCount == 0
-                // v26.11.230: Per-connection sockets (key contains ":") can be
-                // evicted when idle. Shared sockets (key = ":port") are never evicted.
-                isIdlePerConn := false
-                if strings.Count(key, ":") >= 2 && sock.refCount == 0 {
-                        lastUsed := sock.lastUsed.Load()
-                        if nowNano-lastUsed > idleThreshold {
-                                isIdlePerConn = true
-                        }
-                }
                 sock.mu.Unlock()
 
-                if isDead || isIdlePerConn {
+                if isDead {
                         sock.MarkStale()
                         delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted socket for ", key,
-                                " reason=", func() string { if isDead { return "dead" }; return "idle" }())
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted dead socket for ", key)
                 }
         }
 }
@@ -277,28 +256,8 @@ func destKey(dest *stdnet.UDPAddr) string {
         return fmt.Sprintf(":%d", dest.Port)
 }
 
-// v26.11.229: destKeyWithSource creates a per-connection pool key for
-// 0-length SCID connections (Chrome h3). These connections CANNOT be
-// demuxed by DCID on a shared socket (all replies have DCID=∅). Giving
-// each connection its own socket means each has its own source port,
-// and server replies arrive on the correct socket — zero demux needed.
-// The key includes the Chrome source port to distinguish connections.
-func destKeyWithSource(dest *stdnet.UDPAddr, sourcePort int) string {
-        return fmt.Sprintf(":%d:%d", dest.Port, sourcePort)
-}
-
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
-        return p.acquireWithKey(dest, destKey(dest))
-}
-
-// v26.11.229: AcquireWithSource creates a per-connection pool socket
-// keyed by dest port + Chrome source port. Used for 0-length SCID
-// connections (Chrome h3) that can't be demuxed on a shared socket.
-func (p *UDPSocketPool) AcquireWithSource(dest *stdnet.UDPAddr, sourcePort int) (*pooledConn, error) {
-        return p.acquireWithKey(dest, destKeyWithSource(dest, sourcePort))
-}
-
-func (p *UDPSocketPool) acquireWithKey(dest *stdnet.UDPAddr, key string) (*pooledConn, error) {
+        key := destKey(dest)
 
         p.mu.Lock()
         sock, ok := p.sockets[key]
@@ -421,14 +380,6 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                // v26.11.246: Revert to v213's simple ParseDCID for ALL packets.
-                // The shortHeaderCIDLen approach (v216+) broke YouTube because:
-                // 1. atomic.Int32 starts at 0, not -1, so the fallback check was wrong
-                // 2. Even with the fix, h3 connections set it to 0, corrupting YouTube's parsing
-                // 3. ParseDCID defaults to DefaultShortHeaderCIDLen=8, which is correct for YouTube
-                // 4. For h3 (0-length SCID), ParseDCID reads 8 garbage bytes → demux miss
-                //    → lastActiveInbox fallback → correct routing
-                // So just use ParseDCID for everything, like v213 did.
                 dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
                         putPacket(packet)
@@ -474,8 +425,13 @@ func (s *pooledSocket) readLoop() {
                         }
                 }
                 if !ok {
-                        // SCID fallback for long headers: server's reply SCID =
-                        // client's Initial DCID, which was registered in WriteTo.
+                        // FIX: SCID-based fallback for 0-length SCID clients
+                        // (Chrome/Edge). The server's reply DCID = client's SCID
+                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
+                        // 0-length). But per RFC 9000 §7.3, the server's reply
+                        // SCID = client's Initial DCID, which WAS registered in
+                        // WriteTo. Parse the SCID and try demux[scid] as a
+                        // fallback before dropping.
                         if n > 0 && packet[0]&0x80 != 0 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
@@ -625,11 +581,12 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
-        // v26.11.216: Register 0-length CIDs too. Chrome uses 0-length SCID.
-        // The server's reply has DCID = client's SCID = ∅. We need demux[∅]
-        // to route the reply. This is safe because with port-only keying,
-        // there's typically one connection per pool socket at handshake time.
-        // When a new Initial arrives (different DCID), it overwrites demux[∅].
+        if len(cid) == 0 {
+                return
+        }
+        // v26.10.16-link: use zero-alloc dcidKey for both the scids set
+        // and the demux map. Eliminates hex.EncodeToString per SCID
+        // registration (was 1 string alloc; now zero).
         dk := makeDCIDKey(cid)
 
         // v26.10.15-link: atomic closed check avoids acquiring mu
@@ -677,22 +634,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // mutex acquire for 99% of packets in a long-lived QUIC
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
-                if scid, _, err := parseQUICSCID(b); err == nil {
-                        // v26.11.217: Don't register 0-length SCIDs in demux —
-                        // they collide across connections. Instead, set lastActiveInbox
-                        // so the readLoop can route DCID=∅ replies to the most recently
-                        // active connection.
-                        if len(scid) > 0 {
-                                c.RegisterCID(scid)
-                        }
-                        // v26.11.246: Removed shortHeaderCIDLen.Store — reverted to v213's
-                        // ParseDCID which always uses DefaultShortHeaderCIDLen=8.
-                        // v26.11.217: Update lastActiveInbox on every WriteTo call
-                        // v26.11.235: Also update lastActiveSource for NotifyServerSCID
-                        c.socket.mu.Lock()
-                        c.socket.lastActiveInbox = c.inbox
-                        c.socket.lastActiveSource = c.source
-                        c.socket.mu.Unlock()
+                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
+                        c.RegisterCID(scid)
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
@@ -702,10 +645,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // dropped. By registering the DCID, the readLoop's
                 // SCID-based fallback can route the reply by looking up
                 // demux[serverSCID] = demux[clientDCID].
-                if dcid, _, err := quic.ParseDCID(b); err == nil {
-                        if len(dcid) > 0 {
-                                c.RegisterCID(dcid)
-                        }
+                if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
+                        c.RegisterCID(dcid)
                 }
         }
 
@@ -718,25 +659,28 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 dest = udp
         }
         n, err := c.socket.conn.WriteTo(b, dest)
-        if err != nil {
-                if !isTransientWriteError(err) {
-                        c.socket.MarkDead()
-                }
-        }
         // v26.11.239: Update lastActiveInbox and lastActiveSource on EVERY
         // WriteTo call, not just long headers. This is critical for 1-RTT
         // packets (short headers): the readLoop needs the current inbox
-        // and source to route DCID=∅ replies. Without this, 1-RTT packets
-        // from one connection's WriteTo don't update lastActiveSource →
-        // NotifyServerSCID fires with stale source → server SCID registered
-        // with wrong Chrome port → 1-RTT replies routed to wrong connection
-        // → fall through to 127.0.0.1:443 → TCP fallback.
+        // and source to route DCID=∅ replies.
         c.socket.mu.Lock()
         c.socket.lastActiveInbox = c.inbox
         if c.source != nil {
                 c.socket.lastActiveSource = c.source
         }
         c.socket.mu.Unlock()
+        if err != nil {
+                // v26.10.15-link: only mark the socket dead on persistent
+                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
+                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
+                // will retry or the route will come back. Killing the socket
+                // on a transient error would kill all 50+ QUIC sessions
+                // sharing this socket, which is much worse than dropping one
+                // packet.
+                if !isTransientWriteError(err) {
+                        c.socket.MarkDead()
+                }
+        }
         // v26.11.212: update activity timer
         if c.onActivity != nil {
                 c.onActivity()
@@ -745,9 +689,11 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
-        // v26.11.238: Revert to 30s per-read timeout. The 2-minute hard deadline
-        // (v237) caused alternating good/bad results because it fired mid-test,
-        // closing BufferedPacketReader → inbox fills up → packets dropped.
+        // v26.11.208: Add 30-second timeout. If no reply in 30s, return EOF.
+        // This makes BufferedPacketReader's readLoop exit, which makes
+        // responseDone return, which makes Process return. Without this,
+        // abandoned QUIC connections (Shorts swiping) keep their readLoop
+        // alive forever — goroutine leak that stalls new connections.
         timer := time.NewTimer(30 * time.Second)
         defer timer.Stop()
         select {
@@ -1000,11 +946,7 @@ func isQUICLongHeader(b []byte) bool {
         if len(b) < 1 {
                 return false
         }
-        // v26.11.214: Support both QUIC v1 (0xc0) and v2 (0x80) long headers.
-        // QUIC v1: bit 7=1 (long header), bit 6=1 (fixed bit)
-        // QUIC v2: bit 7=1 (long header), bit 6=0 (fixed bit inverted per RFC 9369)
-        // Both have bit 7=1 for long header.
-        return b[0]&0x80 != 0
+        return b[0]&0x80 != 0 && b[0]&0x40 != 0
 }
 
 // ============================================================
@@ -1037,7 +979,7 @@ type BufferedPacketReader struct {
 func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
         r := &BufferedPacketReader{
                 base:   base,
-                buffer: make(chan buf.MultiBuffer, 1024), // v26.11.236: was 256, increased to reduce backpressure
+                buffer: make(chan buf.MultiBuffer, 256),
                 done:   make(chan struct{}),
         }
         go r.readLoop()
@@ -1070,13 +1012,12 @@ func (r *BufferedPacketReader) readLoop() {
                         buf.ReleaseMulti(mb)
                         return
                 default:
-                        // v26.11.236: DON'T drop oldest — BLOCK instead.
-                        // Dropping old packets causes Chrome to see packet loss
-                        // → declares path degraded → connection breaks after
-                        // ~52 requests. Blocking is better: the readLoop waits
-                        // for the buffer to drain, which naturally applies
-                        // backpressure. If the inbox fills up because of this,
-                        // the readLoop drops at the inbox level (which IS logged).
+                        // Buffer full — drop oldest to make room
+                        select {
+                        case old := <-r.buffer:
+                                buf.ReleaseMulti(old)
+                        default:
+                        }
                         select {
                         case r.buffer <- mb:
                         case <-r.done:
