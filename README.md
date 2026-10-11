@@ -133,39 +133,39 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
 
 ```
                           UDP/QUIC packet flow
-  ┌────────┐  QUIC Initial   ┌──────────────────────────────┐   QUIC Initial   ┌────────┐
+  ┌────────┐  QUIC Initial   ┌───────────────────────────────┐   QUIC Initial  ┌────────┐
   │ Chrome │ ──────────────> │ VPS xray inbound (UDP :443)   │ ──────────────> │ Google │
-  │ 0-SCID │  1-RTT data    │   udpWorker.callback()       │   (via pool)    │  CDN   │
-  └────────┘ <───────────── │   ├─ dcidIndex/srcIndex       │ <─────────────  └────────┘
-     ▲      QUIC reply      │   ├─ udpConn (per-flow)       │   QUIC reply       │
-     │                      │   └─ proxy.Process(ctx,UDP)  │                    │
-     │                      └────────────┬─────────────────┘                    │
-     │                      ┌────────────┴─────────────────┐                    │
-     │                      │ freedom.Process              │                    │
-     │                      │  ├─ peek packet → QUIC?       │                    │
-     │                      │  ├─ socketPool.Acquire(:443)  │ ── pooledConn ──┐  │
-     │                      │  │    (ONE socket for ALL)    │                │  │
-     │                      │  ├─ requestDone:             │                │  │
-     │                      │  │    buf.Copy(input,writer)  │ ── WriteTo ──> │  │
-     │                      │  └─ responseDone:             │                │  │
-     │                      │       buf.Copy(reader,output) │ <─ ReadFrom ──┘  │
-     │                      │       → BufferedPacketReader │  (30s timeout)   │
-     │                      │         └─ readLoop goroutine │                   │
-     │                      │            (drains inbox even │                   │
-     │                      │             when Process away)│                   │
-     │                      └──────────────┬───────────────┘                    │
-     │                                     │                                    │
-     │            ┌────────────────────────┘                                    │
-     │            v                                                             │
-     │  ┌─────────────────────────────────────────────────┐                     │
-     │  │ pooledSocket (shared by ALL connections to :443) │                     │
-     │  │  ├─ conn: net.PacketConn (outbound, wildcard)    │ ───── WriteTo ───> │
-     │  │  ├─ demux: map[dcidKey]chan readResult          │                     │
-     │  │  ├─ demuxSource: map[dcidKey]*UDPAddr           │ <──── ReadFrom ─── │
-     │  │  └─ readLoop() goroutine:                       │   (parse DCID,     │
-     │  │      for { ReadFrom → ParseDCID → demux → inbox}│    demux → inbox)  │
-     │  └─────────────────────────────────────────────────┘                     │
-     └──────────────────── QUIC reply delivered to Chrome ──────────────────────┘
+  │ 0-SCID │  1-RTT data     │   udpWorker.callback()        │   (via pool)    │  CDN   │
+  └────────┘ <─────────────  │   ├─ dcidIndex/srcIndex       │ <─────────────  └────────┘
+     ▲      QUIC reply       │   ├─ udpConn (per-flow)       │   QUIC reply        │
+     │                       │   └─ proxy.Process(ctx,UDP)   │                     │
+     │                       └────────────┬──────────────────┘                     │
+     │                       ┌────────────┴──────────────────┐                     │
+     │                       │ freedom.Process               │                     │
+     │                       │  ├─ peek packet → QUIC?       │                     │
+     │                       │  ├─ socketPool.Acquire(:443)  │ ── pooledConn ──┐   │
+     │                       │  │    (ONE socket for ALL)    │                 │   │
+     │                       │  ├─ requestDone:              │                 │   │
+     │                       │  │    buf.Copy(input,writer)  │ ── WriteTo ───> │   │
+     │                       │  └─ responseDone:             │                 │   │
+     │                       │       buf.Copy(reader,output) │ <─ ReadFrom ────┘   │
+     │                       │       → BufferedPacketReader  │  (30s timeout)      │
+     │                       │         └─ readLoop goroutine │                     │
+     │                       │            (drains inbox even │                     │
+     │                       │             when Process away)│                     │
+     │                       └──────────────┬────────────────┘                     │
+     │                                      │                                      │
+     │             ┌────────────────────────┘                                      │
+     │             v                                                               │
+     │  ┌──────────────────────────────────────────────────┐                       │
+     │  │ pooledSocket (shared by ALL connections to :443) │                       │
+     │  │  ├─ conn: net.PacketConn (outbound, wildcard)    │ ───── WriteTo ───>    │
+     │  │  ├─ demux: map[dcidKey]chan readResult           │                       │
+     │  │  ├─ demuxSource: map[dcidKey]*UDPAddr            │ <──── ReadFrom ───    │
+     │  │  └─ readLoop() goroutine:                        │   (parse DCID,        │
+     │  │      for { ReadFrom → ParseDCID → demux → inbox} │    demux → inbox)     │
+     │  └──────────────────────────────────────────────────┘                       │
+     └──────────────────── QUIC reply delivered to Chrome ─────────────────────────┘
 ```
 
 ### Lifecycle of one QUIC flow
