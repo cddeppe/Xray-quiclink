@@ -218,6 +218,13 @@ func (c *udpConn) updateActivity() {
         atomic.StoreInt64(&c.lastActivityTime, time.Now().Unix())
 }
 
+// v26.11.212: UpdateActivity is an exported wrapper for updateActivity.
+// Called by pooledConn.onActivity when data flows through the pool path.
+// This keeps clean() from retiring active connections.
+func (c *udpConn) UpdateActivity() {
+        c.updateActivity()
+}
+
 // v26.11.196: GetOutboundConn returns the persistent outbound conn (to Google).
 // Called by freedom.Process to check if a previous Process call left a conn
 // that can be reused (keeping the source port stable).

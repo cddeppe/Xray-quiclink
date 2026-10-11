@@ -730,6 +730,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 if setter, ok := inbound.Conn.(interface{ SetPooledConn(interface{}) }); ok {
                                                         setter.SetPooledConn(pconn)
                                                 }
+                                                // v26.11.212: Wire up activity callback so clean()
+                                                // doesn't retire active connections. Without this,
+                                                // BufferedPacketReader and PooledPacketWriter bypass
+                                                // udpConn.Write/Read, so lastActivityTime is never
+                                                // updated and clean() retires after sessionIdleTimeout.
+                                                if updater, ok := inbound.Conn.(interface{ UpdateActivity() }); ok {
+                                                        pconn.onActivity = updater.UpdateActivity
+                                                }
                                         }
                                 }
                         }

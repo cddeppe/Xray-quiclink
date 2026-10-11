@@ -115,6 +115,13 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+        // v26.11.212: onActivity is called when data flows through this conn
+        // (both WriteTo and ReadFrom). Set by freedom.Process to update the
+        // inbound udpConn's lastActivityTime, preventing clean() from retiring
+        // active connections. Without this, clean() sees no activity updates
+        // (because BufferedPacketReader and PooledPacketWriter bypass
+        // udpConn.Write/Read) and retires connections after sessionIdleTimeout.
+        onActivity func()
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -628,6 +635,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.MarkDead()
                 }
         }
+        // v26.11.212: update activity timer
+        if c.onActivity != nil {
+                c.onActivity()
+        }
         return n, err
 }
 
@@ -646,6 +657,10 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
                 }
                 n := copy(p, rr.data)
                 putPacket(rr.data)
+                // v26.11.212: update activity timer
+                if c.onActivity != nil {
+                        c.onActivity()
+                }
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
