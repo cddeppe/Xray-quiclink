@@ -441,15 +441,29 @@ func (s *pooledSocket) readLoop() {
                 // inbox is full (nobody reading), the packet is dropped (QUIC
                 // retransmits). No lock needed.
                 sentOk := false
-                packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
-                select {
-                case ch <- readResult{data: packetToSend, addr: addr}:
+                packetToSend := packet[:n]
+                panicked := false
+                func() {
+                    defer func() {
+                        if r := recover(); r != nil {
+                            panicked = true
+                            s.droppedReplies.Add(1)
+                            putPacket(packet)
+                        }
+                    }()
+                    select {
+                    case ch <- readResult{data: packetToSend, addr: addr}:
                         sentOk = true
-                default:
+                    default:
                         s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
                         putPacket(packet)
+                    }
+                }()
+                if panicked {
+                    s.mu.Lock()
+                    delete(s.demux, dk)
+                    delete(s.demuxSource, dk)
+                    s.mu.Unlock()
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
@@ -661,22 +675,19 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
-        // v26.11.160: RESTORE demux cleanup. The original code only deleted
-        // entries where existing == c.inbox (this pooledConn's own entries).
-        // It did NOT delete other connections' entries. This is safe and
-        // necessary — without it, stale entries accumulate and the readLoop
-        // wastes time sending to dead inboxes.
-        c.mu.Lock()
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
-
+        // v26.11.198: DON'T delete DCIDs from the socket's demux map on Close.
+        // When Process returns (video switch), pooledConn.Close() fires. If we
+        // delete the DCID, Google's in-flight replies for that DCID (retransmissions,
+        // ACKs) are silently dropped by readLoop (demux miss). Chrome's QUIC stack
+        // never receives ACKs → declares path dead → falls back to TCP after ~25s.
+        //
+        // Fix: leave the DCID in the demux map as a stale entry. The inbox channel
+        // is closed (close(c.done) above), so readLoop's send will panic — but we
+        // recover from the panic and silently drop the packet. When a new connection
+        // registers the same DCID, the stale entry is overwritten.
+        //
+        // We still need to release the socket's refCount so the reaper can close
+        // it when it's truly unused.
         c.socket.release()
         return nil
 }
