@@ -450,11 +450,6 @@ func (s *pooledSocket) readLoop() {
                 // per reply packet.
                 dk := makeDCIDKey(dcid)
 
-                // v26.11.215: Debug log for demux lookup
-                xrayerrors.LogInfo(context.Background(), "DIAG: readLoop reply dcidLen=", len(dcid),
-                        " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
-                        " demuxSize=", len(s.demux))
-
                 // v26.10.16-link: use RLock for the demux read path (was
                 // Lock, blocking all RegisterCID calls which need write
                 // locks). The demux map is only mutated by RegisterCID
@@ -486,11 +481,6 @@ func (s *pooledSocket) readLoop() {
                                 if li != nil {
                                         ch = li
                                         ok = true
-                                } else {
-                                        // v26.11.232 DIAG: lastActiveInbox is nil — replies will be dropped
-                                        xrayerrors.LogError(context.Background(), "DIAG v232: DCID=empty reply but lastActiveInbox=nil demuxSize=", len(s.demux),
-                                                " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
-                                                " isLong=", n > 0 && packet[0]&0x80 != 0)
                                 }
                         }
                 }
@@ -507,10 +497,6 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if !ok {
-                                // v26.11.232 DIAG: reply packet DROPPED
-                                xrayerrors.LogError(context.Background(), "DIAG v232: reply DROPPED dcidLen=", len(dcid),
-                                        " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
-                                        " demuxSize=", len(s.demux))
                                 putPacket(packet)
                                 continue
                         }
@@ -540,12 +526,6 @@ func (s *pooledSocket) readLoop() {
                         sentOk = true
                     default:
                         s.droppedReplies.Add(1)
-                        // v26.11.240: Log inbox-full drops. These are the SILENT
-                        // drops that cause Chrome to see packet loss → declare
-                        // connection degraded → fall back to TCP after 20-55s.
-                        xrayerrors.LogError(context.Background(), "DIAG v240: INBOX FULL — packet dropped! dcidLen=", len(dcid),
-                            " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
-                            " demuxSize=", len(s.demux))
                         putPacket(packet)
                     }
                 }()
@@ -733,9 +713,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // SCID-based fallback can route the reply by looking up
                 // demux[serverSCID] = demux[clientDCID].
                 if dcid, _, err := quic.ParseDCID(b); err == nil {
-                        xrayerrors.LogError(context.Background(), "DIAG: WriteTo register DCID len=", len(dcid),
-                                " scidLen=", func() int { if s, _, _ := parseQUICSCID(b); s != nil { return len(s) }; return 0 }(),
-                                " firstByte=0x", fmt.Sprintf("%02x", b[0]))
                         if len(dcid) > 0 {
                                 c.RegisterCID(dcid)
                         }
