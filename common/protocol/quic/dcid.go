@@ -133,11 +133,9 @@ func ParseSCID(packet []byte) ([]byte, bool, error) {
         }
         firstByte := packet[0]
 
-        // Long header: bit 7 = 1, bit 6 = 1 (fixed bit in QUIC v1/v2).
+        // Long header: bit 7 = 1.
+        // v26.11.214: Accept QUIC v2 (bit 6=0) as well as v1 (bit 6=1).
         if firstByte&0x80 != 0 {
-                if firstByte&0x40 == 0 {
-                        return nil, true, ErrNotQUIC
-                }
                 if len(packet) >= 5 && binary.BigEndian.Uint32(packet[1:5]) == VersionNegotiation {
                         return nil, true, ErrNotQUIC
                 }
