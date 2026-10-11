@@ -4,6 +4,7 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strings"
@@ -662,6 +663,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         mb, peekErr := input.ReadMultiBuffer()
                         if peekErr == nil && len(mb) > 0 {
                                 peekedPackets = mb
+                                // v26.11.215: Debug log to see first byte of peeked packet
+                                firstByte := byte(0)
+                                if len(mb[0].Bytes()) > 0 {
+                                        firstByte = mb[0].Bytes()[0]
+                                }
+                                errors.LogWarning(context.Background(), "DIAG: peek firstByte=0x", fmt.Sprintf("%02x", firstByte),
+                                        " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
+                                        " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
