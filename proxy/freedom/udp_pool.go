@@ -620,8 +620,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // dropped. By registering the DCID, the readLoop's
                 // SCID-based fallback can route the reply by looking up
                 // demux[serverSCID] = demux[clientDCID].
-                if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
-                        c.RegisterCID(dcid)
+                if dcid, _, err := quic.ParseDCID(b); err == nil {
+                        xrayerrors.LogInfo(context.Background(), "DIAG: WriteTo register DCID len=", len(dcid),
+                                " scidLen=", func() int { if s, _, _ := parseQUICSCID(b); s != nil { return len(s) }; return 0 }(),
+                                " firstByte=0x", fmt.Sprintf("%02x", b[0]))
+                        if len(dcid) > 0 {
+                                c.RegisterCID(dcid)
+                        }
                 }
         }
 
