@@ -695,8 +695,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         // active connection.
                         if len(scid) > 0 {
                                 c.RegisterCID(scid)
+                                // v26.11.244: Only set shortHeaderCIDLen for non-zero SCIDs.
+                                // For 0-length SCID (Chrome h3), setting it to 0 overwrites
+                                // YouTube's value of 8 on the shared socket → YouTube's 1-RTT
+                                // replies get parsed with CIDLen=0 → DCID=∅ → demux miss →
+                                // replies lost → YouTube breaks!
+                                c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         }
-                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         // v26.11.217: Update lastActiveInbox on every WriteTo call
                         // v26.11.235: Also update lastActiveSource for NotifyServerSCID
                         c.socket.mu.Lock()
