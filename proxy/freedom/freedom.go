@@ -872,6 +872,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 // keeps blocking on input → Process never returns → goroutine
                 // never restarts → new packets from Chrome go to the dead pipe → stall.
                 cancel()
+                // v26.11.210: Also directly interrupt the input pipe. cancel() alone
+                // doesn't work because buf.Copy(input, writer) blocks on
+                // input.ReadMultiBuffer() which doesn't check context. We need to
+                // explicitly interrupt the pipe.
+                common.Interrupt(input)
                 return nil
         }
 
