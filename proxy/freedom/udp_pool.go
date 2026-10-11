@@ -433,8 +433,19 @@ func (s *pooledSocket) readLoop() {
                 } else {
                         // Short header — use learned CID length
                         cidLen := int(s.shortHeaderCIDLen.Load())
-                        if cidLen < 0 {
-                                // Not learned yet — fall back to default
+                        // v26.11.244: cidLen=0 means "not learned yet" (atomic zero value)
+                        // OR "Chrome 0-length SCID". Both should use the default (8) for
+                        // parsing — YouTube's 1-RTT replies have DCID=8 bytes, and Chrome's
+                        // 1-RTT replies have DCID=0 bytes (which ParseShortHeaderDCIDWithLen
+                        // with cidLen=8 will read as 8 garbage bytes, but demux will miss
+                        // and fall through to lastActiveInbox).
+                        //
+                        // The key insight: for YouTube, cidLen must be 8 (correct DCID parsing).
+                        // For Chrome h3, cidLen=8 reads 8 garbage bytes → demux miss →
+                        // lastActiveInbox fallback → correct routing.
+                        // cidLen=0 reads 0 bytes → DCID=∅ → also lastActiveInbox fallback.
+                        // Both work, but cidLen=8 is correct for YouTube and doesn't break h3.
+                        if cidLen == 0 {
                                 cidLen = quic.DefaultShortHeaderCIDLen
                         }
                         // v26.11.216: cidLen can be 0 (Chrome uses 0-length SCID).
