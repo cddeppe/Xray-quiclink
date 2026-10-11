@@ -632,17 +632,24 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
+        // v26.11.208: Add 30-second timeout. If no reply in 30s, return EOF.
+        // This makes BufferedPacketReader's readLoop exit, which makes
+        // responseDone return, which makes Process return. Without this,
+        // abandoned QUIC connections (Shorts swiping) keep their readLoop
+        // alive forever — goroutine leak that stalls new connections.
+        timer := time.NewTimer(30 * time.Second)
+        defer timer.Stop()
         select {
         case rr, ok := <-c.inbox:
                 if !ok {
                         return 0, nil, io.EOF
                 }
                 n := copy(p, rr.data)
-                // v26.10.42-link (audit P3): return the pooled buffer
-                // after copying the data out.
                 putPacket(rr.data)
                 return n, rr.addr, nil
         case <-c.done:
+                return 0, nil, io.EOF
+        case <-timer.C:
                 return 0, nil, io.EOF
         }
 }
