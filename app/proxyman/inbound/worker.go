@@ -1070,18 +1070,18 @@ func (w *udpWorker) clean() error {
                 if nowSec-atomic.LoadInt64(&conn.lastActivityTime) > udptimeout.SessionIdleSeconds() {
                         if !conn.inactive {
                                 conn.setInactive()
-                                // v26.10.42-link (audit H2 from 2-b): delete ALL
-                                // dcidIndex entries pointing to this conn, not just
-                                // the latest DCID. CID rotation may have created
-                                // multiple dcidIndex entries for the same conn.
-                                // The old code only deleted conn.dcid (the latest),
-                                // leaving orphaned entries for rotated-away DCIDs.
-                                connID := addr
-                                for dk, dcidConnID := range w.dcidIndex {
-                                        if dcidConnID == connID {
-                                                delete(w.dcidIndex, dk)
-                                        }
-                                }
+                                // v26.11.213: DON'T delete dcidIndex entries.
+                                // When Chrome comes back after being away, it sends 1-RTT short
+                                // headers with the old DCID. If dcidIndex is empty, callback()
+                                // creates a new connection, peeks the short header, skips the
+                                // pool (isQUICLongHeader=false), dials a new socket with a new
+                                // source port → Google sees migration → stall.
+                                // By keeping dcidIndex entries, Chrome's old DCID routes to the
+                                // existing udpConn, which restarts the goroutine and reuses the
+                                // same pool socket (same source port).
+                                // dcidIndex entries are cleaned up when the pool socket itself
+                                // is eventually replaced (which never happens with port-only
+                                // keying) or when a new Initial overwrites them.
                                 delete(w.srcIndex, addr.srcKey)
                                 delete(w.activeConn, addr)
                         }
