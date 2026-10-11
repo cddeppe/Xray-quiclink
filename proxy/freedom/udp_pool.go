@@ -187,25 +187,23 @@ func (p *UDPSocketPool) Close() {
 }
 
 func (p *UDPSocketPool) evictStale() {
+        // v26.11.207: Don't evict the shared socket. With port-only keying,
+        // there's only ONE socket for all QUIC traffic. Evicting it kills
+        // the source port stability. The socket is wildcard-bound and
+        // receives from any IP — it should never be evicted.
+        //
+        // Only evict if the socket is dead AND refCount == 0 (truly abandoned).
         p.mu.Lock()
         defer p.mu.Unlock()
         for key, sock := range p.sockets {
                 sock.mu.Lock()
-                isDead := sock.dead
-                // v26.10.43-link (audit P5): atomic reads for timestamps
-                isIdle := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.idleTimeout && sock.refCount > 0
-                isUnused := time.Since(time.Unix(0, sock.lastUsed.Load())) > p.unusedTimeout && sock.refCount == 0
+                isDead := sock.dead && sock.refCount == 0
                 sock.mu.Unlock()
 
-                if isDead || isIdle || isUnused {
-                        // v26.10.34-link (H1 fix): use MarkStale (not MarkDead) so
-                        // sockets with active sessions (refCount > 0) keep their
-                        // conn alive. MarkDead would close s.conn and kill all
-                        // sessions sharing it — the exact regression v26.10.28
-                        // fixed for the Acquire path but missed in the reaper.
+                if isDead {
                         sock.MarkStale()
                         delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted stale socket for ", key)
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted dead socket for ", key)
                 }
         }
 }
