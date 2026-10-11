@@ -746,17 +746,24 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
-                // v26.10.15-link: only mark the socket dead on persistent
-                // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
-                // ENETUNREACH, ECONNREFUSED) are recoverable — the kernel
-                // will retry or the route will come back. Killing the socket
-                // on a transient error would kill all 50+ QUIC sessions
-                // sharing this socket, which is much worse than dropping one
-                // packet.
                 if !isTransientWriteError(err) {
                         c.socket.MarkDead()
                 }
         }
+        // v26.11.239: Update lastActiveInbox and lastActiveSource on EVERY
+        // WriteTo call, not just long headers. This is critical for 1-RTT
+        // packets (short headers): the readLoop needs the current inbox
+        // and source to route DCID=∅ replies. Without this, 1-RTT packets
+        // from one connection's WriteTo don't update lastActiveSource →
+        // NotifyServerSCID fires with stale source → server SCID registered
+        // with wrong Chrome port → 1-RTT replies routed to wrong connection
+        // → fall through to 127.0.0.1:443 → TCP fallback.
+        c.socket.mu.Lock()
+        c.socket.lastActiveInbox = c.inbox
+        if c.source != nil {
+                c.socket.lastActiveSource = c.source
+        }
+        c.socket.mu.Unlock()
         // v26.11.212: update activity timer
         if c.onActivity != nil {
                 c.onActivity()
