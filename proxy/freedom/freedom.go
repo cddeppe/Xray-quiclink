@@ -881,6 +881,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // BufferedPacketReader for the same pooledConn's inbox.
                         defer bpr.Close()
                 } else {
+                        // v26.11.222: Wrap per-session reader with a 30-second timeout.
+                        // Without this, conn.ReadFrom() blocks forever and Process
+                        // never returns — the goroutine gets stuck and Chrome
+                        // falls back to TCP after ~2000 requests. The pool path
+                        // has this timeout in pooledConn.ReadFrom; the per-session
+                        // path needs it too.
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                         // v26.11.117: Wrap reader to detect server SCID from
                         // long-header replies. When Google's Initial reply
@@ -897,6 +903,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
+                        reader = &timeoutPacketReader{base: reader, conn: conn, timeout: 30 * time.Second}
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)

@@ -1232,3 +1232,25 @@ func (r *BufferedPacketReader) Close() error {
                 }
         }
 }
+
+// v26.11.222: timeoutPacketReader wraps a buf.Reader with a per-read deadline.
+// Before each ReadMultiBuffer call, it sets a read deadline on the underlying
+// net.Conn. If no data arrives within the timeout, ReadFrom returns a timeout
+// error, which makes buf.Copy exit, which makes responseDone exit, which makes
+// Process return. The goroutine restarts on the next packet, reusing the
+// persisted conn (via SetOutboundConn).
+//
+// This is the per-session-path equivalent of pooledConn.ReadFrom's 30-second
+// timeout. Without it, conn.ReadFrom() blocks forever and Process gets stuck.
+type timeoutPacketReader struct {
+        base    buf.Reader
+        conn    stdnet.Conn
+        timeout time.Duration
+}
+
+func (r *timeoutPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        if r.conn != nil {
+                _ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
+        }
+        return r.base.ReadMultiBuffer()
+}
