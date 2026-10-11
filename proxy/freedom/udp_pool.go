@@ -934,21 +934,12 @@ func (r *BufferedPacketReader) readLoop() {
                 }
                 mb, err := r.base.ReadMultiBuffer()
                 if err != nil {
-                        // Underlying reader returned error (EOF, closed, etc.)
-                        // Push the error to the buffer so ReadMultiBuffer returns it
-                        select {
-                        case r.buffer <- mb:
-                        case <-r.done:
-                                return
-                        }
+                        // v26.11.211: Don't push nil mb to buffer on error.
+                        // Just exit — the error will be returned by ReadMultiBuffer
+                        // on the next call (buffer is empty, r.done is closed).
                         if mb != nil {
                                 buf.ReleaseMulti(mb)
                         }
-                        // If err is EOF or similar, stop the loop
-                        if errors.Is(err, io.EOF) {
-                                return
-                        }
-                        // For other errors, also stop (the conn is dead)
                         return
                 }
                 if mb == nil || len(mb) == 0 {

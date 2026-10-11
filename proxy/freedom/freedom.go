@@ -843,7 +843,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // readLoop keeps draining the inbox — Google's replies are buffered
                         // and delivered when the goroutine restarts. Without this, the
                         // inbox fills up and replies are dropped → stall at ~10 seconds.
-                        reader = NewBufferedPacketReader(NewPooledPacketReader(pconn))
+                        bpr := NewBufferedPacketReader(NewPooledPacketReader(pconn))
+                        reader = bpr
+                        // v26.11.211: Close BufferedPacketReader when responseDone exits.
+                        // Without this, the readLoop competes with the new Process's
+                        // BufferedPacketReader for the same pooledConn's inbox.
+                        defer bpr.Close()
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                         // v26.11.117: Wrap reader to detect server SCID from
