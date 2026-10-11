@@ -184,7 +184,9 @@ func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
 }
 
 func (p *UDPSocketPool) startReaper() {
-        p.reaper = time.NewTicker(2 * time.Minute)
+        // v26.11.230: Run every 30 seconds (was 2 minutes). Per-connection
+        // sockets for 0-length SCID need prompt cleanup to avoid fd exhaustion.
+        p.reaper = time.NewTicker(30 * time.Second)
         go func() {
                 for range p.reaper.C {
                         p.evictStale()
@@ -207,18 +209,34 @@ func (p *UDPSocketPool) evictStale() {
         // the source port stability. The socket is wildcard-bound and
         // receives from any IP — it should never be evicted.
         //
-        // Only evict if the socket is dead AND refCount == 0 (truly abandoned).
+        // v26.11.230: For per-connection sockets (0-length SCID, keyed by
+        // ":port:sourcePort"), evict if idle for > 2 minutes with refCount=0.
+        // These sockets are created per Chrome connection and must be cleaned
+        // up when the connection closes. Without this, idle sockets accumulate
+        // → fd exhaustion → "overwhelmed" → TCP fallback.
         p.mu.Lock()
         defer p.mu.Unlock()
+        nowNano := time.Now().UnixNano()
+        idleThreshold := int64(2 * time.Minute)
         for key, sock := range p.sockets {
                 sock.mu.Lock()
                 isDead := sock.dead && sock.refCount == 0
+                // v26.11.230: Per-connection sockets (key contains ":") can be
+                // evicted when idle. Shared sockets (key = ":port") are never evicted.
+                isIdlePerConn := false
+                if strings.Count(key, ":") >= 2 && sock.refCount == 0 {
+                        lastUsed := sock.lastUsed.Load()
+                        if nowNano-lastUsed > idleThreshold {
+                                isIdlePerConn = true
+                        }
+                }
                 sock.mu.Unlock()
 
-                if isDead {
+                if isDead || isIdlePerConn {
                         sock.MarkStale()
                         delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted dead socket for ", key)
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted socket for ", key,
+                                " reason=", func() string { if isDead { return "dead" }; return "idle" }())
                 }
         }
 }
