@@ -881,12 +881,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // BufferedPacketReader for the same pooledConn's inbox.
                         defer bpr.Close()
                 } else {
-                        // v26.11.222: Wrap per-session reader with a 30-second timeout.
-                        // Without this, conn.ReadFrom() blocks forever and Process
-                        // never returns — the goroutine gets stuck and Chrome
-                        // falls back to TCP after ~2000 requests. The pool path
-                        // has this timeout in pooledConn.ReadFrom; the per-session
-                        // path needs it too.
+                        // v26.11.223: Wrap per-session reader with BOTH a timeout
+                        // AND BufferedPacketReader — exactly like the pool path.
+                        //
+                        // The timeout makes Process return after 30s of inactivity
+                        // (so the goroutine doesn't get stuck). But when Process
+                        // returns, nobody reads from conn → kernel UDP buffer fills
+                        // → server replies are DROPPED → Chrome sees packet loss
+                        // → ~1000/3000 failures.
+                        //
+                        // BufferedPacketReader fixes this: its readLoop keeps
+                        // draining the underlying reader (via timeoutPacketReader)
+                        // even after Process returns. When Process restarts, the
+                        // buffered replies are immediately available — no loss.
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                         // v26.11.117: Wrap reader to detect server SCID from
                         // long-header replies. When Google's Initial reply
@@ -904,6 +911,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 }
                         }
                         reader = &timeoutPacketReader{base: reader, conn: conn, timeout: 30 * time.Second}
+                        // v26.11.223: Wrap with BufferedPacketReader so replies
+                        // are continuously drained even when Process isn't running.
+                        bpr := NewBufferedPacketReader(reader)
+                        reader = bpr
+                        defer bpr.Close()
                 }
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
