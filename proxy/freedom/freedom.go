@@ -383,6 +383,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         destination := ob.Target
+        // v26.11.233 DIAG: unconditional log at Process entry
+        errors.LogWarning(context.Background(), "DIAG v233: Process ENTER net=", destination.Network, " dest=", destination)
         origTargetAddr := ob.OriginalTarget.Address
         if origTargetAddr == nil {
                 origTargetAddr = ob.Target.Address
