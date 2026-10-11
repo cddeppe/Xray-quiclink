@@ -379,6 +379,11 @@ func (s *pooledSocket) readLoop() {
                 // per reply packet.
                 dk := makeDCIDKey(dcid)
 
+                // v26.11.215: Debug log for demux lookup
+                xrayerrors.LogInfo(context.Background(), "DIAG: readLoop reply dcidLen=", len(dcid),
+                        " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
+                        " demuxSize=", len(s.demux))
+
                 // v26.10.16-link: use RLock for the demux read path (was
                 // Lock, blocking all RegisterCID calls which need write
                 // locks). The demux map is only mutated by RegisterCID
