@@ -132,7 +132,7 @@ No hot-path overhead — one nil check + one atomic store per packet (~5ns).
 ## Packet Flow
 
 ```
-                          UDP/QUIC packet flow
+                                   UDP/QUIC packet flow
   ┌────────┐  QUIC Initial   ┌───────────────────────────────┐   QUIC Initial  ┌────────┐
   │ Chrome │ ──────────────> │ VPS xray inbound (UDP :443)   │ ──────────────> │ Google │
   │ 0-SCID │  1-RTT data     │   udpWorker.callback()        │   (via pool)    │  CDN   │
