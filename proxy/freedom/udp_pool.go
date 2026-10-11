@@ -250,36 +250,16 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 ok = false
         }
         if ok {
-                // STALENESS CHECK: If the socket hasn't received a reply in 60 seconds,
-                // assume the CDN edge rotated and is silently dropping packets.
-                // Mark it dead and force the creation of a fresh socket for this request.
+                // v26.11.206: REMOVED staleness check. With port-only keying, the
+                // pool socket is shared across ALL Google IPs. If one connection
+                // is idle, the staleness check would mark the shared socket stale,
+                // killing ALL connections. The socket is wildcard-bound and receives
+                // from any source IP — staleness is irrelevant.
+                nowNano := time.Now().UnixNano()
+                sock.lastUsed.Store(nowNano)
                 sock.mu.Lock()
-                // v26.10.43-link (audit P5): atomic read
-                isStale := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.stalenessTimeout
+                sock.refCount++
                 sock.mu.Unlock()
-                if isStale {
-                        // v26.10.42-link (audit C1): use MarkStale instead of
-                        // manually setting dead=true. MarkStale closes s.conn
-                        // when refCount==0, preventing the FD+goroutine leak
-                        // that occurred when refCount hit 0 after this point
-                        // (release() checks s.dead but the conn was never
-                        // closed because we bypassed MarkStale's close logic).
-                        sock.MarkStale()
-                        delete(p.sockets, key)
-                        ok = false
-                } else {
-                        // v26.10.26-link: only increment refCount if the socket
-                        // is alive. Previously this ran even after MarkDead+delete,
-                        // orphaning the dead socket with refCount > 0.
-                        // v26.10.43-link (audit P5): init atomic timestamps
-                        nowNano := time.Now().UnixNano()
-                        sock.lastUsed.Store(nowNano)
-                        sock.lastReplyTime.Store(nowNano) // v26.10.26: init to now, not zero
-                        sock.mu.Lock()
-                        sock.refCount++
-                        sock.lastUsed.Store(nowNano)
-                        sock.mu.Unlock()
-                }
         }
         p.mu.Unlock()
 
