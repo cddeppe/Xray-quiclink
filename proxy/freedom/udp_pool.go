@@ -647,19 +647,27 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 return 0, io.EOF
         }
 
-        // v26.11.218: For 0-length SCID connections (Chrome h3), migrate to a
+        // v26.11.219: For 0-length SCID connections (Chrome h3), migrate to a
         // dedicated per-connection socket. This gives each connection its own
         // source port, so dedicatedReadLoop delivers ALL replies to this conn's
         // inbox — no demux, no lastActiveInbox race.
         // YouTube (non-zero SCID) stays on the shared socket with DCID demux.
         // Both work simultaneously.
         if c.dedicatedPC == nil && !c.dedicatedStarted.Load() && len(b) > 0 && b[0]&0x80 != 0 {
-                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) == 0 {
-                        c.migrateToDedicated()
+                if scid, _, err := parseQUICSCID(b); err == nil {
+                        xrayerrors.LogInfo(context.Background(), "v26.11.219 DIAG: WriteTo first-long-header scidLen=", len(scid),
+                                " dcidLen=", func() int { if d, _, e := quic.ParseDCID(b); e == nil { return len(d) }; return -1 }(),
+                                " firstByte=0x", fmt.Sprintf("%02x", b[0]),
+                                " willMigrate=", len(scid) == 0)
+                        if len(scid) == 0 {
+                                c.migrateToDedicated()
+                        }
+                } else {
+                        xrayerrors.LogInfo(context.Background(), "v26.11.219 DIAG: parseQUICSCID error on first long header: ", err)
                 }
         }
 
-        // v26.11.218: If on a dedicated socket, send via it — no demux, no CID
+        // v26.11.219: If on a dedicated socket, send via it — no demux, no CID
         // registration, no lastActiveInbox. The dedicatedReadLoop handles all
         // incoming packets for this connection.
         if c.dedicatedPC != nil {
@@ -782,6 +790,7 @@ func (c *pooledConn) migrateToDedicated() {
 // routed to the right inbox.
 func (c *pooledConn) dedicatedReadLoop() {
         b := make([]byte, 65535)
+        var pktCount int64
         for {
                 select {
                 case <-c.done:
@@ -793,7 +802,13 @@ func (c *pooledConn) dedicatedReadLoop() {
                         if isTransientReadError(err) {
                                 continue
                         }
+                        xrayerrors.LogInfo(context.Background(), "v26.11.219 DIAG: dedicatedReadLoop EXIT after pkts=", pktCount, " err=", err)
                         return
+                }
+                pktCount++
+                if pktCount <= 3 || pktCount%100 == 0 {
+                        xrayerrors.LogInfo(context.Background(), "v26.11.219 DIAG: dedicatedReadLoop recv pkt#", pktCount,
+                                " len=", n, " firstByte=0x", fmt.Sprintf("%02x", b[0]))
                 }
                 packet := getPacket()
                 copy(packet, b[:n])
