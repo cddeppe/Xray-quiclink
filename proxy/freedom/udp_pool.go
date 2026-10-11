@@ -3,6 +3,7 @@ package freedom
 import (
         "context"
         "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strconv"
@@ -210,31 +211,33 @@ func (p *UDPSocketPool) evictStale() {
 }
 
 // InvalidateByIP marks all pool sockets to the given IP as stale.
-// Called by the sticky resolver when it refreshes DNS and gets a new
-// IP — the old IP's pool sockets should be evicted so new connections
-// use the fresh IP.
-//
-// v26.10.27-link: closes the gap between sticky resolver TTL (60s)
-// and pool staleness (300s). Previously, when the resolver got a new
-// IP, existing pool sockets to the old IP stayed alive for up to 5
-// minutes, sending QUIC retransmits into a black hole.
+// v26.11.204: Since we now key by port only (not IP), this is a no-op.
+// The shared socket handles all IPs — invalidating by IP would kill
+// connections to other Google IPs sharing the same socket.
 func (p *UDPSocketPool) InvalidateByIP(ip string) {
-        p.mu.Lock()
-        for key, sock := range p.sockets {
-                if strings.HasPrefix(key, ip+":") || strings.HasPrefix(key, "["+ip+"]:") {
-                        // v26.10.42-link (audit C1): use MarkStale instead of
-                        // manually setting dead=true. Prevents the FD+goroutine
-                        // leak when refCount reaches 0 after invalidation.
-                        sock.MarkStale()
-                        delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: invalidated socket for ", key, " (IP changed)")
-                }
-        }
-        p.mu.Unlock()
+        // v26.11.204: No-op — pool is keyed by port, not IP.
+        // The shared socket handles all Google IPs. DNS rotation doesn't
+        // require socket invalidation because the socket is wildcard-bound
+        // and receives replies from any source IP.
 }
 
 func destKey(dest *stdnet.UDPAddr) string {
-        return dest.String()
+        // v26.11.204: Key by PORT ONLY, not by full dest IP:port.
+        // This makes ALL QUIC traffic to port 443 share ONE pool socket
+        // with ONE source port. Google sees the same source port regardless
+        // of which CDN edge IP it is — no path validation, no stall on
+        // video switching.
+        //
+        // The DCID-based demux handles routing replies to the correct
+        // connection. The readLoop receives from ALL source IPs on the
+        // wildcard-bound socket, parses the DCID, and routes to the correct
+        // inbox. This is safe because QUIC DCIDs are globally unique.
+        //
+        // Previously this was dest.String() which created a separate socket
+        // per Google IP. Chrome switches videos → different googlevideo.com
+        // subdomain → different IP → different socket → different source
+        // port → Google sees connection migration → path validation → stall.
+        return fmt.Sprintf(":%d", dest.Port)
 }
 
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
