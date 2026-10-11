@@ -805,7 +805,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 if destination.Network == net.Network_TCP {
                         reader = buf.NewReader(conn)
                 } else if pooledConn != nil {
-                        reader = NewPooledPacketReader(pooledConn)
+                        // v26.11.201: Wrap PooledPacketReader with BufferedPacketReader.
+                        // This decouples the pool's inbox from Process. When Process
+                        // returns (video switch, CID rotation), the BufferedPacketReader's
+                        // readLoop keeps draining the inbox — Google's replies are buffered
+                        // and delivered when the goroutine restarts. Without this, the
+                        // inbox fills up and replies are dropped → stall at ~10 seconds.
+                        reader = NewBufferedPacketReader(NewPooledPacketReader(pooledConn))
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                         // v26.11.117: Wrap reader to detect server SCID from

@@ -898,3 +898,121 @@ func isQUICLongHeader(b []byte) bool {
         }
         return b[0]&0x80 != 0 && b[0]&0x40 != 0
 }
+
+// ============================================================
+// v26.11.201: BufferedPacketReader — decouples pool inbox from Process
+// ============================================================
+//
+// This is the missing piece from the v196 binary. Without it, when Process
+// returns (video switch, CID rotation, timer fires), responseDone stops
+// reading from PooledPacketReader → nobody drains pooledConn.inbox → inbox
+// fills up (256 cap) → readLoop drops replies (non-blocking send) → Chrome
+// never gets ACKs → stall at ~10 seconds.
+//
+// BufferedPacketReader wraps PooledPacketReader with a readLoop goroutine
+// that continuously drains the underlying reader into an internal buffer.
+// When Process returns and responseDone stops, the readLoop keeps running —
+// Google's replies keep being consumed and buffered. When the goroutine
+// restarts and a new Process starts, the new responseDone reads from the
+// buffer, getting all the accumulated replies — no stall.
+//
+// The buffer is a buf.MultiBuffer channel with large capacity (256) to
+// absorb bursts of replies during the Process gap.
+
+type BufferedPacketReader struct {
+        base    buf.Reader      // underlying PooledPacketReader
+        buffer  chan buf.MultiBuffer
+        done    chan struct{}
+        closed  atomic.Bool
+}
+
+func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
+        r := &BufferedPacketReader{
+                base:   base,
+                buffer: make(chan buf.MultiBuffer, 256),
+                done:   make(chan struct{}),
+        }
+        go r.readLoop()
+        return r
+}
+
+func (r *BufferedPacketReader) readLoop() {
+        for {
+                select {
+                case <-r.done:
+                        return
+                default:
+                }
+                mb, err := r.base.ReadMultiBuffer()
+                if err != nil {
+                        // Underlying reader returned error (EOF, closed, etc.)
+                        // Push the error to the buffer so ReadMultiBuffer returns it
+                        select {
+                        case r.buffer <- mb:
+                        case <-r.done:
+                                return
+                        }
+                        if mb != nil {
+                                buf.ReleaseMulti(mb)
+                        }
+                        // If err is EOF or similar, stop the loop
+                        if errors.Is(err, io.EOF) {
+                                return
+                        }
+                        // For other errors, also stop (the conn is dead)
+                        return
+                }
+                if mb == nil || len(mb) == 0 {
+                        continue
+                }
+                select {
+                case r.buffer <- mb:
+                case <-r.done:
+                        buf.ReleaseMulti(mb)
+                        return
+                default:
+                        // Buffer full — drop oldest to make room
+                        select {
+                        case old := <-r.buffer:
+                                buf.ReleaseMulti(old)
+                        default:
+                        }
+                        select {
+                        case r.buffer <- mb:
+                        case <-r.done:
+                                buf.ReleaseMulti(mb)
+                                return
+                        }
+                }
+        }
+}
+
+func (r *BufferedPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        select {
+        case mb, ok := <-r.buffer:
+                if !ok || len(mb) == 0 {
+                        return nil, io.EOF
+                }
+                return mb, nil
+        case <-r.done:
+                return nil, io.EOF
+        }
+}
+
+func (r *BufferedPacketReader) Close() error {
+        if !r.closed.CompareAndSwap(false, true) {
+                return nil
+        }
+        close(r.done)
+        // Drain and release any buffered packets
+        for {
+                select {
+                case mb := <-r.buffer:
+                        if mb != nil {
+                                buf.ReleaseMulti(mb)
+                        }
+                default:
+                        return nil
+                }
+        }
+}
