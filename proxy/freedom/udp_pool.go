@@ -637,6 +637,17 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
                         c.RegisterCID(scid)
                 }
+                // v26.11.217: Set lastActiveInbox and lastActiveSource during
+                // long headers only (Initial/Handshake). This avoids per-packet
+                // mutex contention on 1-RTT packets. For YouTube (non-zero SCID),
+                // DCID demux always matches, so lastActiveInbox is never used.
+                // For h3 (0-length SCID), lastActiveInbox routes DCID=∅ replies.
+                c.socket.mu.Lock()
+                c.socket.lastActiveInbox = c.inbox
+                if c.source != nil {
+                        c.socket.lastActiveSource = c.source
+                }
+                c.socket.mu.Unlock()
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
                 // 0-length SCID clients (Chrome/Edge), RegisterCID(scid)
@@ -659,16 +670,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 dest = udp
         }
         n, err := c.socket.conn.WriteTo(b, dest)
-        // v26.11.239: Update lastActiveInbox and lastActiveSource on EVERY
-        // WriteTo call, not just long headers. This is critical for 1-RTT
-        // packets (short headers): the readLoop needs the current inbox
-        // and source to route DCID=∅ replies.
-        c.socket.mu.Lock()
-        c.socket.lastActiveInbox = c.inbox
-        if c.source != nil {
-                c.socket.lastActiveSource = c.source
-        }
-        c.socket.mu.Unlock()
         if err != nil {
                 // v26.10.15-link: only mark the socket dead on persistent
                 // errors. Transient errors (EAGAIN, ENOBUFS, EHOSTUNREACH,
