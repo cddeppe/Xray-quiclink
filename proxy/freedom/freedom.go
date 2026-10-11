@@ -597,10 +597,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
-                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
-                // Store the outbound conn in udpConn for reuse across Process
-                // restarts. Keeps source port stable → no Google path validation.
+        } else if destination.Network != net.Network_TCP {
+                // v26.11.221: Persist UDP conn across Process restarts for ALL UDP paths
+                // (not just non-pool). For pool path (YouTube), conn is created but not
+                               // used for data (pconn is used) — persisted harmlessly. For 0-length
+                // SCID (h3), pconn is nil so conn IS used for data, and persisting it
+                // keeps the source port stable → no reply loss on Process restart.
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -608,6 +610,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }); ok {
                                 existingConn := udpConn.GetOutboundConn()
                                 if existingConn != nil {
+                                        conn.Close()
                                         conn = existingConn
                                         errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
                                 } else {
@@ -672,11 +675,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
-                                        // v26.11.220: Let 0-length SCID connections enter the pool.
-                                        // The pool's WriteTo detects 0-length SCID and migrates to a
-                                        // dedicated per-connection socket (v26.11.218 migrateToDedicated).
-                                        // This keeps the socket alive across Process restarts (unlike
-                                        // the per-session path which closes on Process return).
+                                        // v26.11.221: Skip pool for 0-length SCID (Chrome h3).
+                                        // These connections use the per-session socket (persisted via
+                                        // SetOutboundConn above). The per-session socket has its own
+                                        // source port and ReadFrom directly — no demux needed.
+                                        // YouTube (non-zero SCID) enters the pool with DCID demux.
+                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
+                                        if scidErr == nil && len(scid) == 0 {
+                                                errors.LogWarning(context.Background(), "DIAG: 0-length SCID — using per-session socket (persisted)")
+                                        } else
+                                        {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -755,10 +763,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        // v26.11.220: If not QUIC, pconn stays nil (per-session path)
+                        // v26.11.221: If not QUIC or 0-length SCID, pconn stays nil
                 }
                 }
                 // If peek failed, proceed with existing path (pconn stays nil).
+        }
         }
 
         var newCtx context.Context
