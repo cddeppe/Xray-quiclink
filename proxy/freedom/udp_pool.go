@@ -421,37 +421,15 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                // v26.11.216: Use shortHeaderCIDLen for short headers instead
-                // of the default 8. Chrome uses 0-length SCID, so the server's
-                // 1-RTT replies have DCID=∅ (0 bytes). ParseDCID defaults to 8,
-                // reading garbage. With shortHeaderCIDLen=0, we read 0 bytes
-                // → demux[∅] → matches the 0-length SCID registration.
-                var dcid []byte
-                if n > 0 && packet[0]&0x80 != 0 {
-                        // Long header — DCID length is in the packet
-                        dcid, _, err = quic.ParseDCID(packet[:n])
-                } else {
-                        // Short header — use learned CID length
-                        cidLen := int(s.shortHeaderCIDLen.Load())
-                        // v26.11.244: cidLen=0 means "not learned yet" (atomic zero value)
-                        // OR "Chrome 0-length SCID". Both should use the default (8) for
-                        // parsing — YouTube's 1-RTT replies have DCID=8 bytes, and Chrome's
-                        // 1-RTT replies have DCID=0 bytes (which ParseShortHeaderDCIDWithLen
-                        // with cidLen=8 will read as 8 garbage bytes, but demux will miss
-                        // and fall through to lastActiveInbox).
-                        //
-                        // The key insight: for YouTube, cidLen must be 8 (correct DCID parsing).
-                        // For Chrome h3, cidLen=8 reads 8 garbage bytes → demux miss →
-                        // lastActiveInbox fallback → correct routing.
-                        // cidLen=0 reads 0 bytes → DCID=∅ → also lastActiveInbox fallback.
-                        // Both work, but cidLen=8 is correct for YouTube and doesn't break h3.
-                        if cidLen == 0 {
-                                cidLen = quic.DefaultShortHeaderCIDLen
-                        }
-                        // v26.11.216: cidLen can be 0 (Chrome uses 0-length SCID).
-                        // Don't fall back to 8 when cidLen=0 — that reads garbage.
-                        dcid, _, err = quic.ParseShortHeaderDCIDWithLen(packet[:n], cidLen)
-                }
+                // v26.11.246: Revert to v213's simple ParseDCID for ALL packets.
+                // The shortHeaderCIDLen approach (v216+) broke YouTube because:
+                // 1. atomic.Int32 starts at 0, not -1, so the fallback check was wrong
+                // 2. Even with the fix, h3 connections set it to 0, corrupting YouTube's parsing
+                // 3. ParseDCID defaults to DefaultShortHeaderCIDLen=8, which is correct for YouTube
+                // 4. For h3 (0-length SCID), ParseDCID reads 8 garbage bytes → demux miss
+                //    → lastActiveInbox fallback → correct routing
+                // So just use ParseDCID for everything, like v213 did.
+                dcid, _, err := quic.ParseDCID(packet[:n])
                 if err != nil {
                         putPacket(packet)
                         continue
@@ -706,13 +684,9 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         // active connection.
                         if len(scid) > 0 {
                                 c.RegisterCID(scid)
-                                // v26.11.244: Only set shortHeaderCIDLen for non-zero SCIDs.
-                                // For 0-length SCID (Chrome h3), setting it to 0 overwrites
-                                // YouTube's value of 8 on the shared socket → YouTube's 1-RTT
-                                // replies get parsed with CIDLen=0 → DCID=∅ → demux miss →
-                                // replies lost → YouTube breaks!
-                                c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         }
+                        // v26.11.246: Removed shortHeaderCIDLen.Store — reverted to v213's
+                        // ParseDCID which always uses DefaultShortHeaderCIDLen=8.
                         // v26.11.217: Update lastActiveInbox on every WriteTo call
                         // v26.11.235: Also update lastActiveSource for NotifyServerSCID
                         c.socket.mu.Lock()
