@@ -540,6 +540,12 @@ func (s *pooledSocket) readLoop() {
                         sentOk = true
                     default:
                         s.droppedReplies.Add(1)
+                        // v26.11.240: Log inbox-full drops. These are the SILENT
+                        // drops that cause Chrome to see packet loss → declare
+                        // connection degraded → fall back to TCP after 20-55s.
+                        xrayerrors.LogError(context.Background(), "DIAG v240: INBOX FULL — packet dropped! dcidLen=", len(dcid),
+                            " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
+                            " demuxSize=", len(s.demux))
                         putPacket(packet)
                     }
                 }()
