@@ -57,11 +57,13 @@ type pooledSocket struct {
         // v26.11.216: shortHeaderCIDLen learned from the first connection's
         // Initial SCID length. For Chrome (0-length SCID), this is 0.
         shortHeaderCIDLen atomic.Int32
-        // v26.11.217: lastActiveInbox is the inbox of the connection that
-        // most recently sent a packet via WriteTo. When a reply arrives with
-        // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
-        // of using demux[∅] (which would collide across connections).
-        lastActiveInbox chan<- readResult
+        // v26.11.227: lastActiveInboxByDest is keyed by server IP:port.
+        // When Chrome uses 0-length SCID, server 1-RTT replies have DCID=∅.
+        // We route these by which connection most recently sent to that
+        // server IP:port. This is much more accurate than the old single
+        // lastActiveInbox (which raced between connections to DIFFERENT servers).
+        // For YouTube (non-zero SCID), DCID demux works and this map isn't used.
+        lastActiveInboxByDest map[string]chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -287,13 +289,14 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 }
 
                 sock = &pooledSocket{
-                        conn:          pc,
-                        dest:          dest,
-                        demux:         make(map[dcidKey]chan<- readResult),
-                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
-                        closed:        make(chan struct{}),
-                        lastUsed:      atomic.Int64{},
-                        lastReplyTime: atomic.Int64{},
+                        conn:                   pc,
+                        dest:                   dest,
+                        demux:                  make(map[dcidKey]chan<- readResult),
+                        demuxSource:            make(map[dcidKey]*stdnet.UDPAddr),
+                        lastActiveInboxByDest:  make(map[string]chan<- readResult),
+                        closed:                 make(chan struct{}),
+                        lastUsed:               atomic.Int64{},
+                        lastReplyTime:          atomic.Int64{},
                 }
                 xrayerrors.LogInfo(context.Background(), "udp_pool: NEW socket created for key=", key, " localAddr=", pc.LocalAddr())
 
@@ -431,17 +434,26 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
-                        // instead of demux[∅]. This avoids collisions when multiple
-                        // connections share the pool socket (all Chrome connections
-                        // have 0-length SCID → all replies have DCID=∅).
+                        // v26.11.227: If DCID is empty (0-length), route by source IP:port.
+                        // Chrome's 0-length SCID → server 1-RTT replies have DCID=∅.
+                        // We route these to the connection that most recently sent to
+                        // this server IP:port. This is much more accurate than the old
+                        // single lastActiveInbox (which raced between connections to
+                        // DIFFERENT servers). For YouTube (non-zero SCID), DCID demux
+                        // already matched and this code is never reached.
                         if len(dcid) == 0 {
-                                s.mu.RLock()
-                                li := s.lastActiveInbox
-                                s.mu.RUnlock()
-                                if li != nil {
-                                        ch = li
-                                        ok = true
+                                var srcKey string
+                                if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
+                                        srcKey = udpAddr.IP.String() + ":" + strconv.Itoa(udpAddr.Port)
+                                }
+                                if srcKey != "" {
+                                        s.mu.RLock()
+                                        li := s.lastActiveInboxByDest[srcKey]
+                                        s.mu.RUnlock()
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
+                                        }
                                 }
                         }
                 }
@@ -640,18 +652,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
                 if scid, _, err := parseQUICSCID(b); err == nil {
-                        // v26.11.217: Don't register 0-length SCIDs in demux —
-                        // they collide across connections. Instead, set lastActiveInbox
-                        // so the readLoop can route DCID=∅ replies to the most recently
-                        // active connection.
+                        // v26.11.227: Don't register 0-length SCIDs in demux —
+                        // they collide across connections. DCID=∅ replies are
+                        // routed by lastActiveInboxByDest (updated below).
                         if len(scid) > 0 {
                                 c.RegisterCID(scid)
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
-                        // v26.11.217: Update lastActiveInbox on every WriteTo call
-                        c.socket.mu.Lock()
-                        c.socket.lastActiveInbox = c.inbox
-                        c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
@@ -678,6 +685,20 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         dest := c.socket.dest
         if udp, ok := addr.(*stdnet.UDPAddr); ok {
                 dest = udp
+        }
+        // v26.11.227: Update lastActiveInboxByDest on EVERY WriteTo (not just
+        // long headers). This maps the destination IP:port to this connection's
+        // inbox. When a server 1-RTT reply arrives with DCID=∅ from this IP:port,
+        // the readLoop routes it to this inbox. This fixes the h3 multi-connection
+        // race: Chrome opens multiple connections to the same h3 server, but each
+        // WriteTo updates the map to the most recent writer. In practice, Chrome
+        // sends requests sequentially on each connection, so the reply for the
+        // last writer is the correct destination.
+        if dest != nil {
+                destKeyStr := dest.IP.String() + ":" + strconv.Itoa(dest.Port)
+                c.socket.mu.Lock()
+                c.socket.lastActiveInboxByDest[destKeyStr] = c.inbox
+                c.socket.mu.Unlock()
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
