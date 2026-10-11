@@ -682,18 +682,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // v26.11.229: For 0-length SCID (Chrome h3), use a
-                                        // per-connection pool socket keyed by Chrome's source port.
-                                        // This gives each connection its own source port, so server
-                                        // replies (DCID=∅) arrive on the correct socket — no demux
-                                        // needed. For non-zero SCID (YouTube), use shared socket.
-                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
-                                        inbound := session.InboundFromContext(ctx)
-                                        if scidErr == nil && len(scid) == 0 && inbound != nil && inbound.Source.IsValid() {
-                                                pconn, err = h.socketPool.AcquireWithSource(udpRemote, int(inbound.Source.Port))
-                                        } else {
-                                                pconn, err = h.socketPool.Acquire(udpRemote)
-                                        }
+                                        // v26.11.242: Use shared socket for ALL QUIC traffic
+                                        // (including 0-length SCID / Chrome h3).
+                                        // Per-connection sockets (v229) caused the server to see
+                                        // different source ports → connection migration → degraded.
+                                        // The shared socket uses ONE source port for ALL connections,
+                                        // same as YouTube. DCID=∅ replies use lastActiveInbox.
+                                        pconn, err = h.socketPool.Acquire(udpRemote)
                                         errors.LogError(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pconn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets
