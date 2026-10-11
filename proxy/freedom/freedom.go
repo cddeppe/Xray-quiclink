@@ -672,12 +672,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
-                                        // v26.11.218: Skip pool for 0-length SCID (Chrome to h3 test sites)
-                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
-                                        if scidErr == nil && len(scid) == 0 {
-                                                errors.LogWarning(context.Background(), "DIAG: 0-length SCID — using per-session socket")
-                                        } else
-                                        {
+                                        // v26.11.220: Let 0-length SCID connections enter the pool.
+                                        // The pool's WriteTo detects 0-length SCID and migrates to a
+                                        // dedicated per-connection socket (v26.11.218 migrateToDedicated).
+                                        // This keeps the socket alive across Process restarts (unlike
+                                        // the per-session path which closes on Process return).
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -756,8 +755,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
-                        } // close else (pool path)
-                        // If not QUIC or 0-length SCID, pconn stays nil
+                        // v26.11.220: If not QUIC, pconn stays nil (per-session path)
                 }
                 }
                 // If peek failed, proceed with existing path (pconn stays nil).
