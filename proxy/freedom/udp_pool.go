@@ -765,20 +765,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
-        // v26.11.237: Use a MAX LIFETIME deadline instead of per-read timeout.
-        // The old 30s per-read timeout never fires because server keeps sending
-        // packets (ACKs, retransmissions, flow control). Process stays alive
-        // forever → zombie goroutines accumulate → second test fails.
-        //
-        // The deadline is reset on EACH successful read, but capped at 2 minutes
-        // total. After 2 minutes, ReadFrom returns EOF → Process returns →
-        // goroutine restarts (pconn is persisted, reused on next packet).
-        //
-        // For YouTube: video chunks download in <2 min, so this never fires.
-        // For h3: connections break after ~1000 requests anyway, so returning
-        // Process is correct cleanup behavior.
-        deadline := time.Now().Add(2 * time.Minute)
-        timer := time.NewTimer(time.Until(deadline))
+        // v26.11.238: Revert to 30s per-read timeout. The 2-minute hard deadline
+        // (v237) caused alternating good/bad results because it fired mid-test,
+        // closing BufferedPacketReader → inbox fills up → packets dropped.
+        timer := time.NewTimer(30 * time.Second)
         defer timer.Stop()
         select {
         case rr, ok := <-c.inbox:
@@ -791,15 +781,10 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
                 if c.onActivity != nil {
                         c.onActivity()
                 }
-                // v26.11.237: Don't reset the timer — use a hard 2-minute deadline
-                // so Process eventually returns even if replies keep arriving.
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
         case <-timer.C:
-                // v26.11.237: 2-minute deadline reached. Return EOF to make Process
-                // return. The pconn is persisted, so the next packet from Chrome
-                // restarts Process and reuses the same socket.
                 return 0, nil, io.EOF
         }
 }
