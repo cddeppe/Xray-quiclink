@@ -200,14 +200,14 @@ type udpConn struct {
         outboundConn   net.Conn
         outboundMu     sync.Mutex
         // v26.11.196: Track whether the Process goroutine is running.
-        // When Process returns, this is set to false. When the next packet
-        // arrives and existing=true, callback checks this — if false, it
-        // restarts the goroutine.
         processRunning atomic.Bool
-        // v26.11.196: The destination (Google IP:port) for the persistent
-        // outbound conn. Stored so the restarted goroutine knows where to
-        // send packets without re-dialing.
         outboundDest net.Destination
+        // v26.11.202: Persistent pooledConn. Survives Process restarts so
+        // short-header (1-RTT) packets after a goroutine restart still use
+        // the pool (same socket, same source port). Without this, the
+        // goroutine restart peeks a short header, skips the pool, and dials
+        // a new socket → stall.
+        pooledConnPtr interface{} // *pooledConn, stored as interface to avoid import cycle
 }
 
 func (c *udpConn) setInactive() {
@@ -237,6 +237,19 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         }
         c.outboundConn = conn
         c.outboundDest = dest
+}
+
+// v26.11.202: GetPooledConn returns the persistent pooledConn.
+// Called by freedom.Process to check if a previous Process call left
+// a pooledConn that can be reused (goroutine restart for short headers).
+func (c *udpConn) GetPooledConn() interface{} {
+        return c.pooledConnPtr
+}
+
+// v26.11.202: SetPooledConn stores the pooledConn for reuse by future
+// Process calls. Called by freedom.Process after creating a pooledConn.
+func (c *udpConn) SetPooledConn(pc interface{}) {
+        c.pooledConnPtr = pc
 }
 
 // v26.11.117: RegisterServerSCID is called by freedom's reader wrapper

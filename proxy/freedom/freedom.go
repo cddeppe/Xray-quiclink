@@ -632,12 +632,31 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         var pooledConn *pooledConn
         var peekedPackets buf.MultiBuffer
         if destination.Network != net.Network_TCP && h.socketPool != nil {
-                // Peek at the first packet(s) to check if this is QUIC traffic.
-                mb, peekErr := input.ReadMultiBuffer()
-                if peekErr == nil && len(mb) > 0 {
-                        peekedPackets = mb
-                        if isQUICLongHeader(mb[0].Bytes()) {
-                                remoteAddr := conn.RemoteAddr()
+                // v26.11.202: Check if the inbound udpConn has a pooledConn from a
+                // previous Process call (goroutine restart). If so, reuse it — this
+                // handles short-header (1-RTT) packets that arrive after Process
+                // returned. Without this, short headers skip the pool → new socket → stall.
+                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                        if getter, ok := inbound.Conn.(interface {
+                                GetPooledConn() interface{}
+                                SetPooledConn(interface{})
+                        }); ok {
+                                if existing := getter.GetPooledConn(); existing != nil {
+                                        if pc, ok := existing.(*PooledPacketReader); ok && pc.conn != nil && !pc.conn.IsClosed() {
+                                                pooledConn = pc.conn
+                                                outGateway = nil
+                                        }
+                                }
+                        }
+                }
+
+                if pooledConn == nil {
+                        // Peek at the first packet(s) to check if this is QUIC traffic.
+                        mb, peekErr := input.ReadMultiBuffer()
+                        if peekErr == nil && len(mb) > 0 {
+                                peekedPackets = mb
+                                if isQUICLongHeader(mb[0].Bytes()) {
+                                        remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
                                         udpRemote = u
@@ -699,10 +718,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                                 pc.RegisterCID(newDCID)
                                                         })
                                                 }
+                                                // v26.11.202: Store the pooledConn for reuse by
+                                                // future Process calls (goroutine restart).
+                                                if setter, ok := inbound.Conn.(interface{ SetPooledConn(interface{}) }); ok {
+                                                        setter.SetPooledConn(pooledConn)
+                                                }
                                         }
                                 }
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
+                }
                 }
                 // If peek failed, proceed with existing path (pooledConn stays nil).
         }
