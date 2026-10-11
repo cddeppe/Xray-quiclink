@@ -596,12 +596,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP {
-                // v26.11.196: For UDP (non-pool path), check if the inbound udpConn
-                // has a persistent outbound conn from a previous Process call. If so,
-                // reuse it instead of dialing a new one. This keeps the source port
-                // stable across Process restarts, preventing Google from seeing a
-                // connection migration (which triggers path validation → stall).
+        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
+                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
+                // Store the outbound conn in udpConn for reuse across Process
+                // restarts. Keeps source port stable → no Google path validation.
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -609,12 +607,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }); ok {
                                 existingConn := udpConn.GetOutboundConn()
                                 if existingConn != nil {
-                                        // Reuse the persistent outbound conn
                                         conn = existingConn
                                         errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
                                 } else {
-                                        // First call — store the conn for reuse by future Process calls
-                                        // We'll set it after the dial succeeds
                                         defer func() {
                                                 udpConn.SetOutboundConn(conn, destination)
                                         }()
