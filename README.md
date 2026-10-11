@@ -81,6 +81,23 @@ When Google stops replying (Chrome swiped away from a Short), `ReadFrom` returns
 
 This makes `requestDone` also return, so `task.Run` completes, Process returns, `processRunning` is set to false, and the goroutine restarts on the next packet.
 
+#### 7. Activity Tracking via onActivity Callback (v26.11.212)
+
+The inbound worker's `clean()` function retires connections after `sessionIdleTimeout` (default 1800s) of inactivity. It checks `udpConn.lastActivityTime`, which is updated by `udpConn.Write()` and `udpConn.ReadMultiBuffer()`.
+
+**Problem:** `BufferedPacketReader` and `PooledPacketWriter` bypass `udpConn.Write/Read` entirely — they go through `pooledConn.WriteTo()` and `pooledConn.ReadFrom()` instead. So `lastActivityTime` was never updated, and `clean()` retired active connections after 30 minutes — causing sudden stalls on videos that had been playing for 30+ minutes.
+
+**Fix:** Added an `onActivity` callback to `pooledConn`. It is called on every `WriteTo` (Chrome sends a packet) and every `ReadFrom` (Google replies). The callback is wired to `udpConn.UpdateActivity()`, which updates `lastActivityTime` via an atomic store. `clean()` now sees the connection as active and doesn't retire it.
+
+The callback is set once during `freedom.Process` when the pooledConn is created:
+```go
+if updater, ok := inbound.Conn.(interface{ UpdateActivity() }); ok {
+    pconn.onActivity = updater.UpdateActivity
+}
+```
+
+No hot-path overhead — one nil check + one atomic store per packet (~5ns).
+
 ---
 
 ## Packet Flow
@@ -244,12 +261,12 @@ This makes `requestDone` also return, so `task.Run` completes, Process returns, 
 
 ```bash
 # AMD64
-wget https://github.com/cddeppe/Xray-quiclink/releases/download/v26.11.211/xray-linux-amd64
+wget https://github.com/cddeppe/Xray-quiclink/releases/download/v26.11.212/xray-linux-amd64
 chmod +x xray-linux-amd64
 mv xray-linux-amd64 /usr/local/bin/xray
 
 # ARM64
-wget https://github.com/cddeppe/Xray-quiclink/releases/download/v26.11.211/xray-linux-arm64
+wget https://github.com/cddeppe/Xray-quiclink/releases/download/v26.11.212/xray-linux-arm64
 chmod +x xray-linux-arm64
 mv xray-linux-arm64 /usr/local/bin/xray
 
@@ -318,7 +335,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o xray-linux-ar
 
 ## Version History
 
-### v26.11.211 (Current — YouTube QUIC Working)
+### v26.11.212 (Current — YouTube QUIC Working + Activity Tracking)
 
 **Base:** v26.11.196 source (commit `2934ea47`)
 
@@ -332,6 +349,7 @@ GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o xray-linux-ar
 | v26.11.208 | 30s ReadFrom timeout — prevents goroutine leak | Fixes Shorts goroutine accumulation |
 | v26.11.209-210 | Cancel context + interrupt input pipe on responseDone exit | Fixes Process deadlock (requestDone never returns) |
 | v26.11.211 | Close BufferedPacketReader on responseDone exit | Fixes competing readLoops for same inbox |
+| v26.11.212 | Activity tracking via onActivity callback | Fixes 30-minute stall (clean() retired active connections) |
 | v26.11.198 | Don't delete DCID on Close | Prevents demux miss for in-flight replies |
 | v26.11.196 | Goroutine restart — Process persists across restarts | Stable source port, no removeConn |
 
@@ -374,6 +392,10 @@ Over 30+ versions, we attempted many approaches before finding the solution:
 
 4. **Socket eviction** — The reaper killed the shared socket based on idle/unused timeouts, creating new sockets with new source ports.
 
+5. **Activity tracking bypass** — BufferedPacketReader and PooledPacketWriter bypassed udpConn.Write/Read, so `lastActivityTime` was never updated. `clean()` retired active connections after `sessionIdleTimeout` (30 min), causing sudden stalls on long videos.
+
+6. **Competing readLoops** — When BufferedPacketReader wasn't closed on responseDone exit, the old readLoop competed with the new Process's readLoop for the same pooledConn's inbox — one got packets, the other blocked, causing random stalls.
+
 ---
 
 ## Known Limitations
@@ -385,6 +407,8 @@ Over 30+ versions, we attempted many approaches before finding the solution:
 3. **30-second timeout on abandoned connections.** When Google stops replying, it takes 30 seconds for the goroutine to clean up. During this time, the BufferedPacketReader's readLoop is blocking on the inbox. This is acceptable — the goroutine is cleaned up and the connection is retired.
 
 4. **CID length defaults to 8 for short headers.** If a QUIC variant uses a different default CID length and the first packet is a short header, the parser will get the wrong CID. In practice, handshakes always start with a long header.
+
+5. **Activity tracking via callback.** The `onActivity` callback fires on every `WriteTo` and `ReadFrom` call. This adds one nil check + one atomic store per packet (~5ns). The callback is set once during Process when the pooledConn is created.
 
 ---
 
