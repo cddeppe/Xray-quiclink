@@ -3,6 +3,7 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        "fmt"
         stdnet "net"
         "sync"
 
@@ -635,6 +636,16 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 w.RUnlock()
 
                 // v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
+                // v26.11.241: Add diagnostic log — this is the suspected root cause
+                // of h3 failures. If 1-RTT packets are dropped here, the server
+                // never sees them → no reply → Chrome retransmits → eventually
+                // gives up → "Unknown error" → request fails.
+                errors.LogError(context.Background(), "DIAG v241: DROP 1-RTT short header — dcidIndex AND srcIndex both missed!",
+                        " dcidLen=", func() int { if d, _, e := quic.ParseDCID(b.Bytes()); e == nil { return len(d) }; return -1 }(),
+                        " firstByte=0x", fmt.Sprintf("%02x", b.Bytes()[0]),
+                        " srcKey.port=", id.srcKey.port,
+                        " dcidIndexSize=", len(w.dcidIndex),
+                        " srcIndexSize=", len(w.srcIndex))
                 b.Release()
                 return
         }
