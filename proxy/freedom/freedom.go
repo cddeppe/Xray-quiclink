@@ -633,10 +633,27 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         // all QUIC sessions sharing a pooled socket collapse to
                                         // the socket's local (kernel-chosen) source and the
                                         // 4-tuple-based reply routing breaks under NAT.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                pooledConn.source = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
+                                        //
+                                        // v26.11.0.18: also capture the inbound's LOCAL port
+                                        // (the port Chrome is sending to — typically 443). This
+                                        // is needed by sendICMPPortUnreachable to build a valid
+                                        // ICMP packet: the embedded UDP dst port must match
+                                        // Chrome's connected peer port, or the kernel won't
+                                        // match the ICMP back to Chrome's socket and Chrome
+                                        // won't see ECONNREFUSED. Using the pool socket's random
+                                        // local port (which is what the previous code did) is
+                                        // WRONG and silently breaks the ICMP fallback.
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil {
+                                                if inbound.Source.IsValid() {
+                                                        pooledConn.source = &stdnet.UDPAddr{
+                                                                IP:   inbound.Source.Address.IP(),
+                                                                Port: int(inbound.Source.Port),
+                                                        }
+                                                }
+                                                if inbound.Local.IsValid() && inbound.Local.Port != 0 {
+                                                        pooledConn.localPort = int(inbound.Local.Port)
+                                                } else {
+                                                        pooledConn.localPort = 443 // sensible default for QUIC/HTTP3
                                                 }
                                         }
                                         defer pooledConn.Close()
