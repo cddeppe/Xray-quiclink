@@ -3,6 +3,7 @@ package freedom
 import (
         "context"
         "errors"
+        "fmt"
         "io"
         stdnet "net"
         "strconv"
@@ -38,24 +39,21 @@ type UDPSocketPool struct {
 }
 
 type pooledSocket struct {
-        mu            sync.RWMutex // v26.10.16-link: RWMutex so readLoop can RLock the demux read
+        mu            sync.RWMutex
         conn          stdnet.PacketConn
         dest          *stdnet.UDPAddr
         refCount      int
-        // v26.10.43-link (audit P5): atomic timestamps to avoid
-        // mutex contention on the readLoop hot path.
-        lastUsed      atomic.Int64 // UnixNano
-        lastReplyTime atomic.Int64  // UnixNano
-        demux         map[dcidKey]chan<- readResult // v26.10.16-link: struct key, zero-alloc
+        lastUsed      atomic.Int64
+        lastReplyTime atomic.Int64
+        demux         map[dcidKey]chan<- readResult
         demuxSource   map[dcidKey]*stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
-        // v26.10.15-link: dropped reply packets counter for observability.
-        // Incremented when the inbox channel (cap 32) is full and the
-        // readLoop drops a reply packet. QUIC will retransmit, but
-        // persistent drops indicate a slow consumer.
         droppedReplies atomic.Int64
+        // v26.11.158: Track all pooledConns so readLoop can check
+        // if a pooledConn is closed before sending to its inbox.
+        conns []*pooledConn
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -117,6 +115,13 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+        // v26.11.212: onActivity is called when data flows through this conn
+        // (both WriteTo and ReadFrom). Set by freedom.Process to update the
+        // inbound udpConn's lastActivityTime, preventing clean() from retiring
+        // active connections. Without this, clean() sees no activity updates
+        // (because BufferedPacketReader and PooledPacketWriter bypass
+        // udpConn.Write/Read) and retires connections after sessionIdleTimeout.
+        onActivity func()
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -189,55 +194,55 @@ func (p *UDPSocketPool) Close() {
 }
 
 func (p *UDPSocketPool) evictStale() {
+        // v26.11.207: Don't evict the shared socket. With port-only keying,
+        // there's only ONE socket for all QUIC traffic. Evicting it kills
+        // the source port stability. The socket is wildcard-bound and
+        // receives from any IP — it should never be evicted.
+        //
+        // Only evict if the socket is dead AND refCount == 0 (truly abandoned).
         p.mu.Lock()
         defer p.mu.Unlock()
         for key, sock := range p.sockets {
                 sock.mu.Lock()
-                isDead := sock.dead
-                // v26.10.43-link (audit P5): atomic reads for timestamps
-                isIdle := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.idleTimeout && sock.refCount > 0
-                isUnused := time.Since(time.Unix(0, sock.lastUsed.Load())) > p.unusedTimeout && sock.refCount == 0
+                isDead := sock.dead && sock.refCount == 0
                 sock.mu.Unlock()
 
-                if isDead || isIdle || isUnused {
-                        // v26.10.34-link (H1 fix): use MarkStale (not MarkDead) so
-                        // sockets with active sessions (refCount > 0) keep their
-                        // conn alive. MarkDead would close s.conn and kill all
-                        // sessions sharing it — the exact regression v26.10.28
-                        // fixed for the Acquire path but missed in the reaper.
+                if isDead {
                         sock.MarkStale()
                         delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted stale socket for ", key)
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted dead socket for ", key)
                 }
         }
 }
 
 // InvalidateByIP marks all pool sockets to the given IP as stale.
-// Called by the sticky resolver when it refreshes DNS and gets a new
-// IP — the old IP's pool sockets should be evicted so new connections
-// use the fresh IP.
-//
-// v26.10.27-link: closes the gap between sticky resolver TTL (60s)
-// and pool staleness (300s). Previously, when the resolver got a new
-// IP, existing pool sockets to the old IP stayed alive for up to 5
-// minutes, sending QUIC retransmits into a black hole.
+// v26.11.204: Since we now key by port only (not IP), this is a no-op.
+// The shared socket handles all IPs — invalidating by IP would kill
+// connections to other Google IPs sharing the same socket.
 func (p *UDPSocketPool) InvalidateByIP(ip string) {
-        p.mu.Lock()
-        for key, sock := range p.sockets {
-                if strings.HasPrefix(key, ip+":") || strings.HasPrefix(key, "["+ip+"]:") {
-                        // v26.10.42-link (audit C1): use MarkStale instead of
-                        // manually setting dead=true. Prevents the FD+goroutine
-                        // leak when refCount reaches 0 after invalidation.
-                        sock.MarkStale()
-                        delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: invalidated socket for ", key, " (IP changed)")
-                }
-        }
-        p.mu.Unlock()
+        // v26.11.204: No-op — pool is keyed by port, not IP.
+        // The shared socket handles all Google IPs. DNS rotation doesn't
+        // require socket invalidation because the socket is wildcard-bound
+        // and receives replies from any source IP.
 }
 
 func destKey(dest *stdnet.UDPAddr) string {
-        return dest.String()
+        // v26.11.204: Key by PORT ONLY, not by full dest IP:port.
+        // This makes ALL QUIC traffic to port 443 share ONE pool socket
+        // with ONE source port. Google sees the same source port regardless
+        // of which CDN edge IP it is — no path validation, no stall on
+        // video switching.
+        //
+        // The DCID-based demux handles routing replies to the correct
+        // connection. The readLoop receives from ALL source IPs on the
+        // wildcard-bound socket, parses the DCID, and routes to the correct
+        // inbox. This is safe because QUIC DCIDs are globally unique.
+        //
+        // Previously this was dest.String() which created a separate socket
+        // per Google IP. Chrome switches videos → different googlevideo.com
+        // subdomain → different IP → different socket → different source
+        // port → Google sees connection migration → path validation → stall.
+        return fmt.Sprintf(":%d", dest.Port)
 }
 
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
@@ -250,36 +255,16 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 ok = false
         }
         if ok {
-                // STALENESS CHECK: If the socket hasn't received a reply in 60 seconds,
-                // assume the CDN edge rotated and is silently dropping packets.
-                // Mark it dead and force the creation of a fresh socket for this request.
+                // v26.11.206: REMOVED staleness check. With port-only keying, the
+                // pool socket is shared across ALL Google IPs. If one connection
+                // is idle, the staleness check would mark the shared socket stale,
+                // killing ALL connections. The socket is wildcard-bound and receives
+                // from any source IP — staleness is irrelevant.
+                nowNano := time.Now().UnixNano()
+                sock.lastUsed.Store(nowNano)
                 sock.mu.Lock()
-                // v26.10.43-link (audit P5): atomic read
-                isStale := time.Since(time.Unix(0, sock.lastReplyTime.Load())) > p.stalenessTimeout
+                sock.refCount++
                 sock.mu.Unlock()
-                if isStale {
-                        // v26.10.42-link (audit C1): use MarkStale instead of
-                        // manually setting dead=true. MarkStale closes s.conn
-                        // when refCount==0, preventing the FD+goroutine leak
-                        // that occurred when refCount hit 0 after this point
-                        // (release() checks s.dead but the conn was never
-                        // closed because we bypassed MarkStale's close logic).
-                        sock.MarkStale()
-                        delete(p.sockets, key)
-                        ok = false
-                } else {
-                        // v26.10.26-link: only increment refCount if the socket
-                        // is alive. Previously this ran even after MarkDead+delete,
-                        // orphaning the dead socket with refCount > 0.
-                        // v26.10.43-link (audit P5): init atomic timestamps
-                        nowNano := time.Now().UnixNano()
-                        sock.lastUsed.Store(nowNano)
-                        sock.lastReplyTime.Store(nowNano) // v26.10.26: init to now, not zero
-                        sock.mu.Lock()
-                        sock.refCount++
-                        sock.lastUsed.Store(nowNano)
-                        sock.mu.Unlock()
-                }
         }
         p.mu.Unlock()
 
@@ -302,6 +287,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
                 }
+                xrayerrors.LogInfo(context.Background(), "udp_pool: NEW socket created for key=", key, " localAddr=", pc.LocalAddr())
 
                 p.mu.Lock()
                 if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
@@ -335,6 +321,10 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
         }
+        // v26.11.158: Track this pooledConn so readLoop can check IsClosed
+        sock.mu.Lock()
+        sock.conns = append(sock.conns, conn)
+        sock.mu.Unlock()
         return conn, nil
 }
 
@@ -432,27 +422,37 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
-                //
-                // The blocking send (v26.10.20) was WRONG for the shared-socket
-                // model: one slow/stale session's full channel would block the
-                // entire readLoop, starving ALL other sessions sharing the same
-                // socket. This made YouTube stalls WORSE when swiping quickly
-                // between videos (many sessions, one stale session blocks all).
-                //
-                // The correct approach for a shared readLoop:
-                // 1. Large channel (256) so drops are rare during bursts
-                // 2. Non-blocking send so one slow session doesn't starve others
-                // 3. Track drops for observability
+                // v26.11.159: Removed IsClosed check — it acquired RLock and
+                // iterated ALL conns per packet, blocking RegisterCID (which
+                // needs Lock). This delayed CID rotation registration, causing
+                // Google's replies with the new DCID to be dropped.
+                // The non-blocking send already handles dead conns: if the
+                // inbox is full (nobody reading), the packet is dropped (QUIC
+                // retransmits). No lock needed.
                 sentOk := false
-                packetToSend := packet[:n] // v26.11.81 fix: slice to actual length
-                select {
-                case ch <- readResult{data: packetToSend, addr: addr}:
+                packetToSend := packet[:n]
+                panicked := false
+                func() {
+                    defer func() {
+                        if r := recover(); r != nil {
+                            panicked = true
+                            s.droppedReplies.Add(1)
+                            putPacket(packet)
+                        }
+                    }()
+                    select {
+                    case ch <- readResult{data: packetToSend, addr: addr}:
                         sentOk = true
-                default:
+                    default:
                         s.droppedReplies.Add(1)
-                        // v26.10.42-link (audit P3): return the pooled buffer
-                        // when the inbox is full and we drop the packet.
                         putPacket(packet)
+                    }
+                }()
+                if panicked {
+                    s.mu.Lock()
+                    delete(s.demux, dk)
+                    delete(s.demuxSource, dk)
+                    s.mu.Unlock()
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
@@ -635,21 +635,36 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.MarkDead()
                 }
         }
+        // v26.11.212: update activity timer
+        if c.onActivity != nil {
+                c.onActivity()
+        }
         return n, err
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
+        // v26.11.208: Add 30-second timeout. If no reply in 30s, return EOF.
+        // This makes BufferedPacketReader's readLoop exit, which makes
+        // responseDone return, which makes Process return. Without this,
+        // abandoned QUIC connections (Shorts swiping) keep their readLoop
+        // alive forever — goroutine leak that stalls new connections.
+        timer := time.NewTimer(30 * time.Second)
+        defer timer.Stop()
         select {
         case rr, ok := <-c.inbox:
                 if !ok {
                         return 0, nil, io.EOF
                 }
                 n := copy(p, rr.data)
-                // v26.10.42-link (audit P3): return the pooled buffer
-                // after copying the data out.
                 putPacket(rr.data)
+                // v26.11.212: update activity timer
+                if c.onActivity != nil {
+                        c.onActivity()
+                }
                 return n, rr.addr, nil
         case <-c.done:
+                return 0, nil, io.EOF
+        case <-timer.C:
                 return 0, nil, io.EOF
         }
 }
@@ -659,29 +674,24 @@ func (c *pooledConn) IsClosed() bool {
 }
 
 func (c *pooledConn) Close() error {
-        // v26.10.15-link: atomic CAS to avoid double-close. The
-        // CAS ensures only one caller proceeds to close(c.done)
-        // and the scids cleanup.
         if !c.closed.CompareAndSwap(false, true) {
                 return nil
         }
         close(c.done)
 
-        c.mu.Lock()
-        // v26.10.34-link (C1 fix): acquire socket.mu before mutating s.demux.
-        // Without this, readLoop (RLock) and RegisterCID (Lock) race with the
-        // delete here — Go's race detector flags it, and production can panic
-        // with "concurrent map read and map write".
-        c.socket.mu.Lock()
-        for dk := range c.scidsDCID {
-                if existing, ok := c.socket.demux[dk]; ok && existing == c.inbox {
-                        delete(c.socket.demux, dk)
-                        delete(c.socket.demuxSource, dk)
-                }
-        }
-        c.socket.mu.Unlock()
-        c.mu.Unlock()
-
+        // v26.11.198: DON'T delete DCIDs from the socket's demux map on Close.
+        // When Process returns (video switch), pooledConn.Close() fires. If we
+        // delete the DCID, Google's in-flight replies for that DCID (retransmissions,
+        // ACKs) are silently dropped by readLoop (demux miss). Chrome's QUIC stack
+        // never receives ACKs → declares path dead → falls back to TCP after ~25s.
+        //
+        // Fix: leave the DCID in the demux map as a stale entry. The inbox channel
+        // is closed (close(c.done) above), so readLoop's send will panic — but we
+        // recover from the panic and silently drop the packet. When a new connection
+        // registers the same DCID, the stale entry is overwritten.
+        //
+        // We still need to release the socket's refCount so the reaper can close
+        // it when it's truly unused.
         c.socket.release()
         return nil
 }
@@ -891,4 +901,113 @@ func isQUICLongHeader(b []byte) bool {
                 return false
         }
         return b[0]&0x80 != 0 && b[0]&0x40 != 0
+}
+
+// ============================================================
+// v26.11.201: BufferedPacketReader — decouples pool inbox from Process
+// ============================================================
+//
+// This is the missing piece from the v196 binary. Without it, when Process
+// returns (video switch, CID rotation, timer fires), responseDone stops
+// reading from PooledPacketReader → nobody drains pooledConn.inbox → inbox
+// fills up (256 cap) → readLoop drops replies (non-blocking send) → Chrome
+// never gets ACKs → stall at ~10 seconds.
+//
+// BufferedPacketReader wraps PooledPacketReader with a readLoop goroutine
+// that continuously drains the underlying reader into an internal buffer.
+// When Process returns and responseDone stops, the readLoop keeps running —
+// Google's replies keep being consumed and buffered. When the goroutine
+// restarts and a new Process starts, the new responseDone reads from the
+// buffer, getting all the accumulated replies — no stall.
+//
+// The buffer is a buf.MultiBuffer channel with large capacity (256) to
+// absorb bursts of replies during the Process gap.
+
+type BufferedPacketReader struct {
+        base    buf.Reader      // underlying PooledPacketReader
+        buffer  chan buf.MultiBuffer
+        done    chan struct{}
+        closed  atomic.Bool
+}
+
+func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
+        r := &BufferedPacketReader{
+                base:   base,
+                buffer: make(chan buf.MultiBuffer, 256),
+                done:   make(chan struct{}),
+        }
+        go r.readLoop()
+        return r
+}
+
+func (r *BufferedPacketReader) readLoop() {
+        for {
+                select {
+                case <-r.done:
+                        return
+                default:
+                }
+                mb, err := r.base.ReadMultiBuffer()
+                if err != nil {
+                        // v26.11.211: Don't push nil mb to buffer on error.
+                        // Just exit — the error will be returned by ReadMultiBuffer
+                        // on the next call (buffer is empty, r.done is closed).
+                        if mb != nil {
+                                buf.ReleaseMulti(mb)
+                        }
+                        return
+                }
+                if mb == nil || len(mb) == 0 {
+                        continue
+                }
+                select {
+                case r.buffer <- mb:
+                case <-r.done:
+                        buf.ReleaseMulti(mb)
+                        return
+                default:
+                        // Buffer full — drop oldest to make room
+                        select {
+                        case old := <-r.buffer:
+                                buf.ReleaseMulti(old)
+                        default:
+                        }
+                        select {
+                        case r.buffer <- mb:
+                        case <-r.done:
+                                buf.ReleaseMulti(mb)
+                                return
+                        }
+                }
+        }
+}
+
+func (r *BufferedPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        select {
+        case mb, ok := <-r.buffer:
+                if !ok || len(mb) == 0 {
+                        return nil, io.EOF
+                }
+                return mb, nil
+        case <-r.done:
+                return nil, io.EOF
+        }
+}
+
+func (r *BufferedPacketReader) Close() error {
+        if !r.closed.CompareAndSwap(false, true) {
+                return nil
+        }
+        close(r.done)
+        // Drain and release any buffered packets
+        for {
+                select {
+                case mb := <-r.buffer:
+                        if mb != nil {
+                                buf.ReleaseMulti(mb)
+                        }
+                default:
+                        return nil
+                }
+        }
 }
