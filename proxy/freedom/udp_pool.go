@@ -480,6 +480,11 @@ func (s *pooledSocket) readLoop() {
                                 if li != nil {
                                         ch = li
                                         ok = true
+                                } else {
+                                        // v26.11.232 DIAG: lastActiveInbox is nil — replies will be dropped
+                                        xrayerrors.LogInfo(context.Background(), "DIAG v232: DCID=empty reply but lastActiveInbox=nil demuxSize=", len(s.demux),
+                                                " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
+                                                " isLong=", n > 0 && packet[0]&0x80 != 0)
                                 }
                         }
                 }
@@ -496,6 +501,10 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if !ok {
+                                // v26.11.232 DIAG: reply packet DROPPED
+                                xrayerrors.LogInfo(context.Background(), "DIAG v232: reply DROPPED dcidLen=", len(dcid),
+                                        " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
+                                        " demuxSize=", len(s.demux))
                                 putPacket(packet)
                                 continue
                         }
