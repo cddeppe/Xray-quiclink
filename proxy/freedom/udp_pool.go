@@ -482,7 +482,7 @@ func (s *pooledSocket) readLoop() {
                                         ok = true
                                 } else {
                                         // v26.11.232 DIAG: lastActiveInbox is nil — replies will be dropped
-                                        xrayerrors.LogInfo(context.Background(), "DIAG v232: DCID=empty reply but lastActiveInbox=nil demuxSize=", len(s.demux),
+                                        xrayerrors.LogError(context.Background(), "DIAG v232: DCID=empty reply but lastActiveInbox=nil demuxSize=", len(s.demux),
                                                 " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
                                                 " isLong=", n > 0 && packet[0]&0x80 != 0)
                                 }
@@ -502,7 +502,7 @@ func (s *pooledSocket) readLoop() {
                         }
                         if !ok {
                                 // v26.11.232 DIAG: reply packet DROPPED
-                                xrayerrors.LogInfo(context.Background(), "DIAG v232: reply DROPPED dcidLen=", len(dcid),
+                                xrayerrors.LogError(context.Background(), "DIAG v232: reply DROPPED dcidLen=", len(dcid),
                                         " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
                                         " demuxSize=", len(s.demux))
                                 putPacket(packet)
@@ -709,7 +709,7 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // SCID-based fallback can route the reply by looking up
                 // demux[serverSCID] = demux[clientDCID].
                 if dcid, _, err := quic.ParseDCID(b); err == nil {
-                        xrayerrors.LogInfo(context.Background(), "DIAG: WriteTo register DCID len=", len(dcid),
+                        xrayerrors.LogError(context.Background(), "DIAG: WriteTo register DCID len=", len(dcid),
                                 " scidLen=", func() int { if s, _, _ := parseQUICSCID(b); s != nil { return len(s) }; return 0 }(),
                                 " firstByte=0x", fmt.Sprintf("%02x", b[0]))
                         if len(dcid) > 0 {
