@@ -130,6 +130,18 @@ type pooledConn struct {
         // (because BufferedPacketReader and PooledPacketWriter bypass
         // udpConn.Write/Read) and retires connections after sessionIdleTimeout.
         onActivity func()
+        // v26.11.218: Dedicated per-connection socket for 0-length SCID
+        // connections (Chrome h3). When Chrome uses 0-length SCID, server
+        // replies all have DCID=∅. On the shared pool socket, these can't be
+        // demuxed (multiple parallel connections → DCID=∅ collision →
+        // lastActiveInbox race → ~2000/3000 success rate).
+        // A dedicated socket gives each connection its own source port —
+        // dedicatedReadLoop delivers ALL packets to this conn's inbox with
+        // zero demux. YouTube (non-zero SCID) stays on the shared socket with
+        // DCID demux, so BOTH work simultaneously.
+        pool             *UDPSocketPool
+        dedicatedPC      stdnet.PacketConn // nil = using shared socket
+        dedicatedStarted atomic.Bool      // ensures migration runs once
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -328,6 +340,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 inbox:     inbox,
                 done:      make(chan struct{}),
                 scidsDCID: make(map[dcidKey]bool),
+                pool:      p, // v26.11.218: for creating dedicated socket
         }
         // v26.11.158: Track this pooledConn so readLoop can check IsClosed
         sock.mu.Lock()
@@ -587,6 +600,10 @@ func (s *pooledSocket) release() {
 }
 
 func (c *pooledConn) RegisterCID(cid []byte) {
+        // v26.11.218: Dedicated connections don't use the shared demux map.
+        if c.dedicatedPC != nil {
+                return
+        }
         // v26.11.216: Register 0-length CIDs too. Chrome uses 0-length SCID.
         // The server's reply has DCID = client's SCID = ∅. We need demux[∅]
         // to route the reply. This is safe because with port-only keying,
@@ -626,12 +643,41 @@ func (c *pooledConn) RegisterCID(cid []byte) {
 }
 
 func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
-        // v26.10.15-link: use atomic.Bool for closed check (25x faster
-        // than mutex acquire+release on the hot path).
         if c.closed.Load() {
                 return 0, io.EOF
         }
 
+        // v26.11.218: For 0-length SCID connections (Chrome h3), migrate to a
+        // dedicated per-connection socket. This gives each connection its own
+        // source port, so dedicatedReadLoop delivers ALL replies to this conn's
+        // inbox — no demux, no lastActiveInbox race.
+        // YouTube (non-zero SCID) stays on the shared socket with DCID demux.
+        // Both work simultaneously.
+        if c.dedicatedPC == nil && !c.dedicatedStarted.Load() && len(b) > 0 && b[0]&0x80 != 0 {
+                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) == 0 {
+                        c.migrateToDedicated()
+                }
+        }
+
+        // v26.11.218: If on a dedicated socket, send via it — no demux, no CID
+        // registration, no lastActiveInbox. The dedicatedReadLoop handles all
+        // incoming packets for this connection.
+        if c.dedicatedPC != nil {
+                dest := c.socket.dest
+                if udp, ok := addr.(*stdnet.UDPAddr); ok {
+                        dest = udp
+                }
+                n, err := c.dedicatedPC.WriteTo(b, dest)
+                if err != nil && !isTransientWriteError(err) {
+                        xrayerrors.LogInfo(context.Background(), "v26.11.218: dedicated socket write error: ", err)
+                }
+                if c.onActivity != nil {
+                        c.onActivity()
+                }
+                return n, err
+        }
+
+        // Shared socket path (YouTube / non-zero SCID / migration failed).
         // v26.10.15-link: only parse SCID for long headers (Initial,
         // 0-RTT, Handshake). Short headers (1-RTT, bit 7 = 0) don't
         // carry SCID length info, and we've already registered the SCID
@@ -643,7 +689,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         // v26.11.217: Don't register 0-length SCIDs in demux —
                         // they collide across connections. Instead, set lastActiveInbox
                         // so the readLoop can route DCID=∅ replies to the most recently
-                        // active connection.
+                        // active connection. (Fallback only — 0-length SCID conns
+                        // normally migrate to dedicated sockets above.)
                         if len(scid) > 0 {
                                 c.RegisterCID(scid)
                         }
@@ -662,9 +709,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 // SCID-based fallback can route the reply by looking up
                 // demux[serverSCID] = demux[clientDCID].
                 if dcid, _, err := quic.ParseDCID(b); err == nil {
-                        xrayerrors.LogInfo(context.Background(), "DIAG: WriteTo register DCID len=", len(dcid),
-                                " scidLen=", func() int { if s, _, _ := parseQUICSCID(b); s != nil { return len(s) }; return 0 }(),
-                                " firstByte=0x", fmt.Sprintf("%02x", b[0]))
                         if len(dcid) > 0 {
                                 c.RegisterCID(dcid)
                         }
@@ -697,6 +741,96 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 c.onActivity()
         }
         return n, err
+}
+
+// v26.11.218: migrateToDedicated creates a per-connection UDP socket for
+// 0-length SCID connections (Chrome h3). Called from WriteTo when the first
+// long-header packet has SCID=∅. The dedicated socket gives each connection
+// its own source port, so dedicatedReadLoop routes ALL incoming packets to
+// this conn's inbox without any demux — eliminating the lastActiveInbox race
+// that caused ~2000/3000 success rates for h3 sites.
+func (c *pooledConn) migrateToDedicated() {
+        if !c.dedicatedStarted.CompareAndSwap(false, true) {
+                return // already migrated or migrating
+        }
+
+        pc, err := c.pool.listenUDPWithSockopt()
+        if err != nil {
+                xrayerrors.LogWarning(context.Background(), "v26.11.218: failed to create dedicated socket, falling back to shared: ", err)
+                // dedicatedStarted stays true, dedicatedPC stays nil.
+                // Subsequent WriteTo calls use the shared socket path (lastActiveInbox fallback).
+                return
+        }
+
+        c.dedicatedPC = pc
+
+        // Release the shared socket's refCount — we're no longer using it.
+        // The shared socket stays alive (fix #3: no eviction) for other
+        // connections (YouTube).
+        c.socket.release()
+
+        xrayerrors.LogInfo(context.Background(), "v26.11.218: migrated 0-length SCID connection to dedicated socket localAddr=", pc.LocalAddr())
+
+        go c.dedicatedReadLoop()
+}
+
+// v26.11.218: dedicatedReadLoop reads from the per-connection dedicated
+// socket and delivers ALL packets to this conn's inbox. No demux needed —
+// every packet on this socket belongs to this connection. This is the key
+// fix for h3 sites: each Chrome connection gets its own source port, so
+// server replies (DCID=∅) arrive on the correct socket and are unambiguously
+// routed to the right inbox.
+func (c *pooledConn) dedicatedReadLoop() {
+        b := make([]byte, 65535)
+        for {
+                select {
+                case <-c.done:
+                        return
+                default:
+                }
+                n, addr, err := c.dedicatedPC.ReadFrom(b)
+                if err != nil {
+                        if isTransientReadError(err) {
+                                continue
+                        }
+                        return
+                }
+                packet := getPacket()
+                copy(packet, b[:n])
+
+                // v26.11.218: Notify the inbound worker about the server's SCID
+                // BEFORE sending to inbox (after send, the consumer may free the packet).
+                // This is needed so Chrome's 1-RTT packets (DCID = server SCID) can be
+                // routed to the right connection by the inbound worker.
+                if c.source != nil && n > 0 && packet[0]&0x80 != 0 {
+                        pktType := (packet[0] >> 4) & 0x03
+                        if pktType == 0x00 { // Initial
+                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                        scidCopy := append([]byte(nil), scid...)
+                                        quic.NotifyServerSCID(scidCopy, c.source)
+                                }
+                        }
+                }
+
+                // Deliver to inbox (non-blocking, with recover for closed channel).
+                panicked := false
+                func() {
+                        defer func() {
+                                if r := recover(); r != nil {
+                                        panicked = true
+                                        putPacket(packet)
+                                }
+                        }()
+                        select {
+                        case c.inbox <- readResult{data: packet[:n], addr: addr}:
+                        default:
+                                putPacket(packet)
+                        }
+                }()
+                if panicked {
+                        return
+                }
+        }
 }
 
 func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
@@ -736,6 +870,14 @@ func (c *pooledConn) Close() error {
         }
         close(c.done)
 
+        // v26.11.218: Close the dedicated socket if this connection migrated.
+        if c.dedicatedPC != nil {
+                c.dedicatedPC.Close()
+                // Shared socket refCount was already released in migrateToDedicated
+                xrayerrors.LogInfo(context.Background(), "v26.11.218: closed dedicated socket")
+                return nil
+        }
+
         // v26.11.198: DON'T delete DCIDs from the socket's demux map on Close.
         // When Process returns (video switch), pooledConn.Close() fires. If we
         // delete the DCID, Google's in-flight replies for that DCID (retransmissions,
@@ -754,6 +896,9 @@ func (c *pooledConn) Close() error {
 }
 
 func (c *pooledConn) LocalAddr() stdnet.Addr {
+        if c.dedicatedPC != nil {
+                return c.dedicatedPC.LocalAddr()
+        }
         return c.socket.conn.LocalAddr()
 }
 
