@@ -302,6 +302,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
                 }
+                xrayerrors.LogInfo(context.Background(), "udp_pool: NEW socket created for key=", key, " localAddr=", pc.LocalAddr())
 
                 p.mu.Lock()
                 if existing, ok := p.sockets[key]; ok && !existing.IsClosed() && !existing.IsDead() {
