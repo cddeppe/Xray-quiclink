@@ -23,6 +23,35 @@ This fork bridges that gap with a **UDP socket pool** that demuxes QUIC replies 
 
 ---
 
+## How Upstream Xray-core Fails at QUIC Proxying
+
+Upstream xray-core has several fundamental problems when proxying QUIC/HTTP3 traffic:
+
+1. **Per-destination IP pool sockets.** The pool keys on `dest.String()` (e.g. `[2a00:1450:4017:4::8]:443`). Each different Google CDN edge IP gets its own socket with its own random source port. When Chrome switches videos and resolves to a different Google IP, Google sees a new source port, interprets this as QUIC connection migration, and initiates path validation — which stalls the connection for 25-30 seconds.
+
+2. **Process lifecycle kills the inbox.** Each UDP packet from Chrome triggers `freedom.Process`. When Process returns (Chrome paused sending, or the inactivity timer fired), `defer pooledConn.Close()` fires — closing the inbox channel. Google's in-flight replies hit a closed channel and are dropped. Chrome never receives ACKs and declares the QUIC path dead.
+
+3. **Socket eviction by the reaper.** The reaper (`evictStale`) checks `isIdle` (no replies in 600s) and `isUnused` (no writes in 300s). With a shared socket, one idle connection triggers eviction of the socket that ALL other connections are using — creating a new socket with a new source port.
+
+4. **No activity tracking on the pool path.** `udpConn.lastActivityTime` is only updated by `udpConn.Write()` and `udpConn.ReadMultiBuffer()`. The pool path (`PooledPacketWriter` / `BufferedPacketReader`) bypasses these entirely — so `clean()` retires active connections after `sessionIdleTimeout` even while video is playing.
+
+5. **No BufferedPacketReader.** When Process returns, `responseDone` stops reading from `PooledPacketReader`. Nobody drains the pool's inbox. Google's replies fill the inbox (256 cap) and are dropped. Chrome stalls at ~10 seconds (CID rotation point).
+
+6. **No goroutine restart.** When Process returns, the inbound worker calls `removeConn` and closes the connection. The next packet from Chrome creates a brand new connection from scratch — new dial, new source port, new everything.
+
+### How This Fork Fixes It
+
+| Upstream Problem | This Fork's Fix |
+|-----------------|-----------------|
+| Per-destination IP pool sockets | Key pool by PORT ONLY (`:443`) — ONE socket, ONE source port for all Google IPs |
+| Close kills the inbox | Don't close pooledConn on Process return; don't delete DCID from demux on Close |
+| Reaper kills shared socket | Reaper only evicts dead + refCount==0 sockets; shared socket is never evicted |
+| No activity tracking on pool path | `onActivity` callback fires on every WriteTo/ReadFrom, updates `lastActivityTime` |
+| No BufferedPacketReader | Added BufferedPacketReader with readLoop that drains inbox even when Process is away |
+| No goroutine restart | `callback()` restarts the Process goroutine when `processRunning == false`; no `removeConn` |
+
+---
+
 ## Architecture: How YouTube QUIC Finally Worked
 
 ### The Problem
