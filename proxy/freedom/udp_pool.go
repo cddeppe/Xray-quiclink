@@ -45,8 +45,9 @@ type pooledSocket struct {
         refCount      int
         lastUsed      atomic.Int64
         lastReplyTime atomic.Int64
-        demux         map[dcidKey]chan<- readResult
-        demuxSource   map[dcidKey]*stdnet.UDPAddr
+        // v26.11.296 Fix E: demux and demuxSource as sync.Map — lock-free.
+        demux         sync.Map // dcidKey -> chan<- readResult
+        demuxSource   sync.Map // dcidKey -> *stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
         dead          bool
@@ -294,8 +295,6 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 sock = &pooledSocket{
                         conn:          pc,
                         dest:          dest,
-                        demux:         make(map[dcidKey]chan<- readResult),
-                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
@@ -411,19 +410,21 @@ func (s *pooledSocket) readLoop() {
                 // per reply packet.
                 dk := makeDCIDKey(dcid)
 
-                // v26.11.215: Debug log for demux lookup
-                xrayerrors.LogInfo(context.Background(), "DIAG: readLoop reply dcidLen=", len(dcid),
-                        " firstByte=0x", fmt.Sprintf("%02x", packet[0]),
-                        " demuxSize=", len(s.demux))
-
-                // v26.10.16-link: use RLock for the demux read path (was
-                // Lock, blocking all RegisterCID calls which need write
-                // locks). The demux map is only mutated by RegisterCID
-                // and Close (which use Lock), so RLock is correct here.
-                s.mu.RLock()
-                ch, ok := s.demux[dk]
-                src := s.demuxSource[dk]
-                s.mu.RUnlock()
+                // v26.11.296 Fix E: lock-free sync.Map.Load for demux
+                var ch chan<- readResult
+                var ok bool
+                var src *stdnet.UDPAddr
+                if v, vOk := s.demux.Load(dk); vOk {
+                        if vc, vcOk := v.(chan<- readResult); vcOk {
+                                ch = vc
+                                ok = true
+                        }
+                }
+                if v, vOk := s.demuxSource.Load(dk); vOk {
+                        if vs, vsOk := v.(*stdnet.UDPAddr); vsOk {
+                                src = vs
+                        }
+                }
 
                 // Update timestamps under Lock. This is a short critical
                 // section but still serializes with RegisterCID. A future
@@ -469,10 +470,18 @@ func (s *pooledSocket) readLoop() {
                         if n > 0 && packet[0]&0x80 != 0 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidKey := makeDCIDKey(scid)
-                                        s.mu.RLock()
-                                        ch, ok = s.demux[scidKey]
-                                        src = s.demuxSource[scidKey]
-                                        s.mu.RUnlock()
+                                        // v26.11.296 Fix E: lock-free sync.Map.Load
+                                        if v, vOk := s.demux.Load(scidKey); vOk {
+                                                if vc, vcOk := v.(chan<- readResult); vcOk {
+                                                        ch = vc
+                                                        ok = true
+                                                }
+                                        }
+                                        if v, vOk := s.demuxSource.Load(scidKey); vOk {
+                                                if vs, vsOk := v.(*stdnet.UDPAddr); vsOk {
+                                                        src = vs
+                                                }
+                                        }
                                 }
                         }
                         if !ok {
@@ -509,10 +518,9 @@ func (s *pooledSocket) readLoop() {
                     }
                 }()
                 if panicked {
-                    s.mu.Lock()
-                    delete(s.demux, dk)
-                    delete(s.demuxSource, dk)
-                    s.mu.Unlock()
+                        // v26.11.296 Fix E: lock-free sync.Map.Delete
+                        s.demux.Delete(dk)
+                        s.demuxSource.Delete(dk)
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
@@ -529,15 +537,13 @@ func (s *pooledSocket) readLoop() {
                                         quic.NotifyServerSCID(scidCopy, src)
                                         // v26.11.291 Fix A: also register the server SCID in this
                                         // socket's demux map so future 1-RTT short-header packets
-                                        // (DCID = server SCID) can be routed. Only for long headers
-                                        // (Initial replies) — zero hot-path impact.
+                                        // (DCID = server SCID) can be routed.
+                                        // v26.11.296 Fix E: lock-free sync.Map.LoadOrStore
                                         scidKey := makeDCIDKey(scidCopy)
-                                        s.mu.Lock()
-                                        if _, exists := s.demux[scidKey]; !exists {
-                                                s.demux[scidKey] = ch
-                                                s.demuxSource[scidKey] = src
+                                        if _, exists := s.demux.Load(scidKey); !exists {
+                                                s.demux.Store(scidKey, ch)
+                                                s.demuxSource.Store(scidKey, src)
                                         }
-                                        s.mu.Unlock()
                                 }
                         }
                 }
@@ -643,19 +649,16 @@ func (c *pooledConn) RegisterCID(cid []byte) {
 
         if !already {
                 // H4 fix: re-check closed under lock before mutating demux.
-                // Between the first closed check and here, another goroutine
-                // could call Close() which clears scidsDCID from demux.
                 c.mu.Lock()
                 if c.closed.Load() {
                         c.mu.Unlock()
                         return
                 }
-                c.socket.mu.Lock()
-                c.socket.demux[dk] = c.inbox
+                // v26.11.296 Fix E: lock-free sync.Map.Store
+                c.socket.demux.Store(dk, c.inbox)
                 if c.source != nil {
-                        c.socket.demuxSource[dk] = c.source
+                        c.socket.demuxSource.Store(dk, c.source)
                 }
-                c.socket.mu.Unlock()
                 c.mu.Unlock()
         }
 }
