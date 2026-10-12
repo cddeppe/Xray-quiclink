@@ -240,6 +240,37 @@ type udpConn struct {
         udpConnWrite    uint64
         hubWriteToCalls uint64
         hubWriteToBytes uint64
+
+        // v26.11.283 DIAG: request-path counters (browser → VPS → Google).
+        // Printed in the same DIAG COUNTERS line as the reply counters.
+        //
+        //   reqPkts    — packets written to Google (via requestDone → writer)
+        //   reqBytes   — bytes written to Google
+        //   reqLastErr — last error from WriteTo (stored as string via atomic.Value)
+        //
+        // If reqPkts = 0 while replyChRecv > 0: the request path is broken —
+        // Google never receives the client's packets, so it can't reply.
+        // (Note: replyChRecv > 0 with reqPkts = 0 shouldn't happen unless the
+        // replies are from a previous Process — the counters are cumulative.)
+        // If reqPkts > 0 but replyChRecv = 0: Google isn't replying — dial
+        // is wrong, or Google is blocking the VPS IP.
+        reqPkts    uint64
+        reqBytes   uint64
+        reqLastErr atomic.Value // stores string
+}
+
+// v26.11.283 DIAG: AddReqStats increments request-path counters.
+// Called by countingWriter in freedom.go's requestDone for each
+// WriteMultiBuffer call. pkts = number of UDP packets (buffers),
+// bytes = total bytes, err = last write error (if any).
+func (c *udpConn) AddReqStats(pkts int, bytes int, err error) {
+        atomic.AddUint64(&c.reqPkts, uint64(pkts))
+        if bytes > 0 {
+                atomic.AddUint64(&c.reqBytes, uint64(bytes))
+        }
+        if err != nil {
+                c.reqLastErr.Store(err.Error())
+        }
 }
 
 func (c *udpConn) setInactive() {
@@ -1458,15 +1489,26 @@ func (w *udpWorker) logCounters() {
                         src                                   net.Destination
                         replyChRecv, udpConnWrite             uint64
                         hubWriteToCalls, hubWriteToBytes      uint64
+                        reqPkts, reqBytes                     uint64
+                        reqLastErr                            string
                 }
                 stats := make([]connStats, 0, len(w.activeConn))
                 for _, c := range w.activeConn {
+                        var lastErr string
+                        if v := c.reqLastErr.Load(); v != nil {
+                                if s, ok := v.(string); ok {
+                                        lastErr = s
+                                }
+                        }
                         stats = append(stats, connStats{
                                 src:            *c.src,
                                 replyChRecv:    atomic.LoadUint64(&c.replyChRecv),
                                 udpConnWrite:   atomic.LoadUint64(&c.udpConnWrite),
                                 hubWriteToCalls: atomic.LoadUint64(&c.hubWriteToCalls),
                                 hubWriteToBytes: atomic.LoadUint64(&c.hubWriteToBytes),
+                                reqPkts:        atomic.LoadUint64(&c.reqPkts),
+                                reqBytes:       atomic.LoadUint64(&c.reqBytes),
+                                reqLastErr:     lastErr,
                         })
                 }
                 w.RUnlock()
@@ -1475,7 +1517,10 @@ func (w *udpWorker) logCounters() {
                                 " replyChRecv=", s.replyChRecv,
                                 " udpConnWrite=", s.udpConnWrite,
                                 " hubWriteToCalls=", s.hubWriteToCalls,
-                                " hubWriteToBytes=", s.hubWriteToBytes)
+                                " hubWriteToBytes=", s.hubWriteToBytes,
+                                " reqPkts=", s.reqPkts,
+                                " reqBytes=", s.reqBytes,
+                                " reqLastErr=", s.reqLastErr)
                 }
         }
 }

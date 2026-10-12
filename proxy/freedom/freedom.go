@@ -699,6 +699,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }
                 }
 
+                // v26.11.283 DIAG: when connPersisted, wrap the writer with
+                // countingWriter to measure the request path (browser → VPS → Google).
+                // This counts packets/bytes/errors written toward Google and stores
+                // them on the udpConn so they appear in the DIAG COUNTERS line.
+                if connPersisted {
+                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                if stats, ok := inbound.Conn.(interface{ AddReqStats(pkts int, bytes int, err error) }); ok {
+                                        writer = &countingWriter{base: writer, udp: stats}
+                                }
+                        }
+                }
+
                 // Write any packets we peeked during the pool decision (before buf.Copy).
                 if len(peekedPackets) > 0 {
                         if err := writer.WriteMultiBuffer(peekedPackets); err != nil {
@@ -1245,4 +1257,26 @@ func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         b := buf.New()
         b.Write(pkt)
         return buf.MultiBuffer{b}, nil
+}
+
+// v26.11.283 DIAG: countingWriter wraps a buf.Writer and counts packets,
+// bytes, and errors written to Google. Used by requestDone when connPersisted
+// is true to measure the request path (browser → VPS → Google).
+type countingWriter struct {
+        base buf.Writer
+        udp  interface{ AddReqStats(pkts int, bytes int, err error) }
+}
+
+func (w *countingWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+        // Count packets and bytes BEFORE the write (WriteMultiBuffer may release them)
+        pkts := len(mb)
+        var byteCount int
+        for _, b := range mb {
+                if b != nil {
+                        byteCount += int(b.Len())
+                }
+        }
+        err := w.base.WriteMultiBuffer(mb)
+        w.udp.AddReqStats(pkts, byteCount, err)
+        return err
 }
