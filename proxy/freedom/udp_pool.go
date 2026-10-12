@@ -427,24 +427,9 @@ func (s *pooledSocket) readLoop() {
                 src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
-                // v26.11.262: On demux hit (non-empty DCID), cache the
-                // reply source IP → inbox mapping for future DCID=∅ replies.
-                // Only writes ONCE per IP — subsequent hits skip (RLock only).
-                // This avoids Lock contention on YouTube's 25kpps hot path.
-                if ok && len(dcid) > 0 {
-                        if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
-                                ipKey := udpAddr.IP.String()
-                                // RLock check first — skip if already registered
-                                s.srcIPMu.RLock()
-                                existing, found := s.srcIPInbox[ipKey]
-                                s.srcIPMu.RUnlock()
-                                if !found || existing != ch {
-                                        s.srcIPMu.Lock()
-                                        s.srcIPInbox[ipKey] = ch
-                                        s.srcIPMu.Unlock()
-                                }
-                        }
-                }
+                // v26.11.262: Removed srcIPInbox write from here — was running on
+                // EVERY demux hit (25k/sec for YouTube). Moved to SCID fallback
+                // block below (long headers only — once per connection).
 
                 // Update timestamps under Lock. This is a short critical
                 // section but still serializes with RegisterCID. A future
@@ -497,6 +482,17 @@ func (s *pooledSocket) readLoop() {
                                         ch, ok = s.demux[scidKey]
                                         src = s.demuxSource[scidKey]
                                         s.mu.RUnlock()
+                                        // v26.11.263: Cache source IP → inbox for future
+                                        // DCID=∅ replies. Only runs on long headers (Initial)
+                                        // — zero overhead on YouTube's 1-RTT hot path.
+                                        if ok && src != nil {
+                                                if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
+                                                        ipKey := udpAddr.IP.String()
+                                                        s.srcIPMu.Lock()
+                                                        s.srcIPInbox[ipKey] = ch
+                                                        s.srcIPMu.Unlock()
+                                                }
+                                        }
                                 }
                         }
                         if !ok {
