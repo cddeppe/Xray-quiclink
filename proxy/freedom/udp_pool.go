@@ -46,7 +46,10 @@ type pooledSocket struct {
         lastUsed      atomic.Int64
         lastReplyTime atomic.Int64
         // v26.11.296 Fix E: demux and demuxSource as sync.Map — lock-free.
-        demux         sync.Map // dcidKey -> chan<- readResult
+        // NOTE: stored as chan readResult (not chan<- readResult) so the type
+        // assertion in readLoop works. sync.Map stores interface{}, and
+        // chan readResult != chan<- readResult for assertion purposes.
+        demux         sync.Map // dcidKey -> chan readResult
         demuxSource   sync.Map // dcidKey -> *stdnet.UDPAddr
         closed        chan struct{}
         closeOnce     sync.Once
@@ -415,8 +418,8 @@ func (s *pooledSocket) readLoop() {
                 var ok bool
                 var src *stdnet.UDPAddr
                 if v, vOk := s.demux.Load(dk); vOk {
-                        if vc, vcOk := v.(chan<- readResult); vcOk {
-                                ch = vc
+                        if vc, vcOk := v.(chan readResult); vcOk {
+                                ch = vc // chan readResult is assignable to chan<- readResult
                                 ok = true
                         }
                 }
@@ -472,7 +475,7 @@ func (s *pooledSocket) readLoop() {
                                         scidKey := makeDCIDKey(scid)
                                         // v26.11.296 Fix E: lock-free sync.Map.Load
                                         if v, vOk := s.demux.Load(scidKey); vOk {
-                                                if vc, vcOk := v.(chan<- readResult); vcOk {
+                                                if vc, vcOk := v.(chan readResult); vcOk {
                                                         ch = vc
                                                         ok = true
                                                 }
