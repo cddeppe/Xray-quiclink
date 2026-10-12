@@ -207,23 +207,26 @@ func (p *UDPSocketPool) Close() {
 }
 
 func (p *UDPSocketPool) evictStale() {
-        // v26.11.207: Don't evict the shared socket. With port-only keying,
-        // there's only ONE socket for all QUIC traffic. Evicting it kills
-        // the source port stability. The socket is wildcard-bound and
-        // receives from any IP — it should never be evicted.
-        //
-        // Only evict if the socket is dead AND refCount == 0 (truly abandoned).
         p.mu.Lock()
         defer p.mu.Unlock()
+        nowNano := time.Now().UnixNano()
+        idleThreshold := int64(2 * time.Minute)
         for key, sock := range p.sockets {
                 sock.mu.Lock()
                 isDead := sock.dead && sock.refCount == 0
+                // v26.11.256: Evict idle per-connection sockets (key has 2+ colons).
+                // Shared sockets (key = ":port") are never evicted.
+                isIdlePerConn := false
+                if strings.Count(key, ":") >= 2 && sock.refCount == 0 {
+                        if nowNano-sock.lastUsed.Load() > idleThreshold {
+                                isIdlePerConn = true
+                        }
+                }
                 sock.mu.Unlock()
 
-                if isDead {
+                if isDead || isIdlePerConn {
                         sock.MarkStale()
                         delete(p.sockets, key)
-                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted dead socket for ", key)
                 }
         }
 }
@@ -258,9 +261,23 @@ func destKey(dest *stdnet.UDPAddr) string {
         return fmt.Sprintf(":%d", dest.Port)
 }
 
+// v26.11.256: Per-connection socket key for 0-length SCID.
+// Includes Chrome source port to distinguish connections.
+func destKeyWithSource(dest *stdnet.UDPAddr, sourcePort int) string {
+        return fmt.Sprintf(":%d:%d", dest.Port, sourcePort)
+}
+
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
         key := destKey(dest)
+        return p.acquireWithKey(dest, key)
+}
 
+// v26.11.256: Per-connection socket for 0-length SCID.
+func (p *UDPSocketPool) AcquireWithSource(dest *stdnet.UDPAddr, sourcePort int) (*pooledConn, error) {
+        return p.acquireWithKey(dest, destKeyWithSource(dest, sourcePort))
+}
+
+func (p *UDPSocketPool) acquireWithKey(dest *stdnet.UDPAddr, key string) (*pooledConn, error) {
         p.mu.Lock()
         sock, ok := p.sockets[key]
         if ok && (sock.IsClosed() || sock.IsDead()) {

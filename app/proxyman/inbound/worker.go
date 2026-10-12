@@ -350,6 +350,15 @@ func (c *udpConn) Close() error {
                 c.outboundConn = nil
         }
         c.outboundMu.Unlock()
+        // v26.11.256: Close the persistent pooledConn too. Without this,
+        // per-connection sockets for 0-length SCID are never closed.
+        if c.pooledConnPtr != nil {
+                type closer interface{ Close() error }
+                if pc, ok := c.pooledConnPtr.(closer); ok {
+                        pc.Close()
+                }
+                c.pooledConnPtr = nil
+        }
         return nil
 }
 
