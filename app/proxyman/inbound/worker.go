@@ -345,11 +345,18 @@ func (c *udpConn) EnsureSessionReader() {
         c.sessionReaderOnce.Do(func() {
                 c.sessionReplyCh = make(chan []byte, 1024)
                 c.sessionReaderDone = make(chan struct{})
+                // v26.11.276 DIAG: log reader startup
+                c.sessionSocketMu.Lock()
+                pcStartup := c.sessionSocket
+                c.sessionSocketMu.Unlock()
+                errors.LogWarning(context.Background(), "DIAG READER: starting pc=", pcStartup != nil)
                 go func() {
                         buf := make([]byte, 65535)
+                        var pktCount int64
                         for {
                                 select {
                                 case <-c.sessionReaderDone:
+                                        errors.LogWarning(context.Background(), "DIAG READER: exiting after pkts=", pktCount)
                                         return
                                 default:
                                 }
@@ -358,12 +365,14 @@ func (c *udpConn) EnsureSessionReader() {
                                 pc := c.sessionSocket
                                 c.sessionSocketMu.Unlock()
                                 if pc == nil {
+                                        errors.LogWarning(context.Background(), "DIAG READER: pc==nil, exiting")
                                         return
                                 }
                                 n, _, err := pc.ReadFrom(buf)
                                 if err != nil {
                                         select {
                                         case <-c.sessionReaderDone:
+                                                errors.LogWarning(context.Background(), "DIAG READER: exiting after pkts=", pktCount)
                                                 return
                                         default:
                                         }
@@ -375,7 +384,12 @@ func (c *udpConn) EnsureSessionReader() {
                                                         continue
                                                 }
                                         }
+                                        errors.LogWarning(context.Background(), "DIAG READER: read error, exiting after pkts=", pktCount, " err=", err)
                                         return
+                                }
+                                pktCount++
+                                if pktCount <= 3 || pktCount%100 == 0 {
+                                        errors.LogWarning(context.Background(), "DIAG READER: recv pkt#", pktCount, " len=", n)
                                 }
                                 pkt := make([]byte, n)
                                 copy(pkt, buf[:n])
@@ -704,6 +718,14 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
+        // v26.11.276 DIAG: log every packet's destination + firstByte
+        pktBytes := b.Bytes()
+        fb := byte(0)
+        if len(pktBytes) > 0 {
+                fb = pktBytes[0]
+        }
+        errors.LogWarning(context.Background(), "DIAG CB: originalDest=", originalDest,
+                " source=", source, " firstByte=0x", hex.EncodeToString([]byte{fb}))
         id := connID{
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
