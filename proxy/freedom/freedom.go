@@ -673,12 +673,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         if udpConn, ok := inbound.Conn.(interface {
                                                                 GetOutboundConn() net.Conn
                                                                 SetOutboundConn(net.Conn, net.Destination)
-                                                                StartSessionReader(stdnet.Conn)
+                                                                EnsureSessionReader(stdnet.Conn)
                                                         }); ok {
                                                                 if udpConn.GetOutboundConn() == nil {
                                                                         udpConn.SetOutboundConn(conn, destination)
                                                                         connPersisted = true
-                                                                        udpConn.StartSessionReader(conn)
+                                                                        udpConn.EnsureSessionReader(conn)
                                                                 }
                                                         }
                                                 }
@@ -1327,7 +1327,7 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 // v26.11.268: sessionReplyReader reads from the permanent session reader
-// goroutine on udpConn. The goroutine was started by StartSessionReader
+// goroutine on udpConn. The goroutine was started by EnsureSessionReader
 // and runs for the lifetime of udpConn. This reader just reads from the
 // channel — no socket I/O, no install/uninstall cycle.
 type sessionReplyReader struct {
