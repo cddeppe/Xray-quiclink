@@ -434,20 +434,27 @@ func (s *pooledSocket) readLoop() {
                         // v26.11.257: If DCID is empty (0-length SCID), broadcast
                         // to ALL active inboxes. Chrome's QUIC stack will drop
                         // packets with wrong DCID — only the correct connection
-                        // processes it. This fixes the lastActiveInbox race for
-                        // YouTube thumbnails and h3 sites.
-                        // Uses existing s.conns list — no new field, no WriteTo change.
+                        // processes it. This fixes the lastActiveInbox race.
                         if len(dcid) == 0 {
                                 s.mu.RLock()
+                                li := s.lastActiveInbox
                                 connsCopy := make([]*pooledConn, len(s.conns))
                                 copy(connsCopy, s.conns)
                                 s.mu.RUnlock()
+                                // Deliver to lastActiveInbox (primary — correct for single-stream YouTube)
+                                if li != nil {
+                                        ch = li
+                                        ok = true
+                                }
+                                // Also broadcast to all OTHER active conns.
+                                // For YouTube videos (1 stream): conns has 1 entry = same as ch → skip.
+                                // For thumbnails (N streams): broadcasts to all → correct one gets it.
                                 for _, c := range connsCopy {
-                                        if c.closed.Load() || c == nil {
+                                        if c == nil || c.closed.Load() {
                                                 continue
                                         }
                                         if c.inbox == ch {
-                                                continue // already sending to this one
+                                                continue // primary gets the original
                                         }
                                         pktCopy := getPacket()
                                         copy(pktCopy, packet[:n])
