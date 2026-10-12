@@ -21,9 +21,10 @@ import (
         "github.com/xtls/xray-core/transport/internet"
 )
 
-// v26.11.300: Bumped to 8 workers. 4 was good, 8 gives more headroom
-// for heavy YouTube streaming without h3 starvation.
-const readLoopWorkers = 8
+// v26.11.300: 4 workers — balances parallelism vs ordering for DCID=∅.
+// 8 workers caused thumbnail races (Initial reply and 1-RTT reply
+// processed by different workers out of order).
+const readLoopWorkers = 4
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
