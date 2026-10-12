@@ -62,13 +62,6 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
-        // v26.11.288: lastInboxByDest tracks the last inbox per Google dest IP.
-        // When a reply with DCID=∅ arrives from Google IP X, we route to
-        // lastInboxByDest[X] instead of the global lastActiveInbox.
-        // This fixes the case where multiple connections talk to different
-        // Google IPs simultaneously — the global lastActiveInbox would route
-        // replies to the wrong connection.
-        lastInboxByDest map[string]chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -151,49 +144,12 @@ func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.S
         return p
 }
 
-// v26.11.288: lookupKernelSource does a dummy UDP dial to the destination
-// to discover the kernel's chosen source address for that route. This
-// ensures the pool socket binds to the correct VPS IPv6 address instead
-// of wildcard [::], which let the kernel pick a random/temporary IPv6
-// source per socket (privacy extensions, multiple globals).
-func lookupKernelSource(destAddr *stdnet.UDPAddr) *stdnet.UDPAddr {
-        conn, err := stdnet.Dial("udp", destAddr.String())
-        if err != nil {
-                return nil
-        }
-        defer conn.Close()
-        localAddr, ok := conn.LocalAddr().(*stdnet.UDPAddr)
-        if !ok {
-                return nil
-        }
-        return &stdnet.UDPAddr{
-                IP:   localAddr.IP,
-                Port: 0,
-                Zone: localAddr.Zone,
-        }
-}
-
 // listenUDPWithSockopt creates a UDP socket and applies the pool's
 // sockopt config (interface binding, fwmark, UDP_GRO). This is the
 // v26.10.17-link fix for WireGuard: without SO_BINDTODEVICE, pool
 // sockets bypass the WG policy routing and QUIC traffic leaks.
-func (p *UDPSocketPool) listenUDPWithSockopt(dest *stdnet.UDPAddr) (stdnet.PacketConn, error) {
-        // v26.11.288: Bind to the kernel's chosen source for this destination
-        // instead of wildcard nil. This fixes the IPv6 source binding bug where
-        // wildcard [::] let the kernel pick a random/temporary IPv6 source per
-        // socket. Google's replies would go to the wrong address.
-        //
-        // lookupKernelSource does a dummy UDP dial to dest to discover the
-        // kernel's chosen source, then we bind to that explicitly.
-        var bindAddr *stdnet.UDPAddr
-        if kernelSrc := lookupKernelSource(dest); kernelSrc != nil {
-                bindAddr = kernelSrc
-        } else {
-                // Fallback: wildcard bind (old behavior)
-                bindAddr = nil
-        }
-
-        pc, err := stdnet.ListenUDP("udp", bindAddr)
+func (p *UDPSocketPool) listenUDPWithSockopt() (stdnet.PacketConn, error) {
+        pc, err := stdnet.ListenUDP("udp", nil)
         if err != nil {
                 return nil, err
         }
@@ -325,20 +281,19 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 // fwmark, and UDP_GRO so QUIC traffic through the pool follows
                 // the WireGuard policy routing instead of leaking via the
                 // default route.
-                pc, err := p.listenUDPWithSockopt(dest)
+                pc, err := p.listenUDPWithSockopt()
                 if err != nil {
                         return nil, err
                 }
 
                 sock = &pooledSocket{
-                        conn:            pc,
-                        dest:            dest,
-                        demux:           make(map[dcidKey]chan<- readResult),
-                        demuxSource:     make(map[dcidKey]*stdnet.UDPAddr),
-                        lastInboxByDest: make(map[string]chan<- readResult),
-                        closed:          make(chan struct{}),
-                        lastUsed:        atomic.Int64{},
-                        lastReplyTime:   atomic.Int64{},
+                        conn:          pc,
+                        dest:          dest,
+                        demux:         make(map[dcidKey]chan<- readResult),
+                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
+                        closed:        make(chan struct{}),
+                        lastUsed:      atomic.Int64{},
+                        lastReplyTime: atomic.Int64{},
                 }
                 xrayerrors.LogInfo(context.Background(), "udp_pool: NEW socket created for key=", key, " localAddr=", pc.LocalAddr())
 
@@ -427,13 +382,8 @@ func (s *pooledSocket) readLoop() {
                 // 1-RTT replies have DCID=∅ (0 bytes). ParseDCID defaults to 8,
                 // reading garbage. With shortHeaderCIDLen=0, we read 0 bytes
                 // → demux[∅] → matches the 0-length SCID registration.
-                // v26.11.288: For short headers, also try variable-length CID
-                // lookup (try all known CID lengths in demux, not just one).
-                // Google's server SCID is 20 bytes; Chrome's is 0. The old code
-                // only tried one length and missed when it was wrong.
                 var dcid []byte
-                isLongHeader := n > 0 && packet[0]&0x80 != 0
-                if isLongHeader {
+                if n > 0 && packet[0]&0x80 != 0 {
                         // Long header — DCID length is in the packet
                         dcid, _, err = quic.ParseDCID(packet[:n])
                 } else {
@@ -470,62 +420,6 @@ func (s *pooledSocket) readLoop() {
                 src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
-                // v26.11.288: Variable-length CID lookup for short headers.
-                // The demux map may contain entries with different CID lengths
-                // (8-byte Initial DCIDs, 20-byte server SCIDs). If the first
-                // lookup missed and this is a short header, try all known CID
-                // lengths from the demux map.
-                if !ok && !isLongHeader && len(packet) > 1 {
-                        s.mu.RLock()
-                        // Collect distinct CID lengths from demux keys
-                        var lens [8]int
-                        var nLens int
-                        for existingKey := range s.demux {
-                                l := existingKey.len
-                                dup := false
-                                for i := 0; i < nLens; i++ {
-                                        if lens[i] == l {
-                                                dup = true
-                                                break
-                                        }
-                                }
-                                if !dup && nLens < len(lens) {
-                                        lens[nLens] = l
-                                        nLens++
-                                }
-                        }
-                        // Try each length
-                        for i := 0; i < nLens; i++ {
-                                altDcid, _, altErr := quic.ParseShortHeaderDCIDWithLen(packet[:n], lens[i])
-                                if altErr != nil || len(altDcid) == 0 {
-                                        continue
-                                }
-                                altDk := makeDCIDKey(altDcid)
-                                if altCh, altOk := s.demux[altDk]; altOk {
-                                        ch = altCh
-                                        src = s.demuxSource[altDk]
-                                        ok = true
-                                        break
-                                }
-                        }
-                        s.mu.RUnlock()
-                }
-
-                // v26.11.288: For long-header replies, register the server's SCID
-                // in the demux map. Future 1-RTT packets from Chrome will carry
-                // DCID = server SCID, so this enables correct routing.
-                if isLongHeader && ok && ch != nil {
-                        if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
-                                scidKey := makeDCIDKey(scid)
-                                s.mu.Lock()
-                                if _, exists := s.demux[scidKey]; !exists {
-                                        s.demux[scidKey] = ch
-                                        s.demuxSource[scidKey] = src
-                                }
-                                s.mu.Unlock()
-                        }
-                }
-
                 // Update timestamps under Lock. This is a short critical
                 // section but still serializes with RegisterCID. A future
                 // optimization could make these atomic.Int64 fields, but
@@ -537,33 +431,38 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
+                        // v26.11.290: Try 20-byte CID length for short headers.
+                        // Google's server SCID is 20 bytes; Chrome uses it as the
+                        // 1-RTT DCID. The shortHeaderCIDLen (0 for Chrome) gives
+                        // DCID=∅ which falls to lastActiveInbox. But if that missed,
+                        // try parsing with length 20 (Google's SCID) — this routes
+                        // correctly when the server SCID was registered.
+                        if n > 0 && packet[0]&0x80 == 0 && len(packet) > 20 {
+                                if altDcid, _, altErr := quic.ParseShortHeaderDCIDWithLen(packet[:n], 20); altErr == nil && len(altDcid) > 0 {
+                                        altDk := makeDCIDKey(altDcid)
+                                        s.mu.RLock()
+                                        if altCh, altOk := s.demux[altDk]; altOk {
+                                                ch = altCh
+                                                src = s.demuxSource[altDk]
+                                                ok = true
+                                        }
+                                        s.mu.RUnlock()
+                                }
+                        }
+                }
+                if !ok {
                         // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
                         // instead of demux[∅]. This avoids collisions when multiple
                         // connections share the pool socket (all Chrome connections
                         // have 0-length SCID → all replies have DCID=∅).
-                        // v26.11.288: First try lastInboxByDest[googleSrcIP] — this
-                        // routes correctly when different connections talk to different
-                        // Google IPs. Fall back to global lastActiveInbox if that misses.
                         if len(dcid) == 0 {
                                 s.mu.RLock()
-                                // Try per-dest first (more specific)
-                                if addr != nil {
-                                        if srcUDP, ok := addr.(*stdnet.UDPAddr); ok && srcUDP.IP != nil {
-                                                if li, liOk := s.lastInboxByDest[srcUDP.IP.String()]; liOk && li != nil {
-                                                        ch = li
-                                                        ok = true
-                                                }
-                                        }
-                                }
-                                // Fall back to global lastActiveInbox
-                                if !ok {
-                                        li := s.lastActiveInbox
-                                        if li != nil {
-                                                ch = li
-                                                ok = true
-                                        }
-                                }
+                                li := s.lastActiveInbox
                                 s.mu.RUnlock()
+                                if li != nil {
+                                        ch = li
+                                        ok = true
+                                }
                         }
                 }
                 if !ok {
@@ -581,6 +480,22 @@ func (s *pooledSocket) readLoop() {
                         if !ok {
                                 putPacket(packet)
                                 continue
+                        }
+                }
+
+                // v26.11.290: For long-header replies, register the server's SCID
+                // in the demux map. Future 1-RTT packets from Chrome will carry
+                // DCID = server SCID, so this enables correct routing via the
+                // 20-byte lookup above. Only fires for long headers (low frequency).
+                if n > 0 && packet[0]&0x80 != 0 && ch != nil {
+                        if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                scidKey := makeDCIDKey(scid)
+                                s.mu.Lock()
+                                if _, exists := s.demux[scidKey]; !exists {
+                                        s.demux[scidKey] = ch
+                                        s.demuxSource[scidKey] = src
+                                }
+                                s.mu.Unlock()
                         }
                 }
 
@@ -770,14 +685,8 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         // v26.11.217: Update lastActiveInbox on every WriteTo call
-                        // v26.11.288: Also update lastInboxByDest[destIP] so readLoop can
-                        // route DCID=∅ replies by the Google source IP. Only done for long
-                        // headers to avoid Lock contention on the 1-RTT hot path.
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
-                        if destUDP, ok := addr.(*stdnet.UDPAddr); ok && destUDP.IP != nil {
-                                c.socket.lastInboxByDest[destUDP.IP.String()] = c.inbox
-                        }
                         c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
