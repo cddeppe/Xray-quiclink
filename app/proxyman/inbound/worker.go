@@ -221,6 +221,25 @@ type udpConn struct {
         sessionReaderOnce  sync.Once
         sessionSocketDest  net.Destination
         sessionSocketMu    sync.Mutex
+
+        // v26.11.282 DIAG: packet-flow counters for the second half of the relay
+        // (after buf.Copy). Printed every 5 seconds by the counter logger goroutine.
+        // All four are atomic uint64 so they can be read+written concurrently.
+        //
+        // Chain being measured:
+        //   replyChRecv      — sessionReplyReader pulls a packet off replyCh
+        //   udpConnWrite     — buf.Copy wrote a packet to udpConn (via output pipe)
+        //   hubWriteToCalls  — udpConn.output closure called hub.WriteTo
+        //   hubWriteToBytes  — bytes handed to hub.WriteTo
+        //
+        // If replyChRecv > udpConnWrite: packets lost in the output pipe (overflow)
+        // If udpConnWrite > hubWriteToCalls: packets lost between Write and output
+        // If hubWriteToCalls > 0 but video still doesn't load: loss is downstream
+        //   of the VPS (network path, phone receive buffer, or Chrome itself).
+        replyChRecv     uint64
+        udpConnWrite    uint64
+        hubWriteToCalls uint64
+        hubWriteToBytes uint64
 }
 
 func (c *udpConn) setInactive() {
@@ -430,6 +449,9 @@ func (c *udpConn) EnsureSessionReader() {
 func (c *udpConn) ReadSessionReply() ([]byte, bool) {
         select {
         case pkt, ok := <-c.sessionReplyCh:
+                if ok {
+                        atomic.AddUint64(&c.replyChRecv, 1)
+                }
                 return pkt, ok
         case <-c.sessionReaderDone:
                 return nil, false
@@ -487,6 +509,8 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
+        // v26.11.282 DIAG: count every Write call (one per packet delivered by buf.Copy)
+        atomic.AddUint64(&c.udpConnWrite, 1)
         // v26.11.144: Re-add SplitCoalesced (from v26.11.55).
         // Packets > 1250 bytes are split into separate UDP datagrams.
         // This allows coalesced QUIC packets (Initial+Handshake) to be
@@ -729,7 +753,13 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
                 w.RLock()
                 srcCopy := *conn.src
                 w.RUnlock()
-                return w.hub.WriteTo(b, srcCopy)
+                n, err := w.hub.WriteTo(b, srcCopy)
+                // v26.11.282 DIAG: count hub.WriteTo calls + bytes
+                atomic.AddUint64(&conn.hubWriteToCalls, 1)
+                if n > 0 {
+                        atomic.AddUint64(&conn.hubWriteToBytes, uint64(n))
+                }
+                return n, err
         }
         w.activeConn[id] = conn
 
@@ -1389,7 +1419,65 @@ func (w *udpWorker) Start() error {
         w.hub = h
         quic.RegisterWorkerSCIDHook(w)
         go w.handlePackets()
+        // v26.11.282 DIAG: periodic counter logger — prints all udpConn counters
+        // every 5 seconds so we can compare replyChRecv vs udpConnWrite vs
+        // hubWriteToCalls vs hubWriteToBytes and locate packet loss in the
+        // second half of the relay chain.
+        go w.logCounters()
         return nil
+}
+
+// v26.11.282 DIAG: logCounters prints per-udpConn packet-flow counters
+// every 5 seconds. The counters measure the second half of the relay:
+//
+//      replyChRecv     — sessionReplyReader pulled a packet off replyCh
+//      udpConnWrite    — buf.Copy wrote a packet to udpConn (via output pipe)
+//      hubWriteToCalls — udpConn.output closure called hub.WriteTo
+//      hubWriteToBytes — bytes handed to hub.WriteTo
+//
+// Interpretation:
+//   replyChRecv ≈ udpConnWrite ≈ hubWriteToCalls → relay is healthy,
+//     loss is downstream of the VPS (network, phone, Chrome).
+//   replyChRecv > udpConnWrite → packets lost in output pipe (overflow).
+//   udpConnWrite > hubWriteToCalls → packets lost between Write and output.
+func (w *udpWorker) logCounters() {
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for {
+                select {
+                case <-w.ctx.Done():
+                        return
+                case <-ticker.C:
+                }
+                w.RLock()
+                if len(w.activeConn) == 0 {
+                        w.RUnlock()
+                        continue
+                }
+                type connStats struct {
+                        src                                   net.Destination
+                        replyChRecv, udpConnWrite             uint64
+                        hubWriteToCalls, hubWriteToBytes      uint64
+                }
+                stats := make([]connStats, 0, len(w.activeConn))
+                for _, c := range w.activeConn {
+                        stats = append(stats, connStats{
+                                src:            *c.src,
+                                replyChRecv:    atomic.LoadUint64(&c.replyChRecv),
+                                udpConnWrite:   atomic.LoadUint64(&c.udpConnWrite),
+                                hubWriteToCalls: atomic.LoadUint64(&c.hubWriteToCalls),
+                                hubWriteToBytes: atomic.LoadUint64(&c.hubWriteToBytes),
+                        })
+                }
+                w.RUnlock()
+                for _, s := range stats {
+                        errors.LogWarning(context.Background(), "DIAG COUNTERS: src=", s.src,
+                                " replyChRecv=", s.replyChRecv,
+                                " udpConnWrite=", s.udpConnWrite,
+                                " hubWriteToCalls=", s.hubWriteToCalls,
+                                " hubWriteToBytes=", s.hubWriteToBytes)
+                }
+        }
 }
 
 func (w *udpWorker) Close() error {
