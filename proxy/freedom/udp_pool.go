@@ -62,10 +62,10 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
-        // v26.11.252: lastActiveSource for NotifyServerSCID when DCID=∅.
-        // Plain pointer protected by mu (same lock as lastActiveInbox).
-        // No heap allocation in WriteTo — just stores c.source directly.
-        // Only read when len(dcid)==0 (h3 path). YouTube never reads this.
+        // v26.11.253: lastActiveSource for NotifyServerSCID when DCID=∅.
+        // Set in readLoop when src is not nil (demux hit). Read when
+        // src is nil AND len(dcid)==0 (h3 path). YouTube never reads this.
+        // WriteTo is UNCHANGED from v217 — zero impact on YouTube.
         lastActiveSource *stdnet.UDPAddr
 }
 
@@ -502,10 +502,18 @@ func (s *pooledSocket) readLoop() {
                     s.mu.Unlock()
                 }
 
-                // v26.11.252: Only read lastActiveSource when DCID is empty AND src is nil.
-                // This is the Chrome h3 path — YouTube never reaches here because
-                // YouTube's DCID is 8 bytes → demuxSource is set → src is not nil.
-                // Uses the same RLock as lastActiveInbox — no extra mutex.
+                // v26.11.253: Cache lastActiveSource from demux hits.
+                // When src is not nil (demux hit, YouTube), save it for
+                // later use by DCID=∅ replies (h3). This replaces the
+                // WriteTo-based approach that broke YouTube (v250/v252).
+                // WriteTo is completely unchanged from v217.
+                if src != nil {
+                        s.mu.Lock()
+                        s.lastActiveSource = src
+                        s.mu.Unlock()
+                }
+                // v26.11.253: For DCID=∅ replies (h3), use cached lastActiveSource.
+                // YouTube never reaches here — DCID is 8 bytes → src is not nil.
                 if src == nil && len(dcid) == 0 {
                         s.mu.RLock()
                         src = s.lastActiveSource
@@ -662,12 +670,9 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                                 c.RegisterCID(scid)
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
-                        // v26.11.252: Set lastActiveInbox and lastActiveSource together.
-                        // Plain pointer store — no heap allocation, no escape.
-                        // Same mutex as v217, only on long headers.
+                        // v26.11.217: Update lastActiveInbox on every WriteTo call
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
-                        c.socket.lastActiveSource = c.source
                         c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
