@@ -391,6 +391,18 @@ func (c *udpConn) EnsureSessionReader() {
                                 if pktCount <= 3 || pktCount%100 == 0 {
                                         errors.LogWarning(context.Background(), "DIAG READER: recv pkt#", pktCount, " len=", n)
                                 }
+                                // v26.11.277: Extract server SCID from long-header replies
+                                // and register in dcidIndex. This routes Chrome's 1-RTT
+                                // short headers (which carry DCID=server_SCID) to the
+                                // correct udpConn. Without this, all short headers from
+                                // the same Chrome source port go to the first conn.
+                                if n > 0 && buf[0]&0x80 != 0 {
+                                        if scid, _, perr := quic.ParseSCID(buf[:n]); perr == nil && len(scid) > 0 {
+                                                if c.registerServerCID != nil {
+                                                        c.registerServerCID(scid)
+                                                }
+                                        }
+                                }
                                 pkt := make([]byte, n)
                                 copy(pkt, buf[:n])
                                 select {
