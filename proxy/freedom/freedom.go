@@ -759,17 +759,34 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // BufferedPacketReader for the same pooledConn's inbox.
                         defer bpr.Close()
                 } else {
-                        // v26.11.272: If conn was persisted, use the permanent session
-                        // reader goroutine. Otherwise use NewPacketReader.
+                        // v26.11.281: Per-connection reader architecture.
+                        //
+                        // INVARIANT: socket.ReadFrom is called from exactly ONE place —
+                        // the permanent reader goroutine started by EnsureSessionReader.
+                        // responseDone must NEVER construct NewPacketReader for the
+                        // persisted path — that would create a second reader on the
+                        // same socket, and the two readers would steal packets from
+                        // each other (the "two readers, one socket" bug).
+                        //
+                        // If connPersisted is true, the permanent reader is already
+                        // running. We read ONLY from replyCh via sessionReplyReader.
+                        // If the type assertion fails, we log loudly and return an
+                        // error — we do NOT fall back to NewPacketReader.
                         if connPersisted {
                                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                                         if sr, ok := inbound.Conn.(interface{ ReadSessionReply() ([]byte, bool) }); ok {
                                                 reader = &sessionReplyReader{conn: sr}
                                         } else {
-                                                reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+                                                // v26.11.281: LOUD failure — do NOT fall back to NewPacketReader.
+                                                // That would create a second reader on the socket and silently
+                                                // steal packets from the permanent reader goroutine.
+                                                actualType := fmt.Sprintf("%T", inbound.Conn)
+                                                errors.LogError(context.Background(), "DIAG responseDone: FATAL — ReadSessionReply assertion FAILED, type=", actualType, " — NOT falling back to NewPacketReader")
+                                                return errors.New("responseDone: udpConn does not implement ReadSessionReply, type=" + actualType)
                                         }
                                 } else {
-                                        reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+                                        errors.LogError(context.Background(), "DIAG responseDone: FATAL — inbound.Conn is nil, NOT falling back to NewPacketReader")
+                                        return errors.New("responseDone: inbound.Conn is nil for persisted UDP conn")
                                 }
                         } else {
                                 reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
