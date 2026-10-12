@@ -62,6 +62,11 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // v26.11.255: lastActiveSource for NotifyServerSCID when DCID=∅.
+        // Written and read ONLY by the readLoop goroutine — no lock needed.
+        // Set when src is not nil (Initial reply, YouTube). Read when
+        // src is nil AND len(dcid)==0 (h3 1-RTT reply). YouTube never reads.
+        lastActiveSource *stdnet.UDPAddr
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -418,6 +423,11 @@ func (s *pooledSocket) readLoop() {
                 s.mu.RLock()
                 ch, ok := s.demux[dk]
                 src := s.demuxSource[dk]
+                // v26.11.255: If src is nil (DCID=∅ reply), use lastActiveSource.
+                // Uses the SAME RLock already held — zero extra mutex.
+                if src == nil {
+                        src = s.lastActiveSource
+                }
                 s.mu.RUnlock()
 
                 // Update timestamps under Lock. This is a short critical
@@ -498,6 +508,10 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        // v26.11.255: Cache src for future DCID=∅ replies.
+                        // No lock — readLoop is the only writer AND reader.
+                        // Runs only on long-header Initial replies (rare).
+                        s.lastActiveSource = src
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {

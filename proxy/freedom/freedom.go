@@ -860,25 +860,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // readLoop keeps draining the inbox — Google's replies are buffered
                         // and delivered when the goroutine restarts. Without this, the
                         // inbox fills up and replies are dropped → stall at ~10 seconds.
-                        // v26.11.254: Wrap PooledPacketReader with serverSCIDReader
-                        // BEFORE BufferedPacketReader. This detects the server's SCID
-                        // from long-header replies and registers it in dcidIndex via
-                        // RegisterServerSCID. This fixes the 127.0.0.1:443 routing for
-                        // Chrome h3 (0-length SCID) — without modifying udp_pool.go.
-                        poolReader := NewPooledPacketReader(pconn)
-                        var baseReader buf.Reader = poolReader
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
-                                        var scidRegistered bool
-                                        baseReader = &serverSCIDReader{
-                                                base:       baseReader,
-                                                register:   reg.RegisterServerSCID,
-                                                registered: &scidRegistered,
-                                        }
-                                }
-                        }
-                        bpr := NewBufferedPacketReader(baseReader)
+                        bpr := NewBufferedPacketReader(NewPooledPacketReader(pconn))
                         reader = bpr
+                        // v26.11.211: Close BufferedPacketReader when responseDone exits.
+                        // Without this, the readLoop competes with the new Process's
+                        // BufferedPacketReader for the same pooledConn's inbox.
                         defer bpr.Close()
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
