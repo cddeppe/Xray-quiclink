@@ -770,8 +770,14 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
                         // v26.11.217: Update lastActiveInbox on every WriteTo call
+                        // v26.11.288: Also update lastInboxByDest[destIP] so readLoop can
+                        // route DCID=∅ replies by the Google source IP. Only done for long
+                        // headers to avoid Lock contention on the 1-RTT hot path.
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
+                        if destUDP, ok := addr.(*stdnet.UDPAddr); ok && destUDP.IP != nil {
+                                c.socket.lastInboxByDest[destUDP.IP.String()] = c.inbox
+                        }
                         c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
@@ -799,15 +805,6 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         dest := c.socket.dest
         if udp, ok := addr.(*stdnet.UDPAddr); ok {
                 dest = udp
-        }
-        // v26.11.288: Update lastInboxByDest[destIP] for EVERY packet (not just
-        // long headers) so readLoop can route DCID=∅ replies by the Google source
-        // IP. This runs outside the long-header block so 1-RTT packets also
-        // refresh the mapping.
-        if dest != nil && dest.IP != nil {
-                c.socket.mu.Lock()
-                c.socket.lastInboxByDest[dest.IP.String()] = c.inbox
-                c.socket.mu.Unlock()
         }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
