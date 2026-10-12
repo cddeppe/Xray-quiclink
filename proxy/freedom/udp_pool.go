@@ -62,11 +62,6 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
-        // v26.11.253: lastActiveSource for NotifyServerSCID when DCID=∅.
-        // Set in readLoop when src is not nil (demux hit). Read when
-        // src is nil AND len(dcid)==0 (h3 path). YouTube never reads this.
-        // WriteTo is UNCHANGED from v217 — zero impact on YouTube.
-        lastActiveSource *stdnet.UDPAddr
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -502,23 +497,6 @@ func (s *pooledSocket) readLoop() {
                     s.mu.Unlock()
                 }
 
-                // v26.11.253: Cache lastActiveSource from demux hits.
-                // When src is not nil (demux hit, YouTube), save it for
-                // later use by DCID=∅ replies (h3). This replaces the
-                // WriteTo-based approach that broke YouTube (v250/v252).
-                // WriteTo is completely unchanged from v217.
-                if src != nil {
-                        s.mu.Lock()
-                        s.lastActiveSource = src
-                        s.mu.Unlock()
-                }
-                // v26.11.253: For DCID=∅ replies (h3), use cached lastActiveSource.
-                // YouTube never reaches here — DCID is 8 bytes → src is not nil.
-                if src == nil && len(dcid) == 0 {
-                        s.mu.RLock()
-                        src = s.lastActiveSource
-                        s.mu.RUnlock()
-                }
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
