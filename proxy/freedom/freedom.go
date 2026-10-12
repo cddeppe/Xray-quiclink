@@ -672,6 +672,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
+                                        // v26.11.271 DIAG: log SCID length to verify ParseSCID
+                                        scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
+                                        scidHex := ""
+                                        if scidErr == nil {
+                                                scidHex = fmt.Sprintf("%x", scid)
+                                        }
+                                        errors.LogWarning(context.Background(), "DIAG SCID: scidLen=", len(scid),
+                                                " scidErr=", scidErr, " scidHex=", scidHex,
+                                                " firstByte=0x", fmt.Sprintf("%02x", firstByte),
+                                                " dest=", destination)
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
