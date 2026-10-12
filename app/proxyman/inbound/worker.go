@@ -208,6 +208,12 @@ type udpConn struct {
         // goroutine restart peeks a short header, skips the pool, and dials
         // a new socket → stall.
         pooledConnPtr interface{} // *pooledConn, stored as interface to avoid import cycle
+        // v26.11.264: Persistent outbound PacketConn for 0-length SCID.
+        // Survives Process restarts so source port stays stable.
+        // Google sees same source port → no connection migration → no stall.
+        outboundPacketConn   stdnet.PacketConn
+        outboundPacketMu     sync.Mutex
+        outboundPacketDest   net.Destination
 }
 
 func (c *udpConn) setInactive() {
@@ -257,6 +263,24 @@ func (c *udpConn) GetPooledConn() interface{} {
 // Process calls. Called by freedom.Process after creating a pooledConn.
 func (c *udpConn) SetPooledConn(pc interface{}) {
         c.pooledConnPtr = pc
+}
+
+// v26.11.264: GetOutboundPacketConn returns the persistent outbound PacketConn.
+func (c *udpConn) GetOutboundPacketConn() stdnet.PacketConn {
+        c.outboundPacketMu.Lock()
+        defer c.outboundPacketMu.Unlock()
+        return c.outboundPacketConn
+}
+
+// v26.11.264: SetOutboundPacketConn stores the persistent outbound PacketConn.
+func (c *udpConn) SetOutboundPacketConn(pc stdnet.PacketConn, dest net.Destination) {
+        c.outboundPacketMu.Lock()
+        defer c.outboundPacketMu.Unlock()
+        if c.outboundPacketConn != nil && c.outboundPacketConn != pc {
+                c.outboundPacketConn.Close()
+        }
+        c.outboundPacketConn = pc
+        c.outboundPacketDest = dest
 }
 
 // v26.11.117: RegisterServerSCID is called by freedom's reader wrapper
@@ -350,6 +374,13 @@ func (c *udpConn) Close() error {
                 c.outboundConn = nil
         }
         c.outboundMu.Unlock()
+        // v26.11.264: Close the persistent outbound PacketConn too
+        c.outboundPacketMu.Lock()
+        if c.outboundPacketConn != nil {
+                c.outboundPacketConn.Close()
+                c.outboundPacketConn = nil
+        }
+        c.outboundPacketMu.Unlock()
         return nil
 }
 

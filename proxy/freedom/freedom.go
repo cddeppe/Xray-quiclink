@@ -597,10 +597,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
-                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
-                // Store the outbound conn in udpConn for reuse across Process
-                // restarts. Keeps source port stable → no Google path validation.
+        } else if destination.Network != net.Network_TCP {
+                // v26.11.264: For ALL UDP paths (pool or no pool), persist
+                // the outbound conn so source port survives Process restarts.
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
