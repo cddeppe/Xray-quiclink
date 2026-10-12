@@ -591,16 +591,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return errors.New("failed to set PROXY protocol v", version).Base(err)
                 }
         }
-        // v26.11.268: Flag-based guarded close for ALL UDP paths.
-        connPersisted := false
+        // v26.11.270: Revert conn lifecycle to v217 exactly.
+        // v269's "persist for ALL UDP" broke the pool path — conn.RemoteAddr()
+        // returned a stale destination from a previous Process, causing the
+        // pool to acquire a socket for the WRONG server.
+        connPersisted := false // v26.11.270: set true when 0-length SCID persists conn
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP {
-                defer func() {
-                        if !connPersisted {
-                                conn.Close()
-                        }
-                }()
+        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -608,13 +606,27 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }); ok {
                                 existingConn := udpConn.GetOutboundConn()
                                 if existingConn != nil {
-                                        conn.Close()
                                         conn = existingConn
-                                        connPersisted = true
                                         errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
+                                } else {
+                                        defer func() {
+                                                udpConn.SetOutboundConn(conn, destination)
+                                        }()
                                 }
+                        } else {
+                                defer conn.Close()
                         }
+                } else {
+                        defer conn.Close()
                 }
+        } else if destination.Network != net.Network_TCP {
+                // v26.11.270: Pool is on. Use guarded close — if 0-length SCID
+                // path persists conn, don't close it.
+                defer func() {
+                        if !connPersisted {
+                                conn.Close()
+                        }
+                }()
         } else {
                 defer conn.Close()
         }
@@ -669,17 +681,25 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         // v26.11.268: For 0-length SCID, skip pool → per-session path.
                                         // Persist conn and start permanent reader goroutine.
                                         if scid, _, scidErr := quic.ParseSCID(mb[0].Bytes()); scidErr == nil && len(scid) == 0 {
+                                                // v26.11.270: Persist conn HERE (not at top of Process).
+                                                // The pool path's defer conn.Close() is already set up
+                                                // (line 622). We need to prevent it from closing the
+                                                // persisted conn. Store a flag that the defer checks.
                                                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                                                         if udpConn, ok := inbound.Conn.(interface {
                                                                 GetOutboundConn() net.Conn
                                                                 SetOutboundConn(net.Conn, net.Destination)
                                                                 EnsureSessionReader(stdnet.Conn)
                                                         }); ok {
-                                                                if udpConn.GetOutboundConn() == nil {
+                                                                existing := udpConn.GetOutboundConn()
+                                                                if existing != nil {
+                                                                        conn.Close()
+                                                                        conn = existing
+                                                                } else {
                                                                         udpConn.SetOutboundConn(conn, destination)
-                                                                        connPersisted = true
-                                                                        udpConn.EnsureSessionReader(conn)
                                                                 }
+                                                                connPersisted = true // prevent defer from closing conn
+                                                                udpConn.EnsureSessionReader(conn)
                                                         }
                                                 }
                                         } else {
