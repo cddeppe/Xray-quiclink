@@ -448,7 +448,9 @@ func (s *pooledSocket) readLoop() {
                                 if addr != nil {
                                         if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk && srcUDP.IP != nil {
                                                 if li, liOk := s.lastInboxBySourceIP.Load(srcUDP.IP.String()); liOk {
-                                                        if lic, licOk := li.(chan<- readResult); licOk && lic != nil {
+                                                        // v26.11.296: assert to chan readResult (not chan<- readResult)
+                                                        // — same fix as demux.Load above
+                                                        if lic, licOk := li.(chan readResult); licOk && lic != nil {
                                                                 ch = lic
                                                                 ok = true
                                                         }
