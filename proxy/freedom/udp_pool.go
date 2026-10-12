@@ -21,6 +21,13 @@ import (
         "github.com/xtls/xray-core/transport/internet"
 )
 
+// v26.11.298: Number of readLoop goroutines per pooled socket.
+// Multiple goroutines can call ReadFrom on the same socket concurrently —
+// the kernel distributes packets across them. This parallelizes the
+// parse + demux + send pipeline, eliminating the single-reader bottleneck.
+// 4 workers balances parallelism vs goroutine overhead.
+const readLoopWorkers = 4
+
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
 // UDP socket. Reply packets are demuxed by parsing the QUIC DCID.
@@ -327,7 +334,14 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         sock.mu.Lock()
                         sock.refCount++
                         sock.mu.Unlock()
-                        go sock.readLoop()
+                        // v26.11.298: Spawn multiple readLoop workers to parallelize
+                        // packet processing. The kernel allows concurrent ReadFrom on
+                        // the same socket — each goroutine gets a different packet.
+                        // This eliminates the single-readLoop bottleneck where h3
+                        // replies waited behind YouTube's hundreds of packets/second.
+                        for i := 0; i < readLoopWorkers; i++ {
+                                go sock.readLoop()
+                        }
                 }
                 p.mu.Unlock()
         }
