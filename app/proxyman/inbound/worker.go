@@ -248,6 +248,7 @@ func (c *udpConn) GetOutboundConn() net.Conn {
 
 // v26.11.196: SetOutboundConn stores the outbound conn for reuse by future
 // Process calls. Called by freedom.Process after a successful dial.
+// v26.11.274: Also set sessionSocket for the reader goroutine.
 func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         c.outboundMu.Lock()
         defer c.outboundMu.Unlock()
@@ -256,6 +257,12 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         }
         c.outboundConn = conn
         c.outboundDest = dest
+        // v26.11.274: Also set sessionSocket for EnsureSessionReader
+        c.sessionSocketMu.Lock()
+        if pc, ok := conn.(stdnet.PacketConn); ok {
+                c.sessionSocket = pc
+        }
+        c.sessionSocketMu.Unlock()
 }
 
 // v26.11.202: GetPooledConn returns the persistent pooledConn.
