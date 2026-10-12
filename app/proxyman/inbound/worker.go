@@ -1056,6 +1056,15 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                         local.Address = net.AnyIPv6
                                 }
                         }
+                        // v26.11.285 DIAG: log hub.Addr(), w.address, and the computed local
+                        // to determine whether Option A (use w.address) or Option B (fix
+                        // resolveSrcAddr) is the right fix for IPv6 wildcard binding.
+                        errors.LogWarning(context.Background(), "DIAG HUBADDR: hubAddr=", w.hub.Addr(),
+                                " workerAddr=", w.address,
+                                " workerPort=", w.port,
+                                " source=", source,
+                                " localAddr=", local.Address,
+                                " localIsAny=", local.Address == net.AnyIP || local.Address == net.AnyIPv6)
 
                         ctx = session.ContextWithInbound(ctx, &session.Inbound{
                                 Source:  source,
