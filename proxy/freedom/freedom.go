@@ -1249,11 +1249,9 @@ type sessionReplyReader struct {
 func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         pkt, ok := r.conn.ReadSessionReply()
         if !ok || len(pkt) == 0 {
-                errors.LogWarning(context.Background(), "DIAG RDR: replyCh recv EOF ok=", ok, " len=", len(pkt))
                 return nil, io.EOF
         }
         // v26.11.280 DIAG: log every packet pulled from replyCh
-        errors.LogWarning(context.Background(), "DIAG RDR: replyCh recv, len=", len(pkt))
         b := buf.New()
         b.Write(pkt)
         return buf.MultiBuffer{b}, nil

@@ -112,8 +112,6 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
                         // pick a different IPv6 source for each socket → Google's
                         // replies go to the wrong address.
                         if kernelSrc := lookupKernelSource(destAddr); kernelSrc != nil {
-                                errors.LogWarning(ctx, "DIAG SRCSRC: cross-family bind — dest=", destAddr.String(),
-                                        " kernelSrc=", kernelSrc.String(), " originalSrc=", src)
                                 srcAddr = kernelSrc
                         } else {
                                 // Fallback: wildcard bind

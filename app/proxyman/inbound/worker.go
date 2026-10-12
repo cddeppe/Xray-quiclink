@@ -323,15 +323,9 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         // picks the source — which may differ from what the pool used.
         if pc != nil {
                 if localAddr := pc.LocalAddr(); localAddr != nil {
-                        errors.LogWarning(context.Background(), "DIAG SOCKET: src=", *c.src,
-                                " dest=", dest, " localAddr=", localAddr.String())
                 } else {
-                        errors.LogWarning(context.Background(), "DIAG SOCKET: src=", *c.src,
-                                " dest=", dest, " localAddr=nil")
                 }
         } else {
-                errors.LogWarning(context.Background(), "DIAG SOCKET: src=", *c.src,
-                        " dest=", dest, " sessionSocket=nil (unwrap failed)")
         }
 }
 
@@ -467,26 +461,21 @@ func (c *udpConn) EnsureSessionReader() {
                                 if n > 0 && buf[0]&0x80 != 0 {
                                         if scid, _, perr := quic.ParseSCID(buf[:n]); perr == nil && len(scid) > 0 {
                                                 if c.registerServerCID != nil {
-                                                        errors.LogWarning(context.Background(), "DIAG SCID-REG: calling register scid=", hex.EncodeToString(scid), " scidLen=", len(scid))
                                                         c.registerServerCID(scid)
                                                 } else {
-                                                        errors.LogWarning(context.Background(), "DIAG SCID-REG: callback is nil!")
                                                 }
                                         }
                                 }
                                 pkt := make([]byte, n)
                                 copy(pkt, buf[:n])
                                 // v26.11.280 DIAG: log push attempt with queue depth
-                                errors.LogWarning(context.Background(), "DIAG RDR: about to push, chLen=", len(c.sessionReplyCh), " cap=", cap(c.sessionReplyCh))
                                 select {
                                 case c.sessionReplyCh <- pkt:
                                         // v26.11.280 DIAG: log successful push
-                                        errors.LogWarning(context.Background(), "DIAG RDR: pushed to replyCh, len=", len(pkt), " chLen=", len(c.sessionReplyCh))
                                 case <-c.sessionReaderDone:
                                         return
                                 default:
                                         // Channel full — drop (QUIC retransmits)
-                                        errors.LogWarning(context.Background(), "DIAG RDR: replyCh FULL, dropped pkt len=", len(pkt), " chLen=", len(c.sessionReplyCh))
                                 }
                         }
                 }()
@@ -817,14 +806,6 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
-        // v26.11.276 DIAG: log every packet's destination + firstByte
-        pktBytes := b.Bytes()
-        fb := byte(0)
-        if len(pktBytes) > 0 {
-                fb = pktBytes[0]
-        }
-        errors.LogWarning(context.Background(), "DIAG CB: originalDest=", originalDest,
-                " source=", source, " firstByte=0x", hex.EncodeToString([]byte{fb}))
         id := connID{
                 src:    source,
                 srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
@@ -902,8 +883,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                 packetBytes := b.Bytes()
                 w.RLock()
                 var hitConn *udpConn
-                var hitDcid []byte
-                var hitID connID
                 if len(packetBytes) > 1 {
                         // Collect distinct CID lengths from dcidIndex keys.
                         // Use a small fixed-size array to avoid heap allocation
@@ -934,30 +913,18 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 if existingID, found := w.dcidIndex[dk]; found {
                                         if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
                                                 hitConn = existingConn
-                                                hitDcid = dcid
-                                                hitID = existingID
                                                 break
                                         }
                                 }
                         }
                 }
                 if hitConn != nil {
-                        dcidHex := hex.EncodeToString(hitDcid)
-                        routedTo := hitID.src
                         w.RUnlock()
-                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", dcidHex, " dcidHit=true routedTo=", routedTo)
                         hitConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                         hitConn.updateActivity()
                         return
                 }
-                diagSize := len(w.dcidIndex)
                 w.RUnlock()
-                // Log the miss with the 8-byte default parse for backwards-compatible diagnostics
-                if dcid8, _, err := quic.ParseShortHeaderDCIDWithLen(packetBytes, quic.DefaultShortHeaderCIDLen); err == nil {
-                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", hex.EncodeToString(dcid8), " dcidHit=false dcidIndexSize=", diagSize)
-                } else {
-                        errors.LogWarning(context.Background(), "DIAG 1RTT: parseErr dcidHit=false dcidIndexSize=", diagSize)
-                }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
                 w.RLock()
@@ -1016,8 +983,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if _, exists := w.dcidIndex[dk]; !exists {
                                 w.dcidIndex[dk] = connIDCopy
                         }
-                        errors.LogWarning(context.Background(), "DIAG SCID-REG: stored dcidIndex[", hex.EncodeToString(serverSCID),
-                                "]=", connIDCopy.src, " size=", len(w.dcidIndex))
                         w.Unlock()
                 }
         }
@@ -1059,12 +1024,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         // v26.11.285 DIAG: log hub.Addr(), w.address, and the computed local
                         // to determine whether Option A (use w.address) or Option B (fix
                         // resolveSrcAddr) is the right fix for IPv6 wildcard binding.
-                        errors.LogWarning(context.Background(), "DIAG HUBADDR: hubAddr=", w.hub.Addr(),
-                                " workerAddr=", w.address,
-                                " workerPort=", w.port,
-                                " source=", source,
-                                " localAddr=", local.Address,
-                                " localIsAny=", local.Address == net.AnyIP || local.Address == net.AnyIPv6)
 
                         ctx = session.ContextWithInbound(ctx, &session.Inbound{
                                 Source:  source,
