@@ -622,7 +622,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         defer conn.Close()
                 }
         } else {
-                defer conn.Close()
+                // v26.11.266: Don't defer conn.Close() here — the per-session path
+                // (0-length SCID) may persist conn via SetOutboundConn. Closing it
+                // would close the persisted conn. Use a guarded close instead.
         }
         errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
@@ -773,9 +775,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                                 conn = existingConn
                                                                 errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
                                                         } else {
-                                                                defer func() {
-                                                                        udpConn.SetOutboundConn(conn, destination)
-                                                                }()
+                                                                // v26.11.266: Store IMMEDIATELY, not via defer.
+                                                                // defer would fire AFTER conn.Close() (LIFO), storing a closed conn.
+                                                                udpConn.SetOutboundConn(conn, destination)
                                                         }
                                                 } else {
                                                         defer conn.Close()
@@ -787,6 +789,29 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
                 }
                 // If peek failed, proceed with existing path (pconn stays nil).
+        }
+
+        // v26.11.266: Guarded close — only close conn if it wasn't persisted.
+        if destination.Network != net.Network_TCP && h.socketPool != nil {
+                if pconn != nil {
+                        // Pool path: conn is NOT the data socket (pconn is). Close conn.
+                        defer conn.Close()
+                } else if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                        // Per-session path: check if conn was persisted via SetOutboundConn above
+                        if udpConn, ok := inbound.Conn.(interface {
+                                GetOutboundConn() net.Conn
+                        }); ok {
+                                if udpConn.GetOutboundConn() != conn {
+                                        // conn was NOT persisted (or was reused from existing) → close it
+                                        defer conn.Close()
+                                }
+                                // else: conn was just stored via SetOutboundConn → don't close
+                        } else {
+                                defer conn.Close()
+                        }
+                } else {
+                        defer conn.Close()
+                }
         }
 
         var newCtx context.Context
