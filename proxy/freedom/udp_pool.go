@@ -427,16 +427,22 @@ func (s *pooledSocket) readLoop() {
                 src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
-                // v26.11.261: On demux hit (non-empty DCID), cache the
+                // v26.11.262: On demux hit (non-empty DCID), cache the
                 // reply source IP → inbox mapping for future DCID=∅ replies.
-                // Only runs during Initial/Handshake (long headers with DCID).
-                // After CID rotation (DCID=∅), this doesn't run — map is already populated.
+                // Only writes ONCE per IP — subsequent hits skip (RLock only).
+                // This avoids Lock contention on YouTube's 25kpps hot path.
                 if ok && len(dcid) > 0 {
                         if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
                                 ipKey := udpAddr.IP.String()
-                                s.srcIPMu.Lock()
-                                s.srcIPInbox[ipKey] = ch
-                                s.srcIPMu.Unlock()
+                                // RLock check first — skip if already registered
+                                s.srcIPMu.RLock()
+                                existing, found := s.srcIPInbox[ipKey]
+                                s.srcIPMu.RUnlock()
+                                if !found || existing != ch {
+                                        s.srcIPMu.Lock()
+                                        s.srcIPInbox[ipKey] = ch
+                                        s.srcIPMu.Unlock()
+                                }
                         }
                 }
 
