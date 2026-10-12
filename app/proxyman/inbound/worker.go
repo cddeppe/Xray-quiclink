@@ -3,8 +3,10 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        stderrors "errors"
         stdnet "net"
         "sync"
+        "syscall"
 
         "github.com/xtls/xray-core/common/protocol/quic"
         "sync/atomic"
@@ -208,6 +210,16 @@ type udpConn struct {
         // goroutine restart peeks a short header, skips the pool, and dials
         // a new socket → stall.
         pooledConnPtr interface{} // *pooledConn, stored as interface to avoid import cycle
+        // v26.11.272: Per-connection UDP socket + permanent reader goroutine.
+        // Chrome always uses 0-length SCID → pool's DCID demux can't route replies.
+        // Each udpConn gets its own socket, reader goroutine, and replyCh.
+        // The socket survives Process restarts. Only clean() closes it.
+        sessionSocket     stdnet.PacketConn
+        sessionReplyCh     chan []byte
+        sessionReaderDone  chan struct{}
+        sessionReaderOnce  sync.Once
+        sessionSocketDest  net.Destination
+        sessionSocketMu    sync.Mutex
 }
 
 func (c *udpConn) setInactive() {
@@ -257,6 +269,100 @@ func (c *udpConn) GetPooledConn() interface{} {
 // Process calls. Called by freedom.Process after creating a pooledConn.
 func (c *udpConn) SetPooledConn(pc interface{}) {
         c.pooledConnPtr = pc
+}
+
+// v26.11.272: GetSessionSocket returns the persisted per-connection socket.
+func (c *udpConn) GetSessionSocket() stdnet.PacketConn {
+        c.sessionSocketMu.Lock()
+        defer c.sessionSocketMu.Unlock()
+        return c.sessionSocket
+}
+
+// v26.11.272: SetSessionSocket stores the per-connection socket.
+// Called once from freedom.Process. Reused across Process restarts.
+func (c *udpConn) SetSessionSocket(pc stdnet.PacketConn, dest net.Destination) {
+        c.sessionSocketMu.Lock()
+        defer c.sessionSocketMu.Unlock()
+        c.sessionSocket = pc
+        c.sessionSocketDest = dest
+}
+
+// v26.11.272: EnsureSessionReader starts a permanent reader goroutine.
+// Idempotent via sync.Once. Reads from sessionSocket into sessionReplyCh.
+// Runs for the lifetime of udpConn — never installed/removed per Process.
+func (c *udpConn) EnsureSessionReader() {
+        c.sessionReaderOnce.Do(func() {
+                c.sessionReplyCh = make(chan []byte, 1024)
+                c.sessionReaderDone = make(chan struct{})
+                go func() {
+                        buf := make([]byte, 65535)
+                        for {
+                                select {
+                                case <-c.sessionReaderDone:
+                                        return
+                                default:
+                                }
+                                // Read from the persisted socket
+                                c.sessionSocketMu.Lock()
+                                pc := c.sessionSocket
+                                c.sessionSocketMu.Unlock()
+                                if pc == nil {
+                                        return
+                                }
+                                n, _, err := pc.ReadFrom(buf)
+                                if err != nil {
+                                        select {
+                                        case <-c.sessionReaderDone:
+                                                return
+                                        default:
+                                        }
+                                        var errno syscall.Errno
+                                        if stderrors.As(err, &errno) {
+                                                switch errno {
+                                                case syscall.EAGAIN, syscall.ENOMEM, syscall.ENOBUFS,
+                                                        syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNREFUSED:
+                                                        continue
+                                                }
+                                        }
+                                        return
+                                }
+                                pkt := make([]byte, n)
+                                copy(pkt, buf[:n])
+                                select {
+                                case c.sessionReplyCh <- pkt:
+                                case <-c.sessionReaderDone:
+                                        return
+                                default:
+                                        // Channel full — drop (QUIC retransmits)
+                                }
+                        }
+                }()
+        })
+}
+
+// v26.11.272: ReadSessionReply returns one reply packet from the permanent
+// reader goroutine. Called by freedom.Process's responseDone.
+func (c *udpConn) ReadSessionReply() ([]byte, bool) {
+        select {
+        case pkt, ok := <-c.sessionReplyCh:
+                return pkt, ok
+        case <-c.sessionReaderDone:
+                return nil, false
+        }
+}
+
+// v26.11.272: WriteSessionPacket writes a packet to the persisted socket.
+// Called by freedom.Process's requestDone via sessionPacketWriter.
+func (c *udpConn) WriteSessionPacket(b []byte) (int, error) {
+        c.sessionSocketMu.Lock()
+        pc := c.sessionSocket
+        dest := c.sessionSocketDest
+        c.sessionSocketMu.Unlock()
+        if pc == nil {
+                return 0, stderrors.New("session socket not set")
+        }
+        addr, _ := stdnet.ResolveUDPAddr("udp", dest.String())
+        return pc.WriteTo(b, addr)
 }
 
 // v26.11.117: RegisterServerSCID is called by freedom's reader wrapper
@@ -343,6 +449,16 @@ func (c *udpConn) Close() error {
         }
         common.Must(c.done.Close())
         common.Must(common.Close(c.writer))
+        // v26.11.272: Stop the session reader goroutine and close the socket.
+        if c.sessionReaderDone != nil {
+                close(c.sessionReaderDone)
+        }
+        c.sessionSocketMu.Lock()
+        if c.sessionSocket != nil {
+                c.sessionSocket.Close()
+                c.sessionSocket = nil
+        }
+        c.sessionSocketMu.Unlock()
         // v26.11.196: Close the persistent outbound conn too
         c.outboundMu.Lock()
         if c.outboundConn != nil {
