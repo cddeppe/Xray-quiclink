@@ -62,6 +62,11 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // v26.11.252: lastActiveSource for NotifyServerSCID when DCID=∅.
+        // Plain pointer protected by mu (same lock as lastActiveInbox).
+        // No heap allocation in WriteTo — just stores c.source directly.
+        // Only read when len(dcid)==0 (h3 path). YouTube never reads this.
+        lastActiveSource *stdnet.UDPAddr
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -497,6 +502,15 @@ func (s *pooledSocket) readLoop() {
                     s.mu.Unlock()
                 }
 
+                // v26.11.252: Only read lastActiveSource when DCID is empty AND src is nil.
+                // This is the Chrome h3 path — YouTube never reaches here because
+                // YouTube's DCID is 8 bytes → demuxSource is set → src is not nil.
+                // Uses the same RLock as lastActiveInbox — no extra mutex.
+                if src == nil && len(dcid) == 0 {
+                        s.mu.RLock()
+                        src = s.lastActiveSource
+                        s.mu.RUnlock()
+                }
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
@@ -648,9 +662,12 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                                 c.RegisterCID(scid)
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
-                        // v26.11.217: Update lastActiveInbox on every WriteTo call
+                        // v26.11.252: Set lastActiveInbox and lastActiveSource together.
+                        // Plain pointer store — no heap allocation, no escape.
+                        // Same mutex as v217, only on long headers.
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
+                        c.socket.lastActiveSource = c.source
                         c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
