@@ -597,9 +597,10 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP {
-                // v26.11.264: For ALL UDP paths (pool or no pool), persist
-                // the outbound conn so source port survives Process restarts.
+        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
+                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
+                // Store the outbound conn in udpConn for reuse across Process
+                // restarts. Keeps source port stable → no Google path validation.
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -671,6 +672,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
+                                        // v26.11.265: For 0-length SCID, skip pool → use per-session
+                                        // path (conn is persisted, own source port, no demux race).
+                                        // For non-zero SCID, use pool (shared socket, DCID demux).
+                                        if scid, _, scidErr := quic.ParseSCID(mb[0].Bytes()); scidErr == nil && len(scid) == 0 {
+                                                // 0-length SCID: don't acquire pool socket
+                                                // pconn stays nil → per-session path used
+                                                // conn is persisted via SetOutboundConn (h.socketPool == nil check
+                                                // won't match, so we need to persist manually below)
+                                        } else {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -745,6 +755,30 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                 // updated and clean() retires after sessionIdleTimeout.
                                                 if updater, ok := inbound.Conn.(interface{ UpdateActivity() }); ok {
                                                         pconn.onActivity = updater.UpdateActivity
+                                                }
+                                        }
+                                }
+                                } // close else (non-zero SCID pool path)
+                                // v26.11.265: For 0-length SCID, persist conn manually
+                                // (the h.socketPool== nil check above doesn't match when pool is on).
+                                if pconn == nil {
+                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                if udpConn, ok := inbound.Conn.(interface {
+                                                        GetOutboundConn() net.Conn
+                                                        SetOutboundConn(net.Conn, net.Destination)
+                                                }); ok {
+                                                        existingConn := udpConn.GetOutboundConn()
+                                                        if existingConn != nil {
+                                                                conn.Close()
+                                                                conn = existingConn
+                                                                errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
+                                                        } else {
+                                                                defer func() {
+                                                                        udpConn.SetOutboundConn(conn, destination)
+                                                                }()
+                                                        }
+                                                } else {
+                                                        defer conn.Close()
                                                 }
                                         }
                                 }
