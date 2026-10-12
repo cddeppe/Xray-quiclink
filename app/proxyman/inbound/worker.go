@@ -408,12 +408,17 @@ func (c *udpConn) EnsureSessionReader() {
                                 }
                                 pkt := make([]byte, n)
                                 copy(pkt, buf[:n])
+                                // v26.11.280 DIAG: log push attempt with queue depth
+                                errors.LogWarning(context.Background(), "DIAG RDR: about to push, chLen=", len(c.sessionReplyCh), " cap=", cap(c.sessionReplyCh))
                                 select {
                                 case c.sessionReplyCh <- pkt:
+                                        // v26.11.280 DIAG: log successful push
+                                        errors.LogWarning(context.Background(), "DIAG RDR: pushed to replyCh, len=", len(pkt), " chLen=", len(c.sessionReplyCh))
                                 case <-c.sessionReaderDone:
                                         return
                                 default:
                                         // Channel full — drop (QUIC retransmits)
+                                        errors.LogWarning(context.Background(), "DIAG RDR: replyCh FULL, dropped pkt len=", len(pkt), " chLen=", len(c.sessionReplyCh))
                                 }
                         }
                 }()

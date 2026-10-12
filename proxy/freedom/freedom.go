@@ -4,6 +4,7 @@ import (
         "context"
         "crypto/rand"
         stderrors "errors"
+        "fmt"
         "io"
         "strings"
         "sync/atomic"
@@ -789,10 +790,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 }
                         }
                 }
+                // v26.11.280 DIAG: log right before buf.Copy
+                errors.LogWarning(context.Background(), "DIAG responseDone: about to copy reader→output dest=", destination, " connPersisted=", connPersisted, " readerType=", fmt.Sprintf("%T", reader))
                 if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
                         errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
                         return errors.New("failed to process response").Base(err)
                 }
+                errors.LogWarning(context.Background(), "DIAG responseDone: copy returned err=nil dest=", destination)
                 errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
                 // v26.11.209: Cancel the context so requestDone also returns.
                 // Without this, responseDone exits (30s timeout) but requestDone
@@ -1216,8 +1220,11 @@ type sessionReplyReader struct {
 func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         pkt, ok := r.conn.ReadSessionReply()
         if !ok || len(pkt) == 0 {
+                errors.LogWarning(context.Background(), "DIAG RDR: replyCh recv EOF ok=", ok, " len=", len(pkt))
                 return nil, io.EOF
         }
+        // v26.11.280 DIAG: log every packet pulled from replyCh
+        errors.LogWarning(context.Background(), "DIAG RDR: replyCh recv, len=", len(pkt))
         b := buf.New()
         b.Write(pkt)
         return buf.MultiBuffer{b}, nil
