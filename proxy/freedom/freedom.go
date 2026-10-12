@@ -625,16 +625,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         var peekedPackets buf.MultiBuffer
         if destination.Network != net.Network_TCP {
                 if !connPersisted {
-                        // First Process call: persist conn and start reader
+                        // First Process call: persist conn and start reader.
+                        // v26.11.273: Resolve destination to IP from conn.RemoteAddr()
+                        // so domain destinations (quic.nginx.org) are stored as IPs.
+                        // YouTube is already resolved by sticky resolver. nginx is not.
+                        resolvedDest := destination
+                        if remoteDest := net.DestinationFromAddr(conn.RemoteAddr()); remoteDest.IsValid() {
+                                resolvedDest.Address = remoteDest.Address
+                        }
                         if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                                 if udpConn, ok := inbound.Conn.(interface {
                                         SetOutboundConn(net.Conn, net.Destination)
                                         EnsureSessionReader()
                                 }); ok {
-                                        udpConn.SetOutboundConn(conn, destination)
+                                        udpConn.SetOutboundConn(conn, resolvedDest)
                                         connPersisted = true
                                         udpConn.EnsureSessionReader()
-                                        errors.LogWarning(context.Background(), "DIAG: session socket persisted dest=", destination)
+                                        errors.LogWarning(context.Background(), "DIAG: session socket persisted dest=", resolvedDest)
                                 }
                         }
                 }
