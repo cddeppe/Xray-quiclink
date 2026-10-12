@@ -57,11 +57,11 @@ type pooledSocket struct {
         // v26.11.216: shortHeaderCIDLen learned from the first connection's
         // Initial SCID length. For Chrome (0-length SCID), this is 0.
         shortHeaderCIDLen atomic.Int32
-        // v26.11.250: Use atomic.Pointer for lastActiveSource (no mutex).
-        // lastActiveInbox stays as a regular field with RLock — only read
-        // when DCID=∅, which is the rare h3 path. YouTube never reads it.
+        // v26.11.217: lastActiveInbox is the inbox of the connection that
+        // most recently sent a packet via WriteTo. When a reply arrives with
+        // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
+        // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
-        lastActiveSource atomic.Pointer[stdnet.UDPAddr]
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -431,8 +431,10 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.250: If DCID is empty (0-length), use lastActiveInbox.
-                        // YouTube never reaches here — DCID is always 8 bytes → demux hits.
+                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
+                        // instead of demux[∅]. This avoids collisions when multiple
+                        // connections share the pool socket (all Chrome connections
+                        // have 0-length SCID → all replies have DCID=∅).
                         if len(dcid) == 0 {
                                 s.mu.RLock()
                                 li := s.lastActiveInbox
@@ -495,12 +497,6 @@ func (s *pooledSocket) readLoop() {
                     s.mu.Unlock()
                 }
 
-                // v26.11.250: Only read lastActiveSource when DCID is empty AND src is nil.
-                // This is the Chrome h3 path — YouTube never reaches here because
-                // YouTube's DCID is 8 bytes → demuxSource is set → src is not nil.
-                if src == nil && len(dcid) == 0 {
-                        src = s.lastActiveSource.Load()
-                }
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
@@ -652,16 +648,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                                 c.RegisterCID(scid)
                         }
                         c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
-                        // v26.11.250: Set lastActiveInbox (mutex, long headers only)
-                        // and lastActiveSource (atomic, no mutex). Only runs for
-                        // long headers — zero impact on YouTube's 1-RTT hot path.
+                        // v26.11.217: Update lastActiveInbox on every WriteTo call
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
                         c.socket.mu.Unlock()
-                        if c.source != nil {
-                                srcCopy := *c.source
-                                c.socket.lastActiveSource.Store(&srcCopy)
-                        }
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
