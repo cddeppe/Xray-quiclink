@@ -21,12 +21,9 @@ import (
         "github.com/xtls/xray-core/transport/internet"
 )
 
-// v26.11.298: Number of readLoop goroutines per pooled socket.
-// Multiple goroutines can call ReadFrom on the same socket concurrently —
-// the kernel distributes packets across them. This parallelizes the
-// parse + demux + send pipeline, eliminating the single-reader bottleneck.
-// 4 workers balances parallelism vs goroutine overhead.
-const readLoopWorkers = 4
+// v26.11.300: Bumped to 8 workers. 4 was good, 8 gives more headroom
+// for heavy YouTube streaming without h3 starvation.
+const readLoopWorkers = 8
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
