@@ -5,6 +5,7 @@ import (
         "encoding/hex"
         stderrors "errors"
         stdnet "net"
+        "reflect"
         "sync"
         "syscall"
 
@@ -249,6 +250,9 @@ func (c *udpConn) GetOutboundConn() net.Conn {
 // v26.11.196: SetOutboundConn stores the outbound conn for reuse by future
 // Process calls. Called by freedom.Process after a successful dial.
 // v26.11.274: Also set sessionSocket for the reader goroutine.
+// v26.11.275: Unwrap stat.CounterConnection and PacketConnWrapper to get
+// the underlying net.PacketConn. Without this, the type assertion fails
+// because the dialer wraps the conn in multiple layers.
 func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         c.outboundMu.Lock()
         defer c.outboundMu.Unlock()
@@ -257,12 +261,52 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         }
         c.outboundConn = conn
         c.outboundDest = dest
-        // v26.11.274: Also set sessionSocket for EnsureSessionReader
+        // v26.11.275: Unwrap to find the underlying PacketConn
         c.sessionSocketMu.Lock()
-        if pc, ok := conn.(stdnet.PacketConn); ok {
-                c.sessionSocket = pc
-        }
+        c.sessionSocket = unwrapPacketConn(conn)
         c.sessionSocketMu.Unlock()
+}
+
+// unwrapPacketConn unwraps stat.CounterConnection and PacketConnWrapper
+// to find the underlying net.PacketConn for the reader goroutine.
+func unwrapPacketConn(conn stdnet.Conn) stdnet.PacketConn {
+        // Try direct
+        if pc, ok := conn.(stdnet.PacketConn); ok {
+                return pc
+        }
+        // Try stat.CounterConnection → .Connection
+        type counterConn interface {
+                GetConnection() stdnet.Conn
+        }
+        if cc, ok := conn.(counterConn); ok {
+                return unwrapPacketConn(cc.GetConnection())
+        }
+        // Try by accessing the embedded field via type assertion
+        // stat.CounterConnection embeds net.Conn as "Connection"
+        // PacketConnWrapper embeds net.PacketConn
+        // Use reflection to find a net.PacketConn field
+        rv := reflect.ValueOf(conn)
+        if rv.Kind() == reflect.Ptr {
+                rv = rv.Elem()
+        }
+        if rv.Kind() == reflect.Struct {
+                for i := 0; i < rv.NumField(); i++ {
+                        field := rv.Field(i)
+                        if !field.CanInterface() {
+                                continue
+                        }
+                        if pc, ok := field.Interface().(stdnet.PacketConn); ok {
+                                return pc
+                        }
+                        // Try unwrapping nested
+                        if fc, ok := field.Interface().(stdnet.Conn); ok {
+                                if pc := unwrapPacketConn(fc); pc != nil {
+                                        return pc
+                                }
+                        }
+                }
+        }
+        return nil
 }
 
 // v26.11.202: GetPooledConn returns the persistent pooledConn.
