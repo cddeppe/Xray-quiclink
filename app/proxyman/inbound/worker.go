@@ -399,7 +399,10 @@ func (c *udpConn) EnsureSessionReader() {
                                 if n > 0 && buf[0]&0x80 != 0 {
                                         if scid, _, perr := quic.ParseSCID(buf[:n]); perr == nil && len(scid) > 0 {
                                                 if c.registerServerCID != nil {
+                                                        errors.LogWarning(context.Background(), "DIAG SCID-REG: calling register scid=", hex.EncodeToString(scid), " scidLen=", len(scid))
                                                         c.registerServerCID(scid)
+                                                } else {
+                                                        errors.LogWarning(context.Background(), "DIAG SCID-REG: callback is nil!")
                                                 }
                                         }
                                 }
@@ -804,12 +807,14 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if existingID, found := w.dcidIndex[dk]; found {
                                 if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
                                         w.RUnlock()
+                                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", hex.EncodeToString(dcid), " dcidHit=true routedTo=", existingID.src)
                                         existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
                                         existingConn.updateActivity()
                                         return
                                 }
                         }
                         w.RUnlock()
+                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", hex.EncodeToString(dcid), " dcidHit=false dcidIndexSize=", len(w.dcidIndex))
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
@@ -869,6 +874,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                         if _, exists := w.dcidIndex[dk]; !exists {
                                 w.dcidIndex[dk] = connIDCopy
                         }
+                        errors.LogWarning(context.Background(), "DIAG SCID-REG: stored dcidIndex[", hex.EncodeToString(serverSCID),
+                                "]=", connIDCopy.src, " size=", len(w.dcidIndex))
                         w.Unlock()
                 }
         }
