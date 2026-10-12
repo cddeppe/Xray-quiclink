@@ -427,10 +427,12 @@ func (s *pooledSocket) readLoop() {
                 s.mu.RUnlock()
 
                 // v26.11.293: 20-byte CID lookup for short headers. If the first
-                // lookup missed and this is a short header, try parsing with
-                // length=20 (Google's server SCID length). O(1) — one extra parse
-                // + one extra demux lookup, no map iteration. Only fires on miss.
-                if !ok && n > 0 && packet[0]&0x80 == 0 && len(packet) > 20 {
+                // lookup missed and this is a short header with a NON-EMPTY DCID,
+                // try parsing with length=20 (Google's server SCID length).
+                // v26.11.294: Skip when len(dcid)==0 (Chrome's case) — that goes
+                // straight to the DCID=∅ fallback without wasting an extra RLock
+                // + parse on every 1-RTT packet (was causing stalls).
+                if !ok && len(dcid) > 0 && n > 0 && packet[0]&0x80 == 0 && len(packet) > 20 {
                         if altDcid, _, altErr := quic.ParseShortHeaderDCIDWithLen(packet[:n], 20); altErr == nil && len(altDcid) > 0 {
                                 altDk := makeDCIDKey(altDcid)
                                 s.mu.RLock()
