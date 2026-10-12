@@ -431,9 +431,11 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.258: If DCID is empty (0-length SCID), deliver
-                        // to lastActiveInbox (primary) and broadcast to others.
-                        // Chrome's QUIC stack drops wrong-DCID packets.
+                        // v26.11.260: If DCID is empty (0-length SCID):
+                        // - If only 1 conn is actively reading → use lastActiveInbox (v217 behavior)
+                        // - If multiple conns are reading → broadcast to all with capacity
+                        // This way videos (1 stream) get v217 performance,
+                        // thumbnails (N streams) get correct routing.
                         if len(dcid) == 0 {
                                 s.mu.RLock()
                                 li := s.lastActiveInbox
@@ -444,27 +446,31 @@ func (s *pooledSocket) readLoop() {
                                         ch = li
                                         ok = true
                                 }
-                                // Broadcast to other conns — but SKIP full inboxes
-                                // to avoid getPacket/copy allocation overhead.
-                                // Only 1-3 conns are actively reading; the rest
-                                // have full inboxes and get skipped.
+                                // Count conns with non-full inboxes (actively reading)
+                                activeCount := 0
                                 for _, c := range connsCopy {
-                                        if c == nil || c.closed.Load() {
-                                                continue
+                                        if c != nil && !c.closed.Load() && len(c.inbox) < cap(c.inbox) {
+                                                activeCount++
                                         }
-                                        if c.inbox == ch {
-                                                continue
-                                        }
-                                        // Skip if inbox is full — conn isn't reading
-                                        if len(c.inbox) >= cap(c.inbox) {
-                                                continue
-                                        }
-                                        pktCopy := getPacket()
-                                        copy(pktCopy, packet[:n])
-                                        select {
-                                        case c.inbox <- readResult{data: pktCopy[:n], addr: addr}:
-                                        default:
-                                                putPacket(pktCopy)
+                                }
+                                // Only broadcast if multiple conns are actively reading.
+                                // For videos (1 stream): activeCount=1 → no broadcast → v217 behavior.
+                                // For thumbnails (N streams): activeCount>1 → broadcast → correct routing.
+                                if activeCount > 1 {
+                                        for _, c := range connsCopy {
+                                                if c == nil || c.closed.Load() || c.inbox == ch {
+                                                        continue
+                                                }
+                                                if len(c.inbox) >= cap(c.inbox) {
+                                                        continue
+                                                }
+                                                pktCopy := getPacket()
+                                                copy(pktCopy, packet[:n])
+                                                select {
+                                                case c.inbox <- readResult{data: pktCopy[:n], addr: addr}:
+                                                default:
+                                                        putPacket(pktCopy)
+                                                }
                                         }
                                 }
                         }
