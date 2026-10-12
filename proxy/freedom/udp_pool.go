@@ -503,6 +503,17 @@ func (s *pooledSocket) readLoop() {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidCopy := append([]byte(nil), scid...)
                                         quic.NotifyServerSCID(scidCopy, src)
+                                        // v26.11.291 Fix A: also register the server SCID in this
+                                        // socket's demux map so future 1-RTT short-header packets
+                                        // (DCID = server SCID) can be routed. Only for long headers
+                                        // (Initial replies) — zero hot-path impact.
+                                        scidKey := makeDCIDKey(scidCopy)
+                                        s.mu.Lock()
+                                        if _, exists := s.demux[scidKey]; !exists {
+                                                s.demux[scidKey] = ch
+                                                s.demuxSource[scidKey] = src
+                                        }
+                                        s.mu.Unlock()
                                 }
                         }
                 }
