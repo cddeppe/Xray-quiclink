@@ -680,20 +680,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // v26.11.256: For 0-length SCID (Chrome h3, YouTube thumbnails),
-                                        // use a per-connection pool socket. This gives each connection
-                                        // its own source port → no lastActiveInbox race.
-                                        // For non-zero SCID (YouTube videos), use shared socket (DCID demux).
-                                        if scid, _, scidErr := quic.ParseSCID(mb[0].Bytes()); scidErr == nil && len(scid) == 0 {
-                                                inbound := session.InboundFromContext(ctx)
-                                                if inbound != nil && inbound.Source.IsValid() {
-                                                        pconn, err = h.socketPool.AcquireWithSource(udpRemote, int(inbound.Source.Port))
-                                                } else {
-                                                        pconn, err = h.socketPool.Acquire(udpRemote)
-                                                }
-                                        } else {
-                                                pconn, err = h.socketPool.Acquire(udpRemote)
-                                        }
+                                        pconn, err = h.socketPool.Acquire(udpRemote)
                                         errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pconn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets

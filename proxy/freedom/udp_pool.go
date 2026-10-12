@@ -62,11 +62,6 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
-        // v26.11.255: lastActiveSource for NotifyServerSCID when DCID=∅.
-        // Written and read ONLY by the readLoop goroutine — no lock needed.
-        // Set when src is not nil (Initial reply, YouTube). Read when
-        // src is nil AND len(dcid)==0 (h3 1-RTT reply). YouTube never reads.
-        lastActiveSource *stdnet.UDPAddr
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -207,26 +202,23 @@ func (p *UDPSocketPool) Close() {
 }
 
 func (p *UDPSocketPool) evictStale() {
+        // v26.11.207: Don't evict the shared socket. With port-only keying,
+        // there's only ONE socket for all QUIC traffic. Evicting it kills
+        // the source port stability. The socket is wildcard-bound and
+        // receives from any IP — it should never be evicted.
+        //
+        // Only evict if the socket is dead AND refCount == 0 (truly abandoned).
         p.mu.Lock()
         defer p.mu.Unlock()
-        nowNano := time.Now().UnixNano()
-        idleThreshold := int64(2 * time.Minute)
         for key, sock := range p.sockets {
                 sock.mu.Lock()
                 isDead := sock.dead && sock.refCount == 0
-                // v26.11.256: Evict idle per-connection sockets (key has 2+ colons).
-                // Shared sockets (key = ":port") are never evicted.
-                isIdlePerConn := false
-                if strings.Count(key, ":") >= 2 && sock.refCount == 0 {
-                        if nowNano-sock.lastUsed.Load() > idleThreshold {
-                                isIdlePerConn = true
-                        }
-                }
                 sock.mu.Unlock()
 
-                if isDead || isIdlePerConn {
+                if isDead {
                         sock.MarkStale()
                         delete(p.sockets, key)
+                        xrayerrors.LogInfo(context.Background(), "udp_pool: evicted dead socket for ", key)
                 }
         }
 }
@@ -261,23 +253,9 @@ func destKey(dest *stdnet.UDPAddr) string {
         return fmt.Sprintf(":%d", dest.Port)
 }
 
-// v26.11.256: Per-connection socket key for 0-length SCID.
-// Includes Chrome source port to distinguish connections.
-func destKeyWithSource(dest *stdnet.UDPAddr, sourcePort int) string {
-        return fmt.Sprintf(":%d:%d", dest.Port, sourcePort)
-}
-
 func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
         key := destKey(dest)
-        return p.acquireWithKey(dest, key)
-}
 
-// v26.11.256: Per-connection socket for 0-length SCID.
-func (p *UDPSocketPool) AcquireWithSource(dest *stdnet.UDPAddr, sourcePort int) (*pooledConn, error) {
-        return p.acquireWithKey(dest, destKeyWithSource(dest, sourcePort))
-}
-
-func (p *UDPSocketPool) acquireWithKey(dest *stdnet.UDPAddr, key string) (*pooledConn, error) {
         p.mu.Lock()
         sock, ok := p.sockets[key]
         if ok && (sock.IsClosed() || sock.IsDead()) {
@@ -440,11 +418,6 @@ func (s *pooledSocket) readLoop() {
                 s.mu.RLock()
                 ch, ok := s.demux[dk]
                 src := s.demuxSource[dk]
-                // v26.11.255: If src is nil (DCID=∅ reply), use lastActiveSource.
-                // Uses the SAME RLock already held — zero extra mutex.
-                if src == nil {
-                        src = s.lastActiveSource
-                }
                 s.mu.RUnlock()
 
                 // Update timestamps under Lock. This is a short critical
@@ -458,17 +431,31 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
-                        // instead of demux[∅]. This avoids collisions when multiple
-                        // connections share the pool socket (all Chrome connections
-                        // have 0-length SCID → all replies have DCID=∅).
+                        // v26.11.257: If DCID is empty (0-length SCID), broadcast
+                        // to ALL active inboxes. Chrome's QUIC stack will drop
+                        // packets with wrong DCID — only the correct connection
+                        // processes it. This fixes the lastActiveInbox race for
+                        // YouTube thumbnails and h3 sites.
+                        // Uses existing s.conns list — no new field, no WriteTo change.
                         if len(dcid) == 0 {
                                 s.mu.RLock()
-                                li := s.lastActiveInbox
+                                connsCopy := make([]*pooledConn, len(s.conns))
+                                copy(connsCopy, s.conns)
                                 s.mu.RUnlock()
-                                if li != nil {
-                                        ch = li
-                                        ok = true
+                                for _, c := range connsCopy {
+                                        if c.closed.Load() || c == nil {
+                                                continue
+                                        }
+                                        if c.inbox == ch {
+                                                continue // already sending to this one
+                                        }
+                                        pktCopy := getPacket()
+                                        copy(pktCopy, packet[:n])
+                                        select {
+                                        case c.inbox <- readResult{data: pktCopy[:n], addr: addr}:
+                                        default:
+                                                putPacket(pktCopy)
+                                        }
                                 }
                         }
                 }
@@ -525,10 +512,6 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
-                        // v26.11.255: Cache src for future DCID=∅ replies.
-                        // No lock — readLoop is the only writer AND reader.
-                        // Runs only on long-header Initial replies (rare).
-                        s.lastActiveSource = src
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
