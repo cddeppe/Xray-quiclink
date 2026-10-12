@@ -1,0 +1,25 @@
+tree 0be26c3bb23b9f41d225c731c05b5718dccdbbde
+parent 5679d717eef23f48d4f60a0a34684f46c478e053
+author 风扇滑翔翼 <Fangliding.fshxy@outlook.com> 1737889716 +0800
+committer GitHub <noreply@github.com> 1737889716 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wsFcBAABCAAQBQJnlhe0CRC1aQ7uu5UhlAAA3t8QAFn7KI8E4dcw+ZTHMfvBx7Ro
+ 1fuNFDfEnZSARWC2jA2ddYmg/f/q58hoCpuirnSxsuUmR1oFNBPeZPdoD0M2HrbC
+ mPiv5vg/SZ0FjevIxqNuoJsfSTGVv8Hv8tehJudvrxXmGik2ljz2chhYdirJrjfB
+ CzYuP8ye26Qxmw+TaFae9ae/y1ft/A7zfSC3BxTzNgFGknO/NIWGG/pJSCfcslLP
+ 5BKFvaCD18NxwcCJZNov1QG8Ov3OdfjGqcYJ4zMDfZncsZ9quVUi1fV6X2l1lgfY
+ rK0k17Xiu0w98u+ikJ63DCNrLrDyFjkcQ9fP8HMrcbmufvVhIcy+XkzKVaAkKfdl
+ Uj3vIq4l6IhYcNIwFtUbmX5Zx6KVst05yPpqKjDl0vA8VU7N0NjPUfwv2FQvzV0Q
+ M1LsZPuDIEUYMssAHoo4Pk3Mz6gf2AjUm/pRkZ46ay/Sgj6LaMfMgvFzGsINJvek
+ 50CJpd+ihVzSLx6BK/dTkynbGdzzTe9gKtYAnp8iFOY1bD7ttRrCkLvmw6AMUXb3
+ 2kIL5g7eW41v4M9VZyNVNCVdiVBJSQefi66B8C3Gd98GRM0tNfMBtbYaW/lRQGg+
+ ufyBixOcgooD3rjSsBe+2vPFHnxAUGR3Gj+HdO2X9VjMU3dR3TOKTvAbEE+Sh46h
+ jCQppe4eZO4vYkOhrLse
+ =06Qv
+ -----END PGP SIGNATURE-----
+ 
+
+UDS: Keep valid source addr (#4325)
+
+Fixes https://github.com/XTLS/Xray-core/issues/4324
