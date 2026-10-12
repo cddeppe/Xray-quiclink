@@ -62,6 +62,11 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // v26.11.293 Fix C: lastInboxBySourceIP routes DCID=∅ replies by the
+        // source IP of the reply. YouTube's DCID=∅ replies come from Google IPs;
+        // h3's come from different IPs. Updated ONLY on long-header replies
+        // (Initials) — zero hot-path impact. WriteTo is unchanged.
+        lastInboxBySourceIP map[string]chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -287,13 +292,14 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                 }
 
                 sock = &pooledSocket{
-                        conn:          pc,
-                        dest:          dest,
-                        demux:         make(map[dcidKey]chan<- readResult),
-                        demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
-                        closed:        make(chan struct{}),
-                        lastUsed:      atomic.Int64{},
-                        lastReplyTime: atomic.Int64{},
+                        conn:               pc,
+                        dest:               dest,
+                        demux:              make(map[dcidKey]chan<- readResult),
+                        demuxSource:        make(map[dcidKey]*stdnet.UDPAddr),
+                        lastInboxBySourceIP: make(map[string]chan<- readResult),
+                        closed:             make(chan struct{}),
+                        lastUsed:            atomic.Int64{},
+                        lastReplyTime:      atomic.Int64{},
                 }
                 xrayerrors.LogInfo(context.Background(), "udp_pool: NEW socket created for key=", key, " localAddr=", pc.LocalAddr())
 
@@ -420,6 +426,23 @@ func (s *pooledSocket) readLoop() {
                 src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
+                // v26.11.293: 20-byte CID lookup for short headers. If the first
+                // lookup missed and this is a short header, try parsing with
+                // length=20 (Google's server SCID length). O(1) — one extra parse
+                // + one extra demux lookup, no map iteration. Only fires on miss.
+                if !ok && n > 0 && packet[0]&0x80 == 0 && len(packet) > 20 {
+                        if altDcid, _, altErr := quic.ParseShortHeaderDCIDWithLen(packet[:n], 20); altErr == nil && len(altDcid) > 0 {
+                                altDk := makeDCIDKey(altDcid)
+                                s.mu.RLock()
+                                if altCh, altOk := s.demux[altDk]; altOk {
+                                        ch = altCh
+                                        src = s.demuxSource[altDk]
+                                        ok = true
+                                }
+                                s.mu.RUnlock()
+                        }
+                }
+
                 // Update timestamps under Lock. This is a short critical
                 // section but still serializes with RegisterCID. A future
                 // optimization could make these atomic.Int64 fields, but
@@ -431,18 +454,32 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
-                        // instead of demux[∅]. This avoids collisions when multiple
-                        // connections share the pool socket (all Chrome connections
-                        // have 0-length SCID → all replies have DCID=∅).
+                        // v26.11.293 Fix C: For DCID=∅ replies, try lastInboxBySourceIP
+                        // first — route by the Google source IP. YouTube's DCID=∅ replies
+                        // come from Google IPs; h3's come from different IPs. This avoids
+                        // the collision that lastActiveInbox causes when multiple DCID=∅
+                        // connections share the pool socket.
+                        // Fall back to lastActiveInbox if source-IP lookup misses.
                         if len(dcid) == 0 {
                                 s.mu.RLock()
-                                li := s.lastActiveInbox
-                                s.mu.RUnlock()
-                                if li != nil {
-                                        ch = li
-                                        ok = true
+                                // Try source-IP first (more specific)
+                                if addr != nil {
+                                        if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk && srcUDP.IP != nil {
+                                                if li, liOk := s.lastInboxBySourceIP[srcUDP.IP.String()]; liOk && li != nil {
+                                                        ch = li
+                                                        ok = true
+                                                }
+                                        }
                                 }
+                                // Fall back to global lastActiveInbox
+                                if !ok {
+                                        li := s.lastActiveInbox
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
+                                        }
+                                }
+                                s.mu.RUnlock()
                         }
                 }
                 if !ok {
@@ -498,6 +535,16 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        // v26.11.293 Fix C: Cache lastInboxBySourceIP[srcIP] when we
+                        // successfully demux a long-header reply. This lets future
+                        // DCID=∅ replies from the same Google IP be routed correctly.
+                        // Only fires for long headers (low frequency) — zero hot-path impact.
+                        if srcUDP := src; srcUDP.IP != nil {
+                                s.mu.Lock()
+                                s.lastInboxBySourceIP[srcUDP.IP.String()] = ch
+                                s.mu.Unlock()
+                        }
+
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
