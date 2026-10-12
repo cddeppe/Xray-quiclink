@@ -62,6 +62,12 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // v26.11.261: srcIPInbox maps server reply source IP → inbox.
+        // Populated during demux hits (non-empty DCID). Used as fallback
+        // when DCID=∅ (0-length SCID). O(1) map lookup — no iteration.
+        // Uses separate mutex to avoid contention with s.mu.
+        srcIPMu    sync.RWMutex
+        srcIPInbox map[string]chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -291,6 +297,7 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         dest:          dest,
                         demux:         make(map[dcidKey]chan<- readResult),
                         demuxSource:   make(map[dcidKey]*stdnet.UDPAddr),
+                        srcIPInbox:    make(map[string]chan<- readResult),
                         closed:        make(chan struct{}),
                         lastUsed:      atomic.Int64{},
                         lastReplyTime: atomic.Int64{},
@@ -420,6 +427,19 @@ func (s *pooledSocket) readLoop() {
                 src := s.demuxSource[dk]
                 s.mu.RUnlock()
 
+                // v26.11.261: On demux hit (non-empty DCID), cache the
+                // reply source IP → inbox mapping for future DCID=∅ replies.
+                // Only runs during Initial/Handshake (long headers with DCID).
+                // After CID rotation (DCID=∅), this doesn't run — map is already populated.
+                if ok && len(dcid) > 0 {
+                        if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
+                                ipKey := udpAddr.IP.String()
+                                s.srcIPMu.Lock()
+                                s.srcIPInbox[ipKey] = ch
+                                s.srcIPMu.Unlock()
+                        }
+                }
+
                 // Update timestamps under Lock. This is a short critical
                 // section but still serializes with RegisterCID. A future
                 // optimization could make these atomic.Int64 fields, but
@@ -431,46 +451,32 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.260: If DCID is empty (0-length SCID):
-                        // - If only 1 conn is actively reading → use lastActiveInbox (v217 behavior)
-                        // - If multiple conns are reading → broadcast to all with capacity
-                        // This way videos (1 stream) get v217 performance,
-                        // thumbnails (N streams) get correct routing.
+                        // v26.11.261: If DCID is empty (0-length SCID), try source IP demux first.
+                        // This maps server reply source IP → inbox, populated during demux hits.
+                        // O(1) map lookup — no iteration, no allocation.
+                        // Falls back to lastActiveInbox if source IP collision/miss.
                         if len(dcid) == 0 {
-                                s.mu.RLock()
-                                li := s.lastActiveInbox
-                                connsCopy := make([]*pooledConn, len(s.conns))
-                                copy(connsCopy, s.conns)
-                                s.mu.RUnlock()
-                                if li != nil {
-                                        ch = li
-                                        ok = true
+                                var ipKey string
+                                if udpAddr, ok := addr.(*stdnet.UDPAddr); ok {
+                                        ipKey = udpAddr.IP.String()
                                 }
-                                // Count conns with non-full inboxes (actively reading)
-                                activeCount := 0
-                                for _, c := range connsCopy {
-                                        if c != nil && !c.closed.Load() && len(c.inbox) < cap(c.inbox) {
-                                                activeCount++
+                                if ipKey != "" {
+                                        s.srcIPMu.RLock()
+                                        si, found := s.srcIPInbox[ipKey]
+                                        s.srcIPMu.RUnlock()
+                                        if found {
+                                                ch = si
+                                                ok = true
                                         }
                                 }
-                                // Only broadcast if multiple conns are actively reading.
-                                // For videos (1 stream): activeCount=1 → no broadcast → v217 behavior.
-                                // For thumbnails (N streams): activeCount>1 → broadcast → correct routing.
-                                if activeCount > 1 {
-                                        for _, c := range connsCopy {
-                                                if c == nil || c.closed.Load() || c.inbox == ch {
-                                                        continue
-                                                }
-                                                if len(c.inbox) >= cap(c.inbox) {
-                                                        continue
-                                                }
-                                                pktCopy := getPacket()
-                                                copy(pktCopy, packet[:n])
-                                                select {
-                                                case c.inbox <- readResult{data: pktCopy[:n], addr: addr}:
-                                                default:
-                                                        putPacket(pktCopy)
-                                                }
+                                // Fall back to lastActiveInbox if source IP miss
+                                if !ok {
+                                        s.mu.RLock()
+                                        li := s.lastActiveInbox
+                                        s.mu.RUnlock()
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
                                         }
                                 }
                         }
