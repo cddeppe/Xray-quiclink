@@ -308,3 +308,96 @@ All features are controlled via environment variables for easy deployment:
 - Pool staleness check: 30 seconds (silently dropped connections)
 - Idle reaper: 10 minutes (no replies) / 5 minutes (refCount=0)
 - UDP worker timeout: 30 minutes (was 2 minutes in stock xray)
+
+---
+
+## Per-Connection Socket Investigation (v26.11.272 — v26.11.287)
+
+### Goal
+Replace the shared pool socket with per-connection outbound sockets to solve the pool's 18% failure rate on h3 test sites (DCID=∅ demux collisions).
+
+### Architecture
+Each `udpConn` gets its own outbound UDP socket with a permanent reader goroutine (`EnsureSessionReader`). The socket survives Process restarts. `responseDone` reads from `replyCh` via `sessionReplyReader`.
+
+### What was proved (diagnostics)
+- **v26.11.282-283:** Counters proved the relay works: `replyChRecv == udpConnWrite == hubWriteToCalls` (zero packet loss). Google sends hundreds of KB of replies per connection.
+- **v26.11.284 (DIAG SOCKET):** Every IPv6 outbound socket was wildcard-bound `[::]`. Every IPv4 socket was correctly bound to `85.155.228.208`.
+- **v26.11.285 (DIAG HUBADDR):** `sendThrough:"origin"` sets `ob.Gateway = inbound.Local.Address`. The inbound is IPv4-only (`85.155.228.208`), so `resolveSrcAddr` returns nil for IPv6 destinations (cross-family mismatch) → wildcard bind.
+- **v26.11.286:** Fix applied — `lookupKernelSource` does a dummy UDP dial to discover the kernel's chosen source, then binds to that explicitly. DIAG SRCSRC confirmed: `kernelSrc=[2a14:7583:1a8::1]:0`. Google now replies correctly.
+- **v26.11.287:** Removed per-packet diagnostic logs (17 `LogWarning` calls per packet) that were causing 1-2ms overhead per packet, triggering Chrome's QUIC timer.
+
+### Why it failed
+Even with all fixes applied, Chrome abandons connections after ~10 seconds. Packet capture (`tcpdump`) showed:
+- Google IS replying (VPS ↔ Google IPv6 traffic is healthy, 1250-byte packets both ways)
+- At 9.9 seconds, the VPS goes silent for 1.3 seconds (the "gap")
+- Chrome retransmits, then gives up
+
+The relay delivers everything correctly. The issue is at the QUIC protocol level — Chrome's QUIC stack is unhappy about something in the traffic pattern (likely the per-connection source port changes that the pool's shared socket avoided). This is not fixable in the relay.
+
+### Lessons learned
+1. **Per-packet `LogWarning` is fatal.** Each call does synchronous formatted I/O (~1ms). At 100+ packets/second, this adds enough latency to trigger Chrome's QUIC timer. Never log per-packet in production.
+2. **`sync.Map` type assertions are subtle.** Storing `chan readResult` and asserting `v.(chan<- readResult)` fails silently — Go treats them as different dynamic types. Always assert to the exact stored type.
+3. **`lookupKernelSource` works** — dummy UDP dial discovers the correct source. But it can't be applied to the pool (breaks wildcard bind).
+4. **The pool's shared socket is architecturally superior for Google.** Google's QUIC expects a stable source port. The pool provides this naturally. Per-conn doesn't.
+
+---
+
+## Pooled Version Improvements (v26.11.288 — v26.12.1)
+
+### Starting point
+v26.11.249 (exact v217 restore) — the known-good pooled baseline. 82% QUIC success rate.
+
+### What was applied (v26.12.1 — current good version)
+
+**Fix A: Server SCID registration (v26.11.291)**
+When readLoop delivers a long-header Initial reply, extract the server's SCID and register it in the demux map. Future 1-RTT packets from Chrome (which carry DCID = server SCID) can then be routed correctly. Only fires for long headers — zero hot-path impact.
+
+**Fix D: lastInboxBySourceIP (v26.11.295, fixed v26.11.299)**
+Routes DCID=∅ replies by the source IP of the reply. YouTube's DCID=∅ replies come from Google IPs; h3's come from different IPs. Uses `sync.Map` (lock-free). Falls back to `lastActiveInbox` if source-IP lookup misses.
+
+**Bug fix (v26.11.299):** The Store was using `src.IP` (Chrome's client IP from `demuxSource`) but the Load was using `addr.IP` (Google's source IP from `ReadFrom`). Keys never matched. Fixed to use `addr` for both.
+
+**Parallel readLoop (v26.11.298, tuned v26.12.1)**
+The single `readLoop` goroutine was the scheduling bottleneck. When YouTube streamed hundreds of packets/second, h3 replies waited behind them. Spawned 4 goroutines per pool socket — the kernel distributes packets across them.
+
+**8 workers (v26.11.100) broke h3** — the race condition between Initial reply (stores `lastInboxBySourceIP`) and 1-RTT reply (loads it) fired too often with 8 workers processing packets out of order. 4 workers is the sweet spot.
+
+### What was tried and FAILED
+
+| Version | Change | Result |
+|---|---|---|
+| v26.11.288 | `lookupKernelSource` + `lastInboxByDest` + variable-length CID | Broke pool — `lookupKernelSource` breaks wildcard bind, `lastInboxByDest` added Lock contention |
+| v26.11.289 | Move `lastInboxByDest` to long-header path only | Still broke YouTube — `lookupKernelSource` fundamentally incompatible with pool's port-only keying |
+| v26.11.290 | Revert everything except Fix A + 20-byte CID lookup | Still struggled — 20-byte lookup fired on every 1-RTT packet |
+| v26.11.292 | Fix B: `lastActiveSource` for h3 (from v253) | Broke YouTube — YouTube mixes DCID=∅ and DCID=8 on same socket |
+| v26.11.293 | Fix C: `lastInboxBySourceIP` with regular map + Lock | Stalled YouTube Shorts — Lock contention on Initials |
+| v26.11.294 | Skip 20-byte lookup when DCID=∅ | Helped, but h3 still broken |
+| v26.11.296 | `sync.Map` for demux + demuxSource | SLOWER than regular map + RLock — sync.Map has per-op overhead (atomic + interface boxing + type assertion). RLock allows concurrent readers with minimal overhead. Reverted in v26.11.297. |
+| v26.11.100 | 8 readLoop workers | Broke h3 — race condition between Initial and 1-RTT processing. Reverted to 4 in v26.12.1. |
+
+### Key architectural insights
+
+1. **The pool's wildcard bind is intentional.** Port-only keying = ONE socket for ALL `:443` traffic. `lookupKernelSource` breaks this by binding to a specific IP. Don't apply it to the pool.
+
+2. **`sync.Map` is slower than `map + RLock` for small maps.** sync.Map is optimized for thousands of keys with rare writes. For 1-3 DCIDs per connection with frequent reads, regular map + RLock is faster. RLock allows concurrent readers — the contention was with Lock (exclusive), not RLock (shared reader).
+
+3. **`lastActiveInbox` is the best fallback for DCID=∅.** The source-IP refinement (`lastInboxBySourceIP`) helps separate YouTube from h3, but can't solve same-IP collisions (two connections to the same Google edge). That's architecturally unsolvable without per-connection sockets.
+
+4. **Parallel readLoop workers have a race threshold.** More workers = more throughput but higher probability of the Initial/1-RTT ordering race. 4 workers is the sweet spot — enough parallelism to eliminate the bottleneck, low enough race probability that retransmissions paper over the misses.
+
+5. **The per-conn investigation proved the relay works.** Counters showed zero packet loss. Google replied. The issue was Chrome's QUIC behavior toward per-connection source ports — not fixable in the relay.
+
+### Current state (v26.12.1)
+- YouTube: works well, including Shorts and thumbnails
+- h3 (quic.nginx.org): works
+- Performance: good — 4 parallel readLoop workers eliminate the scheduling bottleneck
+- Known limitation: rare thumbnail hesitation when the Initial/1-RTT race fires (retransmissions recover within 1-2 seconds)
+
+### What NOT to try again
+1. ❌ `lookupKernelSource` on the pool — breaks wildcard bind
+2. ❌ `lastInboxByDest` updated on WriteTo — Lock contention on hot path
+3. ❌ `sync.Map` for demux — slower than map + RLock for small maps
+4. ❌ 8+ readLoop workers — race condition breaks h3
+5. ❌ `lastActiveSource` from v253 — YouTube mixes DCID=∅ and DCID=8
+6. ❌ Per-packet diagnostic logging — fatal latency overhead
+7. ❌ Per-connection sockets — Chrome abandons after 10 seconds (protocol-level issue, not relay)
