@@ -314,7 +314,25 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
         // v26.11.275: Unwrap to find the underlying PacketConn
         c.sessionSocketMu.Lock()
         c.sessionSocket = unwrapPacketConn(conn)
+        pc := c.sessionSocket
         c.sessionSocketMu.Unlock()
+        // v26.11.284 DIAG: log the actual bound local address of the outbound socket.
+        // This tells us what source IP Google sees when we send to it.
+        // If sendThrough:"origin" worked, this should be the VPS public IP.
+        // If it's 0.0.0.0 or [::], the socket is wildcard-bound and the kernel
+        // picks the source — which may differ from what the pool used.
+        if pc != nil {
+                if localAddr := pc.LocalAddr(); localAddr != nil {
+                        errors.LogWarning(context.Background(), "DIAG SOCKET: src=", *c.src,
+                                " dest=", dest, " localAddr=", localAddr.String())
+                } else {
+                        errors.LogWarning(context.Background(), "DIAG SOCKET: src=", *c.src,
+                                " dest=", dest, " localAddr=nil")
+                }
+        } else {
+                errors.LogWarning(context.Background(), "DIAG SOCKET: src=", *c.src,
+                        " dest=", dest, " sessionSocket=nil (unwrap failed)")
+        }
 }
 
 // unwrapPacketConn unwraps stat.CounterConnection and PacketConnWrapper
