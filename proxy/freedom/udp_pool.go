@@ -431,30 +431,33 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.257: If DCID is empty (0-length SCID), broadcast
-                        // to ALL active inboxes. Chrome's QUIC stack will drop
-                        // packets with wrong DCID — only the correct connection
-                        // processes it. This fixes the lastActiveInbox race.
+                        // v26.11.258: If DCID is empty (0-length SCID), deliver
+                        // to lastActiveInbox (primary) and broadcast to others.
+                        // Chrome's QUIC stack drops wrong-DCID packets.
                         if len(dcid) == 0 {
                                 s.mu.RLock()
                                 li := s.lastActiveInbox
                                 connsCopy := make([]*pooledConn, len(s.conns))
                                 copy(connsCopy, s.conns)
                                 s.mu.RUnlock()
-                                // Deliver to lastActiveInbox (primary — correct for single-stream YouTube)
                                 if li != nil {
                                         ch = li
                                         ok = true
                                 }
-                                // Also broadcast to all OTHER active conns.
-                                // For YouTube videos (1 stream): conns has 1 entry = same as ch → skip.
-                                // For thumbnails (N streams): broadcasts to all → correct one gets it.
+                                // Broadcast to other conns — but SKIP full inboxes
+                                // to avoid getPacket/copy allocation overhead.
+                                // Only 1-3 conns are actively reading; the rest
+                                // have full inboxes and get skipped.
                                 for _, c := range connsCopy {
                                         if c == nil || c.closed.Load() {
                                                 continue
                                         }
                                         if c.inbox == ch {
-                                                continue // primary gets the original
+                                                continue
+                                        }
+                                        // Skip if inbox is full — conn isn't reading
+                                        if len(c.inbox) >= cap(c.inbox) {
+                                                continue
                                         }
                                         pktCopy := getPacket()
                                         copy(pktCopy, packet[:n])
