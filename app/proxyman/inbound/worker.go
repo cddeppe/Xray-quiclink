@@ -3,8 +3,10 @@ package inbound
 import (
         "context"
         "encoding/hex"
+        stderrors "errors"
         stdnet "net"
         "sync"
+        "syscall"
 
         "github.com/xtls/xray-core/common/protocol/quic"
         "sync/atomic"
@@ -208,6 +210,14 @@ type udpConn struct {
         // goroutine restart peeks a short header, skips the pool, and dials
         // a new socket → stall.
         pooledConnPtr interface{} // *pooledConn, stored as interface to avoid import cycle
+        // v26.11.268: Permanent reader goroutine for per-session UDP.
+        // Created once when the outbound conn is first persisted.
+        // Runs for the lifetime of udpConn — never installed/removed per Process.
+        // This eliminates the 10-second stall caused by BufferedPacketReader's
+        // close/re-create cycle on Process restart.
+        sessionReplyCh   chan []byte
+        sessionReaderDone chan struct{}
+        sessionReaderStarted atomic.Bool
 }
 
 func (c *udpConn) setInactive() {
@@ -257,6 +267,87 @@ func (c *udpConn) GetPooledConn() interface{} {
 // Process calls. Called by freedom.Process after creating a pooledConn.
 func (c *udpConn) SetPooledConn(pc interface{}) {
         c.pooledConnPtr = pc
+}
+
+// v26.11.268: StartSessionReader starts a permanent reader goroutine that
+// reads from the persisted outbound conn for the lifetime of udpConn.
+// Replies go into sessionReplyCh. Process reads from sessionReplyCh via
+// ReadSessionReply. The goroutine is created once and torn down once —
+// no install/uninstall per Process call.
+func (c *udpConn) StartSessionReader(conn stdnet.Conn) {
+        if c.sessionReaderStarted.Load() {
+                return
+        }
+        c.sessionReaderStarted.Store(true)
+        c.sessionReplyCh = make(chan []byte, 256)
+        // Try to get the underlying PacketConn (UDP connections implement this)
+        var pc stdnet.PacketConn
+        if packetConn, ok := conn.(stdnet.PacketConn); ok {
+                pc = packetConn
+        }
+        go func() {
+                buf := make([]byte, 65535)
+                for {
+                        select {
+                        case <-c.sessionReaderDone:
+                                return
+                        default:
+                        }
+                        var n int
+                        _ = pc
+                        var err error
+                        if pc != nil {
+                                n, _, err = pc.ReadFrom(buf)
+                        } else {
+                                n, err = conn.Read(buf)
+                                _ = conn.RemoteAddr()
+                        }
+                        if err != nil {
+                                select {
+                                case <-c.sessionReaderDone:
+                                        return
+                                default:
+                                }
+                                // Transient errors: continue
+                                if isSessionReadError(err) {
+                                        return
+                                }
+                                continue
+                        }
+                        pkt := make([]byte, n)
+                        copy(pkt, buf[:n])
+                        select {
+                        case c.sessionReplyCh <- pkt:
+                        case <-c.sessionReaderDone:
+                                return
+                        default:
+                                // Channel full — drop (QUIC retransmits)
+                        }
+                }
+        }()
+}
+
+// v26.11.268: ReadSessionReply returns one reply packet from the permanent
+// reader goroutine. Called by freedom.Process's responseDone.
+func (c *udpConn) ReadSessionReply() ([]byte, bool) {
+        select {
+        case pkt, ok := <-c.sessionReplyCh:
+                return pkt, ok
+        case <-c.sessionReaderDone:
+                return nil, false
+        }
+}
+
+func isSessionReadError(err error) bool {
+        var errno syscall.Errno
+        if stderrors.As(err, &errno) {
+                switch errno {
+                case syscall.EAGAIN, syscall.ENOMEM, syscall.ENOBUFS,
+                        syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNREFUSED:
+                        return false
+                }
+        }
+        return true
 }
 
 // v26.11.117: RegisterServerSCID is called by freedom's reader wrapper
@@ -343,6 +434,10 @@ func (c *udpConn) Close() error {
         }
         common.Must(c.done.Close())
         common.Must(common.Close(c.writer))
+        // v26.11.268: Stop the session reader goroutine
+        if c.sessionReaderStarted.Load() {
+                close(c.sessionReaderDone)
+        }
         // v26.11.196: Close the persistent outbound conn too
         c.outboundMu.Lock()
         if c.outboundConn != nil {

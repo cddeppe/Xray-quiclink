@@ -591,16 +591,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return errors.New("failed to set PROXY protocol v", version).Base(err)
                 }
         }
-        // v26.10.44-link: for TCP connections with warm pool enabled, release
-        // to the warm pool instead of closing. The warm pool will close the
-        // conn when it expires (default 5s) or when a new inbound reuses it.
-        // For non-warm-pool paths, close normally.
+        // v26.11.268: Flag-based guarded close for ALL UDP paths.
+        connPersisted := false
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
-        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
-                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
-                // Store the outbound conn in udpConn for reuse across Process
-                // restarts. Keeps source port stable → no Google path validation.
+        } else if destination.Network != net.Network_TCP {
+                defer func() {
+                        if !connPersisted {
+                                conn.Close()
+                        }
+                }()
                 if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
                         if udpConn, ok := inbound.Conn.(interface {
                                 GetOutboundConn() net.Conn
@@ -608,18 +608,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         }); ok {
                                 existingConn := udpConn.GetOutboundConn()
                                 if existingConn != nil {
+                                        conn.Close()
                                         conn = existingConn
+                                        connPersisted = true
                                         errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
-                                } else {
-                                        defer func() {
-                                                udpConn.SetOutboundConn(conn, destination)
-                                        }()
                                 }
-                        } else {
-                                defer conn.Close()
                         }
-                } else {
-                        defer conn.Close()
                 }
         } else {
                 defer conn.Close()
@@ -672,6 +666,23 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         " isQUICLongHeader=", isQUICLongHeader(mb[0].Bytes()),
                                         " dest=", destination)
                                 if isQUICLongHeader(mb[0].Bytes()) {
+                                        // v26.11.268: For 0-length SCID, skip pool → per-session path.
+                                        // Persist conn and start permanent reader goroutine.
+                                        if scid, _, scidErr := quic.ParseSCID(mb[0].Bytes()); scidErr == nil && len(scid) == 0 {
+                                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                        if udpConn, ok := inbound.Conn.(interface {
+                                                                GetOutboundConn() net.Conn
+                                                                SetOutboundConn(net.Conn, net.Destination)
+                                                                StartSessionReader(stdnet.Conn)
+                                                        }); ok {
+                                                                if udpConn.GetOutboundConn() == nil {
+                                                                        udpConn.SetOutboundConn(conn, destination)
+                                                                        connPersisted = true
+                                                                        udpConn.StartSessionReader(conn)
+                                                                }
+                                                        }
+                                                }
+                                        } else {
                                         remoteAddr := conn.RemoteAddr()
                                 var udpRemote *net.UDPAddr
                                 if u, ok := remoteAddr.(*net.UDPAddr); ok {
@@ -750,6 +761,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                 }
                         }
+                                } // close else (non-zero SCID pool path)
                         // If not QUIC, pconn stays nil — existing per-session path is used.
                 }
                 }
@@ -867,19 +879,33 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         // BufferedPacketReader for the same pooledConn's inbox.
                         defer bpr.Close()
                 } else {
-                        reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
-                        // v26.11.117: Wrap reader to detect server SCID from
-                        // long-header replies. When Google's Initial reply
-                        // arrives, extract the SCID and register it in the
-                        // worker's dcidIndex via RegisterServerSCID.
-                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
-                                        var scidRegistered bool
-                                        baseReader := reader
-                                        reader = &serverSCIDReader{
-                                                base:       baseReader,
-                                                register:   reg.RegisterServerSCID,
-                                                registered: &scidRegistered,
+                        // v26.11.268: If conn was persisted (0-length SCID), use the
+                        // permanent session reader goroutine instead of NewPacketReader.
+                        // The session reader runs for the lifetime of udpConn and never
+                        // stops on Process return → no 10-second stall.
+                        if connPersisted {
+                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                        if sr, ok := inbound.Conn.(interface{ ReadSessionReply() ([]byte, bool) }); ok {
+                                                reader = &sessionReplyReader{conn: sr}
+                                        } else {
+                                                reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+                                        }
+                                } else {
+                                        reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+                                }
+                        } else {
+                                reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+                                // v26.11.117: Wrap reader to detect server SCID from
+                                // long-header replies.
+                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                        if reg, ok := inbound.Conn.(interface{ RegisterServerSCID([]byte) }); ok {
+                                                var scidRegistered bool
+                                                baseReader := reader
+                                                reader = &serverSCIDReader{
+                                                        base:       baseReader,
+                                                        register:   reg.RegisterServerSCID,
+                                                        registered: &scidRegistered,
+                                                }
                                         }
                                 }
                         }
@@ -1298,4 +1324,24 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
         }
 
         return mb, nil
+}
+
+// v26.11.268: sessionReplyReader reads from the permanent session reader
+// goroutine on udpConn. The goroutine was started by StartSessionReader
+// and runs for the lifetime of udpConn. This reader just reads from the
+// channel — no socket I/O, no install/uninstall cycle.
+type sessionReplyReader struct {
+        conn interface{ // *udpConn, typed as interface to avoid import cycle
+                ReadSessionReply() ([]byte, bool)
+        }
+}
+
+func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        pkt, ok := r.conn.ReadSessionReply()
+        if !ok || len(pkt) == 0 {
+                return nil, io.EOF
+        }
+        b := buf.New()
+        b.Write(pkt)
+        return buf.MultiBuffer{b}, nil
 }
