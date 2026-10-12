@@ -800,21 +800,79 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // one conn for this source (safe for single-connection cases like h3
         // test sites).
         if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-                // Try DCID lookup first
-                if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
-                        dk := makeDCIDKey(dcid)
-                        w.RLock()
-                        if existingID, found := w.dcidIndex[dk]; found {
-                                if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-                                        w.RUnlock()
-                                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", hex.EncodeToString(dcid), " dcidHit=true routedTo=", existingID.src)
-                                        existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-                                        existingConn.updateActivity()
-                                        return
+                // v26.11.278: Try ALL known CID lengths, not just the default 8.
+                //
+                // Chrome uses the server's SCID as the 1-RTT DCID. Google's SCID
+                // is 20 bytes; standard QUIC uses 8. The dcidIndex contains
+                // entries with various lengths (8-byte Initial DCIDs from
+                // recordDCID, 20-byte server SCIDs from registerServerCID).
+                //
+                // The old code called quic.ParseDCID which hardcodes
+                // DefaultShortHeaderCIDLen=8. For Google's 20-byte SCID, this
+                // extracted only the first 8 bytes (0000000000000003), which
+                // never matched the 20-byte key stored by registerServerCID.
+                //
+                // Fix: collect distinct CID lengths from dcidIndex keys, parse
+                // the short header with each length, and look up. This is
+                // O(distinct_lengths) per packet — typically 2 (8 and 20).
+                packetBytes := b.Bytes()
+                w.RLock()
+                var hitConn *udpConn
+                var hitDcid []byte
+                var hitID connID
+                if len(packetBytes) > 1 {
+                        // Collect distinct CID lengths from dcidIndex keys.
+                        // Use a small fixed-size array to avoid heap allocation
+                        // on the hot path. MaxCIDLen=20, so at most a handful of
+                        // distinct lengths exist in practice (typically 2).
+                        var lens [8]int
+                        var nLens int
+                        for existingKey := range w.dcidIndex {
+                                l := existingKey.len
+                                dup := false
+                                for i := 0; i < nLens; i++ {
+                                        if lens[i] == l {
+                                                dup = true
+                                                break
+                                        }
+                                }
+                                if !dup && nLens < len(lens) {
+                                        lens[nLens] = l
+                                        nLens++
                                 }
                         }
+                        for i := 0; i < nLens; i++ {
+                                dcid, _, err := quic.ParseShortHeaderDCIDWithLen(packetBytes, lens[i])
+                                if err != nil || len(dcid) == 0 {
+                                        continue
+                                }
+                                dk := makeDCIDKey(dcid)
+                                if existingID, found := w.dcidIndex[dk]; found {
+                                        if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+                                                hitConn = existingConn
+                                                hitDcid = dcid
+                                                hitID = existingID
+                                                break
+                                        }
+                                }
+                        }
+                }
+                if hitConn != nil {
+                        dcidHex := hex.EncodeToString(hitDcid)
+                        routedTo := hitID.src
                         w.RUnlock()
-                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", hex.EncodeToString(dcid), " dcidHit=false dcidIndexSize=", len(w.dcidIndex))
+                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", dcidHex, " dcidHit=true routedTo=", routedTo)
+                        hitConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+                        hitConn.updateActivity()
+                        return
+                }
+                diagSize := len(w.dcidIndex)
+                w.RUnlock()
+                // Log the miss with the 8-byte default parse for backwards-compatible diagnostics
+                if dcid8, _, err := quic.ParseShortHeaderDCIDWithLen(packetBytes, quic.DefaultShortHeaderCIDLen); err == nil {
+                        errors.LogWarning(context.Background(), "DIAG 1RTT: dcid=", hex.EncodeToString(dcid8), " dcidHit=false dcidIndexSize=", diagSize)
+                } else {
+                        errors.LogWarning(context.Background(), "DIAG 1RTT: parseErr dcidHit=false dcidIndexSize=", diagSize)
                 }
 
                 // DCID miss — fall back to srcIndex (single-connection case)
