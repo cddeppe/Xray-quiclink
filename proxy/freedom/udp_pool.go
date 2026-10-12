@@ -62,6 +62,11 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // v26.11.292 Fix B: lastActiveSource for NotifyServerSCID when DCID=∅.
+        // Set in readLoop when src is not nil (demux hit). Read when
+        // src is nil AND len(dcid)==0 (h3 path). YouTube never reads this.
+        // WriteTo is UNCHANGED from v217 — zero impact on YouTube.
+        lastActiveSource *stdnet.UDPAddr
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -463,6 +468,14 @@ func (s *pooledSocket) readLoop() {
                         }
                 }
 
+                // v26.11.292 Fix B: For DCID=∅ replies (h3), use cached lastActiveSource.
+                // YouTube never reaches here — DCID is 8 bytes → src is not nil.
+                if src == nil && len(dcid) == 0 {
+                        s.mu.RLock()
+                        src = s.lastActiveSource
+                        s.mu.RUnlock()
+                }
+
                 // v26.10.21-link: non-blocking send with large channel (256).
                 // v26.11.159: Removed IsClosed check — it acquired RLock and
                 // iterated ALL conns per packet, blocking RegisterCID (which
@@ -498,6 +511,15 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        // v26.11.292 Fix B: Cache lastActiveSource from demux hits.
+                        // When src is not nil (demux hit, YouTube), save it for
+                        // later use by DCID=∅ replies (h3). This replaces the
+                        // WriteTo-based approach that broke YouTube (v250/v252).
+                        // WriteTo is completely unchanged from v217.
+                        s.mu.Lock()
+                        s.lastActiveSource = src
+                        s.mu.Unlock()
+
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
