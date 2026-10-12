@@ -530,10 +530,12 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
-                        // v26.11.295 Fix D: Cache lastInboxBySourceIP[srcIP] using
-                        // lock-free sync.Map.Store. Only fires for long headers.
-                        if src.IP != nil {
-                                s.lastInboxBySourceIP.Store(src.IP.String(), ch)
+                        // v26.11.299: Cache lastInboxBySourceIP[googleSrcIP] using
+                        // addr (from ReadFrom = Google's IP), NOT src (from demuxSource
+                        // = Chrome's client IP). The DCID=∅ lookup uses addr too, so
+                        // the keys must match. This was broken since v26.11.295.
+                        if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk && srcUDP.IP != nil {
+                                s.lastInboxBySourceIP.Store(srcUDP.IP.String(), ch)
                         }
 
                         pktType := (packet[0] >> 4) & 0x03
