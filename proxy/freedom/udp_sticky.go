@@ -412,20 +412,28 @@ func (s *StickyResolver) finishRefresh(hostname string) {
 
 // selectAddr applies IPv4/IPv6 preference to the address list and
 // returns the selected IP. If no preference is set, returns addrs[0].IP.
+//
+// v26.12.22-link: fixed the IPv4 detection bug. Go's net.IP stores
+// IPv4 addresses as 16-byte IPv6-mapped form (::ffff:a.b.c.d), so
+// len(addr.IP) == net.IPv4len (4) is NEVER true and len(addr.IP) ==
+// net.IPv6len (16) is ALWAYS true. This meant preferIPv6 returned
+// addrs[0] regardless of family (some IPv4, some IPv6 depending on
+// DNS response order), and preferIPv4 returned nil (then fell back
+// to addrs[0]). Now uses addr.IP.To4() != nil to detect IPv4.
 func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
 	if preferIPv4 || preferIPv6 {
 		for _, addr := range addrs {
-			if preferIPv4 && len(addr.IP) == net.IPv4len {
+			isIPv4 := addr.IP.To4() != nil
+			if preferIPv4 && isIPv4 {
 				return addr.IP
 			}
-			if preferIPv6 && len(addr.IP) == net.IPv6len {
+			if preferIPv6 && !isIPv4 {
 				return addr.IP
 			}
 		}
-		// M3 fix: return nil if preferred family not found.
-		// Callers already check ip == nil. Previously returned
-		// addrs[0] (wrong family) causing IPv4/IPv6 flips.
-		return nil
+		// Preferred family not found — fall back to addrs[0].
+		// Callers already check ip == nil.
+		return addrs[0].IP
 	}
 	return addrs[0].IP
 }
