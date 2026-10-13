@@ -792,12 +792,27 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	plcy := h.policy()
 	ctx, cancel := context.WithCancel(ctx)
+	// v26.12.30-link: For UDP with persisted session socket, use a
+	// much longer ConnectionIdle timeout. The session reader goroutine
+	// delivers reply packets via channel — responseDone blocks on the
+	// channel read, and the timer fires if no activity for ConnectionIdle
+	// (default 300s on v191, but some policies set it to 30s). For QUIC,
+	// there can be gaps between Initial reply and 1-RTT data of 10-30s
+	// while Chrome processes the handshake. The longer timeout prevents
+	// Process from returning prematurely and killing the connection.
+	idleTimeout := plcy.Timeouts.ConnectionIdle
+	if destination.Network != net.Network_TCP {
+		// Use at least 5 minutes for UDP — QUIC connections are long-lived
+		if idleTimeout < 5*time.Minute {
+			idleTimeout = 5 * time.Minute
+		}
+	}
 	timer := signal.CancelAfterInactivity(ctx, func() {
 		cancel()
 		if newCancel != nil {
 			newCancel()
 		}
-	}, plcy.Timeouts.ConnectionIdle)
+	}, idleTimeout)
 
 	requestDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
@@ -928,6 +943,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return errors.New("failed to process response").Base(err)
 		}
 		errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
+		// v26.12.30-link: For UDP session reader path, DON'T cancel/interrupt.
+		// The session reader goroutine is still running and will deliver
+		// future reply packets when Chrome sends 1-RTT data. Cancelling
+		// here would kill the context, causing the next buf.Copy call
+		// (from a Process restart) to fail immediately.
+		if destination.Network != net.Network_TCP && pconn == nil {
+			// Session reader path — keep the context alive.
+			// responseDone will be called again on Process restart
+			// when the next packet arrives.
+			// Just return nil — the reader will continue running.
+			return nil
+		}
 		// v26.11.209: Cancel the context so requestDone also returns.
 		// Without this, responseDone exits (e.g. on a 30s timeout) but
 		// requestDone keeps blocking on input → Process never returns →
