@@ -54,6 +54,26 @@ message FinalRuleConfig {
   Range block_delay = 5;
 }
 
+// UDPConfig carries TCP warm-pool + sticky DNS resolver options.
+// Pool-related fields (enable_socket_pool, *_timeout) are accepted for
+// backward compatibility but are no-ops in this TCP-only fork.
+message UDPConfig {
+  bool enable_socket_pool = 1;
+  bool enable_sticky_resolver = 2;
+  bool prefer_ipv4 = 3;
+  bool prefer_ipv6 = 4;
+  uint32 session_idle_timeout = 5;
+  uint32 pool_staleness_timeout = 6;
+  uint32 pool_idle_timeout = 7;
+  uint32 pool_unused_timeout = 8;
+  uint32 sticky_resolver_ttl = 9;
+  bool enable_tcp_warm_pool = 10;
+  uint32 tcp_warm_pool_timeout = 11;
+  uint32 pre_warm_count = 12;
+  uint32 pre_warm_first_n = 13;
+  uint32 pre_warm_learn_visits = 14;
+}
+
 message Config {
   xray.transport.internet.DomainStrategy domain_strategy = 1;
   DestinationOverride destination_override = 3;
@@ -62,4 +82,5 @@ message Config {
   uint32 proxy_protocol = 6;
   repeated Noise noises = 7;
   repeated FinalRuleConfig final_rules = 8;
+  UDPConfig udp_config = 9;
 }

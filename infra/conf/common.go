@@ -378,3 +378,29 @@ func ParseRangeString(str string) (int, int, error) {
 	}
 	return 0, 0, errors.New("invalid range string: ", str)
 }
+
+// AddressList accepts either a single string or an array of strings in JSON,
+// producing a list of *Address. This lets inbound `listen` accept both
+// "listen": "1.2.3.4" and "listen": ["1.2.3.4","5.6.7.8"].
+type AddressList []*Address
+
+// UnmarshalJSON implements encoding/json.Unmarshaler.UnmarshalJSON
+func (v *AddressList) UnmarshalJSON(data []byte) error {
+    var arr []json.RawMessage
+    if err := json.Unmarshal(data, &arr); err == nil {
+        for _, raw := range arr {
+            a := &Address{}
+            if err := a.UnmarshalJSON(raw); err != nil {
+                return err
+            }
+            *v = append(*v, a)
+        }
+        return nil
+    }
+    a := &Address{}
+    if err := a.UnmarshalJSON(data); err == nil {
+        *v = append(*v, a)
+        return nil
+    }
+    return errors.New("invalid address list: " + string(data))
+}

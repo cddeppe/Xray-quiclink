@@ -28,21 +28,35 @@ type DefaultSystemDialer struct {
 	obm outbound.Manager
 }
 
-func resolveSrcAddr(network net.Network, src net.Address) net.Addr {
-	if src == nil || src == net.AnyIP {
+// resolveSrcAddr builds the local address to bind for the outbound dial.
+// Returns nil (let the kernel choose) when an explicit bind would fail:
+//   - src is nil or a wildcard (AnyIP/AnyIPv6);
+//   - dest is a loopback IP and src is a non-loopback IP (EADDRNOTAVAIL);
+//   - src and dest are IPs of different families (EADDRNOTAVAIL).
+// This guard is what makes sendThrough:"origin" safe for multi-IP servers:
+// the listen IP is used whenever possible, and the kernel is allowed to
+// pick a valid source for loopback or cross-family destinations.
+func resolveSrcAddr(network net.Network, src net.Address, dest net.Destination) net.Addr {
+	if src == nil || src == net.AnyIP || src == net.AnyIPv6 {
 		return nil
 	}
-
+	if dest.Address.Family().IsIP() {
+		if dest.Address.IP().IsLoopback() {
+			return nil
+		}
+		if src.Family() != dest.Address.Family() {
+			return nil
+		}
+	}
 	if network == net.Network_TCP {
 		return &net.TCPAddr{
 			IP:   src.IP(),
 			Port: 0,
 		}
 	}
-
 	return &net.UDPAddr{
 		IP:   src.IP(),
-		Port: 0,
+			Port: 0,
 	}
 }
 
@@ -54,7 +68,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		if err != nil {
 			return nil, err
 		}
-		srcAddr := resolveSrcAddr(net.Network_UDP, src)
+		srcAddr := resolveSrcAddr(net.Network_UDP, src, dest)
 		if srcAddr == nil {
 			// some OS don't support mapped IPv4 dual stack
 			// and need to select 0.0.0.0 or [::] manually based on the destination
@@ -86,7 +100,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 		if err != nil {
 			return nil, err
 		}
-		return &net.PacketConnWrapper{
+		return &PacketConnWrapper{
 			PacketConn: packetConn,
 			Dest:       destAddr,
 		}, nil
@@ -116,7 +130,7 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 	}
 	dialer := &net.Dialer{
 		Timeout:         time.Second * 16,
-		LocalAddr:       resolveSrcAddr(dest.Network, src),
+		LocalAddr:       resolveSrcAddr(dest.Network, src, dest),
 		KeepAlive:       keepAlive,
 		KeepAliveConfig: keepAliveConfig,
 	}
@@ -146,6 +160,24 @@ func (d *DefaultSystemDialer) Dial(ctx context.Context, src net.Address, dest ne
 
 func (d *DefaultSystemDialer) DestIpAddress() net.IP {
 	return nil
+}
+
+type PacketConnWrapper struct {
+	net.PacketConn
+	Dest net.Addr
+}
+
+func (c *PacketConnWrapper) Read(p []byte) (int, error) {
+	n, _, err := c.PacketConn.ReadFrom(p)
+	return n, err
+}
+
+func (c *PacketConnWrapper) Write(p []byte) (int, error) {
+	return c.PacketConn.WriteTo(p, c.Dest)
+}
+
+func (c *PacketConnWrapper) RemoteAddr() net.Addr {
+	return c.Dest
 }
 
 type SystemDialerAdapter interface {
