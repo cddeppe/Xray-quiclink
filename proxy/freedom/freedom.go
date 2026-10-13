@@ -915,7 +915,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			// Otherwise use NewPacketReader (per-Process socket read).
 			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
 				if sr, ok := inbound.Conn.(interface{ ReadSessionReply() ([]byte, bool) }); ok {
-					reader = &sessionReplyReader{conn: sr}
+					// v26.12.34: set udpDest so reply packets have b.UDP set
+					var udpDest *net.Destination
+					if inbound.Source.IsValid() {
+						udpDest = &net.Destination{
+							Address: inbound.Source.Address,
+							Port:    inbound.Source.Port,
+							Network: net.Network_UDP,
+						}
+					}
+					reader = &sessionReplyReader{conn: sr, udpDest: udpDest}
 				} else {
 					reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
 				}
@@ -977,80 +986,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		ctx = newCtx
 	}
 
-	// v26.12.31-link: For UDP session reader path, skip task.Run entirely.
-	// task.Run expects both requestDone and responseDone to eventually return,
-	// but QUIC is a long-lived bidirectional packet stream that never "closes."
-	// Instead, run two independent goroutines:
-	//   1. requestDone: reads Chrome's packets from input, writes to outbound
-	//   2. reply delivery: reads from sessionReplyCh, writes to Chrome
-	// Both run until the connection is closed by the worker's clean() timeout.
-	// Process returns nil immediately — the goroutines keep running.
-	if destination.Network != net.Network_TCP && pconn == nil {
-		if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-			if sr, ok := inbound.Conn.(interface{ ReadSessionReply() ([]byte, bool) }); ok {
-				errors.LogInfo(ctx, "freedom: UDP session reader — standalone goroutines (skipping task.Run)")
-
-				// Goroutine 1: read Chrome → write Google (requestDone)
-				go func() {
-					defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-					writer := NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
-					if len(peekedPackets) > 0 {
-						if err := writer.WriteMultiBuffer(peekedPackets); err != nil {
-							errors.LogInfoInner(ctx, err, "freedom: failed to write peeked UDP packets")
-							return
-						}
-					}
-					if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-						// Expected when Chrome stops sending
-					}
-				}()
-
-				// Goroutine 2: read Google replies from channel → write Chrome
-				go func() {
-					defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-					// v26.12.33-link: set b.UDP so the downstream PacketWriter
-					// knows where to send the reply. Without this, replies are
-					// silently dropped — the PacketWriter needs b.UDP to call
-					// WriteTo with the correct destination.
-					var replyDest *net.Destination
-					if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-						replyDest = &net.Destination{
-							Address: inbound.Source.Address,
-							Port:    inbound.Source.Port,
-							Network: net.Network_UDP,
-						}
-					}
-					for {
-						pkt, ok := sr.ReadSessionReply()
-						if !ok || len(pkt) == 0 {
-							return
-						}
-						b := buf.New()
-						b.Write(pkt)
-						b.UDP = replyDest
-						if err := output.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
-							return
-						}
-						timer.SetTimeout(plcy.Timeouts.ConnectionIdle)
-					}
-				}()
-
-				// v26.12.32-link: DON'T return — block until the connection is done.
-				// If we return, the dispatcher closes the pipe (output), killing the
-				// reply goroutine. Instead, wait on the session reader's done channel
-				// (fires when udpConn.Close() is called by the worker's clean() timeout).
-				// This keeps Process alive for the lifetime of the QUIC connection.
-				if done, ok := inbound.Conn.(interface{ Done() <-chan struct{} }); ok {
-					<-done.Done()
-				} else {
-					// Fallback: block on context cancellation (5min idle timeout)
-					<-ctx.Done()
-				}
-				return nil
-			}
-		}
-	}
-
+	// v26.12.34-link: Reverted to task.Run (v26.12.30 approach) which had
+	// CID rotation working. The standalone goroutine approach (v26.12.31-33)
+	// broke CID rotation — the pipe wasn't being managed correctly without
+	// task.Run. Now using task.Run + sessionReplyReader in responseDone,
+	// with the b.UDP fix from v26.12.33 applied to sessionReplyReader.
 	if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
 		return errors.New("connection ends").Base(err)
 	}
@@ -1450,8 +1390,10 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 // and runs for the lifetime of udpConn. This reader just reads from the
 // channel — no socket I/O, no install/uninstall cycle.
 // Ported from v26.11.272.
+// v26.12.34-link: added udpDest field to set b.UDP on reply packets.
 type sessionReplyReader struct {
-	conn interface{ ReadSessionReply() ([]byte, bool) }
+	conn    interface{ ReadSessionReply() ([]byte, bool) }
+	udpDest *net.Destination
 }
 
 func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
@@ -1461,5 +1403,6 @@ func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 	b := buf.New()
 	b.Write(pkt)
+	b.UDP = r.udpDest
 	return buf.MultiBuffer{b}, nil
 }
