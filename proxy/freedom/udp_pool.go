@@ -21,10 +21,10 @@ import (
         "github.com/xtls/xray-core/transport/internet"
 )
 
-// v26.11.300: 4 workers — balances parallelism vs ordering for DCID=∅.
-// 8 workers caused thumbnail races (Initial reply and 1-RTT reply
-// processed by different workers out of order).
-const readLoopWorkers = 4
+// v26.12.3: 2 workers — 4 still had occasional hiccups from DCID=∅
+// collisions. 2 cuts race probability roughly in half while still
+// giving 2x throughput vs single reader.
+const readLoopWorkers = 2
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
