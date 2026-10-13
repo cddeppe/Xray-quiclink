@@ -50,6 +50,17 @@ type pooledSocket struct {
         closeOnce     sync.Once
         dead          bool
         droppedReplies atomic.Int64
+        // v26.12.19: activeConnCount is the number of live pooledConns sharing
+        // this socket. The readLoop uses it for smart routing: when only one
+        // connection is active, reply packets that miss demux can be safely
+        // routed via SCID fallback (long headers) or lastActiveInbox (short
+        // headers). When multiple connections are active, dropping is safer —
+        // misrouting would corrupt the wrong session's QUIC state.
+        activeConnCount atomic.Int64
+        // v26.12.19: lastActiveInbox is the inbox of the pooledConn that most
+        // recently called WriteTo. Used to route 1-RTT short-header replies
+        // (DCID=∅) when only one connection is active. Read under s.mu (RLock).
+        lastActiveInbox chan<- readResult
         // v26.11.158: Track all pooledConns so readLoop can check
         // if a pooledConn is closed before sending to its inbox.
         conns []*pooledConn
@@ -343,6 +354,10 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
         sock.mu.Lock()
         sock.conns = append(sock.conns, conn)
         sock.mu.Unlock()
+        // v26.12.19: count this active connection so readLoop can decide
+        // whether to route demux-miss packets (single-conn) or drop them
+        // (multi-conn, to avoid misrouting). Decremented in pooledConn.Close().
+        sock.activeConnCount.Add(1)
         return conn, nil
 }
 
@@ -417,20 +432,54 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // FIX: SCID-based fallback for 0-length SCID clients
-                        // (Chrome/Edge). The server's reply DCID = client's SCID
-                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
-                        // 0-length). But per RFC 9000 §7.3, the server's reply
-                        // SCID = client's Initial DCID, which WAS registered in
-                        // WriteTo. Parse the SCID and try demux[scid] as a
-                        // fallback before dropping.
-                        if n > 0 && packet[0]&0x80 != 0 {
-                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
-                                        scidKey := makeDCIDKey(scid)
+                        // v26.12.19: Smart routing based on active connection count.
+                        //
+                        // Single active connection (activeConnCount <= 1):
+                        //   - SCID fallback routes Initial replies (long headers)
+                        //     for 0-length SCID clients (Chrome/Edge), where the
+                        //     server's reply DCID = empty and demux[empty] misses.
+                        //   - lastActiveInbox routes 1-RTT short-header replies
+                        //     (DCID=empty, bit 7 = 0), which have no parseable DCID.
+                        //   This is what makes QUIC actually work for nginx/h3 and
+                        //   other single-connection QUIC clients.
+                        //
+                        // Multiple active connections (activeConnCount > 1):
+                        //   - Drop the packet. We can't safely guess which conn
+                        //     owns a DCID=empty reply, and routing to the wrong inbox
+                        //     corrupts that session's QUIC state. Chrome sees no
+                        //     response and falls back to TCP quickly -- which is
+                        //     the desired behavior for Google/YouTube where QUIC
+                        //     pooling causes more problems than it solves.
+                        //
+                        // activeConnCount.Load() is an atomic read -- no lock, no
+                        // overhead on the hot path.
+                        if s.activeConnCount.Load() <= 1 {
+                                // SCID fallback for long headers (Initial replies).
+                                // Per RFC 9000 sec 7.3, server's reply SCID = client's
+                                // Initial DCID, which was registered in WriteTo.
+                                if n > 0 && packet[0]&0x80 != 0 {
+                                        if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
+                                                scidKey := makeDCIDKey(scid)
+                                                s.mu.RLock()
+                                                ch, ok = s.demux[scidKey]
+                                                src = s.demuxSource[scidKey]
+                                                s.mu.RUnlock()
+                                        }
+                                }
+                                // lastActiveInbox for short headers (1-RTT replies).
+                                // These have DCID=empty (zero-length) after QUIC completes
+                                // the CID update, so ParseDCID returns nothing and
+                                // demux lookup misses. Route to the conn that most
+                                // recently wrote -- for single-conn sockets this is
+                                // always the right answer.
+                                if !ok && n > 0 && packet[0]&0x80 == 0 {
                                         s.mu.RLock()
-                                        ch, ok = s.demux[scidKey]
-                                        src = s.demuxSource[scidKey]
+                                        li := s.lastActiveInbox
                                         s.mu.RUnlock()
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
+                                        }
                                 }
                         }
                         if !ok {
@@ -618,6 +667,15 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                 }
         }
 
+        // v26.12.19: remember this conn's inbox as the most-recently-active
+        // one. The readLoop uses lastActiveInbox to route 1-RTT short-header
+        // replies (DCID=∅) when only one connection is active on this socket.
+        // Updated on every WriteTo — both long and short headers — because
+        // either packet type indicates this conn is the live peer.
+        c.socket.mu.Lock()
+        c.socket.lastActiveInbox = c.inbox
+        c.socket.mu.Unlock()
+
         // v26.10.34-link (M1 fix): honor the caller-provided addr if it's a
         // *net.UDPAddr; otherwise fall back to the socket's fixed dest. The
         // pool model assumes one socket per dest, but QUIC connection
@@ -692,6 +750,10 @@ func (c *pooledConn) Close() error {
         }
         c.socket.mu.Unlock()
         c.mu.Unlock()
+
+        // v26.12.19: decrement active connection count so the readLoop
+        // knows when this socket transitions back to single-conn routing.
+        c.socket.activeConnCount.Add(-1)
 
         c.socket.release()
         return nil
