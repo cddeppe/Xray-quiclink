@@ -1,0 +1,80 @@
+name: Publish bare binaries
+
+# Attaches bare xray-linux-amd64 and xray-linux-arm64 binaries to the release
+# for a v* tag, so a server can install with:
+#
+#   cd /tmp && wget -q https://github.com/cddeppe/Xray-quiclink/releases/download/<tag>/xray-linux-amd64
+#   chmod +x xray-linux-amd64 && mv xray-linux-amd64 /usr/local/bin/xray
+#   systemctl restart xray
+#   cd /tmp && rm -f xray-linux-amd64
+#
+# If no release exists for the tag yet, this creates it (published, with
+# generated notes). Publishing it also triggers release.yml, which builds the
+# usual Xray-<platform>.zip assets. So pushing a tag is enough; there is no
+# need to click "Draft a new release" in the UI.
+#
+# This is deliberately a separate workflow rather than another step in
+# release.yml: if something here is wrong, only these two assets are missing
+# and the zip build is unaffected.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Get project dependencies
+        run: go mod download
+
+      - name: Build bare linux binaries
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -eu
+          COMMID=$(git describe --always --dirty)
+          mkdir -p bare
+          for PAIR in "amd64:xray-linux-amd64" "arm64:xray-linux-arm64"; do
+            GOARCH="${PAIR%%:*}"
+            NAME="${PAIR##*:}"
+            echo "Building ${NAME}..."
+            GOOS=linux GOARCH="${GOARCH}" go build \
+              -o "bare/${NAME}" \
+              -trimpath \
+              -buildvcs=false \
+              -gcflags="all=-l=4" \
+              -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
+              ./main
+          done
+          ls -l bare
+
+      - name: Create the release if it does not exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes
+          fi
+
+      - name: Attach bare binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          gh release upload "${GITHUB_REF_NAME}" bare/xray-linux-amd64 bare/xray-linux-arm64 --clobber
