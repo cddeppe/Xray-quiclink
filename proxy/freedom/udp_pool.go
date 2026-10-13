@@ -417,26 +417,12 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // FIX: SCID-based fallback for 0-length SCID clients
-                        // (Chrome/Edge). The server's reply DCID = client's SCID
-                        // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
-                        // 0-length). But per RFC 9000 §7.3, the server's reply
-                        // SCID = client's Initial DCID, which WAS registered in
-                        // WriteTo. Parse the SCID and try demux[scid] as a
-                        // fallback before dropping.
-                        if n > 0 && packet[0]&0x80 != 0 {
-                                if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
-                                        scidKey := makeDCIDKey(scid)
-                                        s.mu.RLock()
-                                        ch, ok = s.demux[scidKey]
-                                        src = s.demuxSource[scidKey]
-                                        s.mu.RUnlock()
-                                }
-                        }
-                        if !ok {
-                                putPacket(packet)
-                                continue
-                        }
+                        // No SCID fallback — drop the packet.
+                        // Chrome's QUIC Initial reply (DCID=∅) is dropped → Chrome sees
+                        // no response → falls back to TCP in ~1 second (faster than
+                        // routing the Initial and then failing on 1-RTT).
+                        putPacket(packet)
+                        continue
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
