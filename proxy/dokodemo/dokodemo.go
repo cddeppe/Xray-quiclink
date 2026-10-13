@@ -86,41 +86,27 @@ func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn st
 
 	if !d.config.FollowRedirect {
 		host, port, err := net.SplitHostPort(conn.LocalAddr().String())
-		// v26.12.24-link: if ob.Target is valid (TPROXY gave us the
-		// real original destination), use it instead of 127.0.0.1.
-		// This preserves Chrome's cached Google IP so freedom can
-		// forward to the exact IP Chrome expected.
-		outbounds := session.OutboundsFromContext(ctx)
-		if len(outbounds) > 0 {
-			ob := outbounds[len(outbounds)-1]
-			if ob.Target.IsValid() && ob.Target.Address.Family().IsIP() {
-				dest = ob.Target
-				destinationOverridden = true
+		if dest.Address == nil {
+			if err != nil {
+				dest.Address = net.DomainAddress("localhost")
+			} else {
+				if strings.Contains(host, ".") {
+					dest.Address = net.LocalHostIP
+				} else {
+					dest.Address = net.LocalHostIPv6
+				}
 			}
 		}
-		if !destinationOverridden {
-			if dest.Address == nil {
-				if err != nil {
-					dest.Address = net.DomainAddress("localhost")
-				} else {
-					if strings.Contains(host, ".") {
-						dest.Address = net.LocalHostIP
-					} else {
-						dest.Address = net.LocalHostIPv6
-					}
-				}
+		if dest.Port == 0 && port != "" {
+			dest.Port = net.Port(common.Must2(strconv.Atoi(port)))
+		}
+		if d.portMap != nil && d.portMap[port] != "" {
+			h, p, _ := net.SplitHostPort(d.portMap[port])
+			if len(h) > 0 {
+				dest.Address = net.ParseAddress(h)
 			}
-			if dest.Port == 0 && port != "" {
-				dest.Port = net.Port(common.Must2(strconv.Atoi(port)))
-			}
-			if d.portMap != nil && d.portMap[port] != "" {
-				h, p, _ := net.SplitHostPort(d.portMap[port])
-				if len(h) > 0 {
-					dest.Address = net.ParseAddress(h)
-				}
-				if len(p) > 0 {
-					dest.Port = net.Port(common.Must2(strconv.Atoi(p)))
-				}
+			if len(p) > 0 {
+				dest.Port = net.Port(common.Must2(strconv.Atoi(p)))
 			}
 		}
 	}
