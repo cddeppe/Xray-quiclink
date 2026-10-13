@@ -95,6 +95,33 @@ type readResult struct {
         addr stdnet.Addr
 }
 
+// v26.12.17: sharedPacket is a reference-counted packet wrapper used for
+// zero-copy broadcast of DCID=∅ short-header (1-RTT) replies. Chrome uses
+// 0-length SCID, so Google's 1-RTT replies have DCID=∅ — the pool can't
+// demux these by DCID. The readLoop creates one sharedPacket per such reply
+// and broadcasts it to all active conns on the socket whose googleDestIP
+// matches the packet's source IP. Each conn's dcidEmptyReader copies the
+// data into the conn's inbox and calls release(). When the last reference
+// is released, the buffer is returned to packetPool.
+//
+// The readLoop holds its own reference (refCount=1) for the duration of the
+// broadcast loop so that no consumer's release() can free the buffer while
+// the readLoop is still iterating conns and incrementing the count for
+// subsequent sends. After the loop, the readLoop calls release() to drop
+// its own reference; the last consumer to finish drives refCount to 0.
+type sharedPacket struct {
+        buf      []byte // full buffer from getPacket()
+        n        int     // actual data length
+        addr     stdnet.Addr
+        refCount atomic.Int32
+}
+
+func (sp *sharedPacket) release() {
+        if sp.refCount.Add(-1) == 0 {
+                putPacket(sp.buf)
+        }
+}
+
 type pooledConn struct {
         socket *pooledSocket
         inbox  chan readResult
@@ -114,6 +141,20 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+        // v26.12.17: googleDestIP is the Google server IP this connection
+        // is talking to (set in WriteTo). Used by dcidEmptyReader to
+        // filter broadcast DCID=∅ replies. Written from the WriteTo
+        // goroutine; read from dcidEmptyReader. Since all conns on a
+        // socket share the same dest IP (per-IP keying), this is usually
+        // constant after the first WriteTo.
+        googleDestIP stdnet.IP
+        // v26.12.17: dcidEmptyCh is a per-conn buffered channel for
+        // DCID=∅ 1-RTT replies broadcast by the readLoop. The readLoop
+        // sends the same *sharedPacket to every matching conn's channel
+        // (non-blocking, drops if full). Each conn's dcidEmptyReader
+        // reads from its own channel — this is true fan-out broadcast
+        // (not competing consumers), so every conn gets every packet.
+        dcidEmptyCh chan *sharedPacket
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -327,15 +368,20 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
 
         inbox := make(chan readResult, 256) // v26.10.20-link: was 32, increased to 256 to absorb YouTube reply bursts
         conn := &pooledConn{
-                socket:    sock,
-                inbox:     inbox,
-                done:      make(chan struct{}),
-                scidsDCID: make(map[dcidKey]bool),
+                socket:      sock,
+                inbox:       inbox,
+                done:        make(chan struct{}),
+                scidsDCID:   make(map[dcidKey]bool),
+                dcidEmptyCh: make(chan *sharedPacket, 64), // v26.12.17: per-conn broadcast for DCID=∅ replies
         }
         // v26.11.158: Track this pooledConn so readLoop can check IsClosed
         sock.mu.Lock()
         sock.conns = append(sock.conns, conn)
         sock.mu.Unlock()
+        // v26.12.17: start the dcidEmptyReader goroutine to receive broadcast
+        // DCID=∅ 1-RTT replies from the readLoop and deliver matching ones to
+        // this conn's inbox.
+        go conn.dcidEmptyReader()
         return conn, nil
 }
 
@@ -427,6 +473,63 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if !ok {
+                                // v26.12.17: zero-copy broadcast for DCID=∅ short-header
+                                // (1-RTT) replies. Chrome uses 0-length SCID, so Google's
+                                // 1-RTT replies have DCID=∅ — the pool's ParseDCID reads
+                                // the 8 bytes after byte 0 (DefaultShortHeaderCIDLen=8)
+                                // and won't match any registered CID, and the SCID
+                                // fallback above only runs for long headers (Initial).
+                                // Without this broadcast, these replies are dropped and
+                                // Chrome falls back to TCP (h3 doesn't work).
+                                //
+                                // Broadcast the packet to every active conn on this
+                                // socket whose googleDestIP matches the packet's source
+                                // IP. Each conn's QUIC stack will try to decrypt and
+                                // either accept or drop — only the right conn has the
+                                // keys, so only it accepts; others drop silently.
+                                //
+                                // This is TRUE fan-out: every matching conn's
+                                // dcidEmptyCh gets its own *sharedPacket reference.
+                                // refCount = 1 (readLoop) + number of successful sends.
+                                // The readLoop holds its own reference for the whole
+                                // loop so no consumer's release() can free the buffer
+                                // mid-broadcast. After the loop, the readLoop releases
+                                // its reference; the last consumer to finish drives
+                                // refCount to 0 and frees the buffer.
+                                if n > 0 && packet[0]&0x80 == 0 {
+                                        if srcUDP, addrOk := addr.(*stdnet.UDPAddr); addrOk {
+                                                sp := &sharedPacket{
+                                                        buf:  packet,
+                                                        n:    n,
+                                                        addr: addr,
+                                                }
+                                                sp.refCount.Store(1) // readLoop's own reference
+                                                s.mu.RLock()
+                                                for _, c := range s.conns {
+                                                        if c.closed.Load() {
+                                                                continue
+                                                        }
+                                                        if c.googleDestIP == nil {
+                                                                continue
+                                                        }
+                                                        if !srcUDP.IP.Equal(c.googleDestIP) {
+                                                                continue
+                                                        }
+                                                        sp.refCount.Add(1)
+                                                        select {
+                                                        case c.dcidEmptyCh <- sp:
+                                                                // sent — refCount stays incremented
+                                                        default:
+                                                                // channel full or reader not keeping up —
+                                                                // undo the increment so refCount stays consistent.
+                                                                sp.refCount.Add(-1)
+                                                        }
+                                                }
+                                                s.mu.RUnlock()
+                                                sp.release() // drop the readLoop's reference
+                                                continue
+                                        }
+                                }
                                 putPacket(packet)
                                 continue
                         }
@@ -619,6 +722,16 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if udp, ok := addr.(*stdnet.UDPAddr); ok {
                 dest = udp
         }
+        // v26.12.17: track the Google server IP we're sending to so the
+        // dcidEmptyReader can filter broadcast DCID=∅ replies by source IP.
+        // WriteTo is called from one goroutine per connection, so the plain
+        // assignment is safe (the reader tolerates a benign torn read — it
+        // just skips the packet and the next one works). After the first
+        // WriteTo this is constant for the conn's lifetime under per-IP
+        // socket keying.
+        if dest != nil && dest.IP != nil {
+                c.googleDestIP = dest.IP
+        }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
                 // v26.10.15-link: only mark the socket dead on persistent
@@ -651,6 +764,69 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
         }
 }
 
+// v26.12.17: dcidEmptyReader reads broadcast DCID=∅ short-header (1-RTT)
+// replies from the readLoop and delivers matching ones to the conn's inbox.
+//
+// The readLoop broadcasts a *sharedPacket to every active conn's dcidEmptyCh
+// when it receives a 1-RTT reply whose DCID doesn't match any demux entry
+// (Chrome's 0-length SCID means Google's 1-RTT replies have DCID=∅). Each
+// conn gets its own reference; release() decrements the refCount and the
+// last one frees the buffer.
+//
+// This goroutine exits when c.done is closed (in Close()). On exit it
+// drains any remaining packets so their references are released and the
+// buffer is freed — this is paired with a drain in Close() that catches
+// packets the readLoop sent in the race window between the c.closed check
+// and the reader actually exiting.
+func (c *pooledConn) dcidEmptyReader() {
+        for {
+                select {
+                case <-c.done:
+                        // Drain remaining packets so their refCounts are released.
+                        for {
+                                select {
+                                case sp, ok := <-c.dcidEmptyCh:
+                                        if !ok {
+                                                return
+                                        }
+                                        sp.release()
+                                default:
+                                        return
+                                }
+                        }
+                case sp, ok := <-c.dcidEmptyCh:
+                        if !ok {
+                                return
+                        }
+                        // Filter: only deliver if the packet's source IP matches
+                        // the Google IP we're talking to. Under per-IP socket
+                        // keying this always matches (the socket's dest == our
+                        // googleDestIP), but the check is cheap defense-in-depth
+                        // against connection-migration edge cases.
+                        if srcUDP, ok := sp.addr.(*stdnet.UDPAddr); ok && c.googleDestIP != nil {
+                                if srcUDP.IP.Equal(c.googleDestIP) {
+                                        // Copy the data into a fresh pooled buffer for the
+                                        // inbox. The inbox reader (ReadFrom) calls putPacket
+                                        // on the data it receives, so it must own its own
+                                        // buffer — we can't hand it the shared buffer (other
+                                        // conns may still be reading it). One copy per
+                                        // matching conn, almost always just 1 conn.
+                                        pktCopy := getPacket()
+                                        copy(pktCopy, sp.buf[:sp.n])
+                                        select {
+                                        case c.inbox <- readResult{data: pktCopy[:sp.n], addr: sp.addr}:
+                                                // delivered — inbox reader will putPacket(pktCopy)
+                                        default:
+                                                // inbox full — drop (QUIC retransmits)
+                                                putPacket(pktCopy)
+                                        }
+                                }
+                        }
+                        sp.release()
+                }
+        }
+}
+
 func (c *pooledConn) IsClosed() bool {
         return c.closed.Load()
 }
@@ -676,6 +852,24 @@ func (c *pooledConn) Close() error {
         }
         c.socket.mu.Unlock()
         c.mu.Unlock()
+
+        // v26.12.17: drain dcidEmptyCh to release any broadcast packets the
+        // readLoop sent in the race window between our c.closed check (in the
+        // readLoop's broadcast loop) and the reader goroutine actually exiting.
+        // By this point we've released c.socket.mu, but the readLoop's next
+        // broadcast will see c.closed=true and skip us — so no new sends can
+        // arrive after this drain completes. The reader goroutine may have
+        // already drained some packets; channel semantics guarantee each
+        // packet is drained exactly once, so there's no double-release.
+        for {
+                select {
+                case sp := <-c.dcidEmptyCh:
+                        sp.release()
+                default:
+                        goto dcidDrained
+                }
+        }
+dcidDrained:
 
         c.socket.release()
         return nil
