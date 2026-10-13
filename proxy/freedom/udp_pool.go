@@ -62,6 +62,11 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // Fix D: lastInboxBySourceIP routes DCID=∅ replies by the source IP
+        // of the reply. Uses sync.Map — Load and Store are lock-free (atomic CAS),
+        // so no RLock/Lock contention on the hot path. YouTube's DCID=∅ replies
+        // come from Google IPs; h3's come from different IPs.
+        lastInboxBySourceIP sync.Map // string -> chan readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -431,17 +436,30 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
-                        // instead of demux[∅]. This avoids collisions when multiple
-                        // connections share the pool socket (all Chrome connections
-                        // have 0-length SCID → all replies have DCID=∅).
+                        // Fix D: For DCID=∅ replies, try lastInboxBySourceIP first
+                        // (lock-free sync.Map.Load). YouTube's DCID=∅ replies come from
+                        // Google IPs; h3's come from different IPs. Fall back to
+                        // lastActiveInbox if source-IP lookup misses.
                         if len(dcid) == 0 {
-                                s.mu.RLock()
-                                li := s.lastActiveInbox
-                                s.mu.RUnlock()
-                                if li != nil {
-                                        ch = li
-                                        ok = true
+                                if addr != nil {
+                                        if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk && srcUDP.IP != nil {
+                                                if li, liOk := s.lastInboxBySourceIP.Load(srcUDP.IP.String()); liOk {
+                                                        if lic, licOk := li.(chan readResult); licOk && lic != nil {
+                                                                ch = lic
+                                                                ok = true
+                                                        }
+                                                }
+                                        }
+                                }
+                                // Fall back to global lastActiveInbox
+                                if !ok {
+                                        s.mu.RLock()
+                                        li := s.lastActiveInbox
+                                        s.mu.RUnlock()
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
+                                        }
                                 }
                         }
                 }
@@ -498,6 +516,13 @@ func (s *pooledSocket) readLoop() {
                 }
 
                 if sentOk && n > 0 && packet[0]&0x80 != 0 && src != nil {
+                        // Fix D: Cache lastInboxBySourceIP[googleSrcIP] using addr
+                        // (from ReadFrom = Google's IP). Lock-free sync.Map.Store.
+                        // Only fires for long headers — zero hot-path impact.
+                        if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk && srcUDP.IP != nil {
+                                s.lastInboxBySourceIP.Store(srcUDP.IP.String(), ch)
+                        }
+
                         pktType := (packet[0] >> 4) & 0x03
                         if pktType == 0x00 {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
