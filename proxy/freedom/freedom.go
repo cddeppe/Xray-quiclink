@@ -623,8 +623,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 if udpRemote != nil {
                                         // Skip pool for loopback (127.0.0.1, ::1) — DNS/localhost
                                         // traffic doesn't need source port stability, and routing
-                                        // Skip pool for loopback (127.0.0.1, ::1, 0.0.0.0) — DNS/localhost
-                                        // traffic doesn't need source port stability, and routing
                                         // it through the pool overwrites lastActiveInbox, breaking
                                         // QUIC handshake routing for Google traffic.
                                         isLoopback := udpRemote.IP.IsLoopback() || udpRemote.IP.IsUnspecified()
@@ -633,14 +631,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         }
                                         errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
                                         if err != nil {
-                                                // v26.10.34-link (C3 fix): release peeked packets
-                                                // before returning. Without this, every Acquire
-                                                // failure leaks one MultiBuffer (up to 8KB+ per
-                                                // failure) — unbounded growth under flapping dest.
                                                 buf.ReleaseMulti(peekedPackets)
                                                 peekedPackets = nil
                                                 return errors.New("failed to acquire pooled UDP conn").Base(err)
                                         }
+                                        // Skip pool setup if loopback — pooledConn is nil
+                                        if pooledConn == nil {
+                                                // Not a pool connection — use per-session path
+                                                // Write peeked packets and continue to normal path
+                                                if len(peekedPackets) > 0 {
+                                                        // Fall through to non-pool path below
+                                                }
+                                        } else {
                                         // v26.11.52-link (Solution B): bind the pooled socket's
                                         // source to the inbound client's source IP:port so that
                                         // pool reply packets (read via wildcard listen) are
@@ -669,8 +671,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         uc.SetRegisterPoolCID(func(newDCID []byte) {
                                                                 pc.RegisterCID(newDCID)
                                                         })
+                                                }
                                         }
-                                        }
+                                        } // end if pooledConn != nil
                                 }
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
