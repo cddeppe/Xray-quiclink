@@ -623,6 +623,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                 if udpRemote != nil {
                                         // Skip pool for loopback (127.0.0.1, ::1) — DNS/localhost
                                         // traffic doesn't need source port stability, and routing
+                                        // Skip pool for loopback (127.0.0.1, ::1, 0.0.0.0) — DNS/localhost
+                                        // traffic doesn't need source port stability, and routing
                                         // it through the pool overwrites lastActiveInbox, breaking
                                         // QUIC handshake routing for Google traffic.
                                         isLoopback := udpRemote.IP.IsLoopback() || udpRemote.IP.IsUnspecified()
@@ -668,6 +670,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                                 pc.RegisterCID(newDCID)
                                                         })
                                                 }
+                                        }
                                         }
                                 }
                         }
