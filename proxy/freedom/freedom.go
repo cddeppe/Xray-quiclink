@@ -621,7 +621,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        // Skip pool for loopback (127.0.0.1, ::1) — DNS/localhost
+                                        // traffic doesn't need source port stability, and routing
+                                        // it through the pool overwrites lastActiveInbox, breaking
+                                        // QUIC handshake routing for Google traffic.
+                                        isLoopback := udpRemote.IP.IsLoopback()
+                                        if !isLoopback {
+                                            pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                        }
                                         errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
                                         if err != nil {
                                                 // v26.10.34-link (C3 fix): release peeked packets

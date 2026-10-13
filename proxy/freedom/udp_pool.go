@@ -53,6 +53,14 @@ type pooledSocket struct {
         // v26.11.158: Track all pooledConns so readLoop can check
         // if a pooledConn is closed before sending to its inbox.
         conns []*pooledConn
+        // shortHeaderCIDLen learned from the first connection's
+        // Initial SCID length. For Chrome (0-length SCID), this is 0.
+        shortHeaderCIDLen atomic.Int32
+        // lastActiveInbox is the inbox of the connection that
+        // most recently sent a packet via WriteTo. When a reply arrives with
+        // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
+        // of using demux[∅] (which would collide across connections).
+        lastActiveInbox chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -380,7 +388,24 @@ func (s *pooledSocket) readLoop() {
                 packet := getPacket()
                 copy(packet, b[:n])
 
-                dcid, _, err := quic.ParseDCID(packet[:n])
+                // Use shortHeaderCIDLen for short headers instead of default 8.
+                // Chrome uses 0-length SCID, so the server's 1-RTT replies have
+                // DCID=∅ (0 bytes). ParseDCID defaults to 8, reading garbage.
+                // With shortHeaderCIDLen=0, we read 0 bytes → DCID=∅ → demux miss
+                // → falls to lastActiveInbox fallback.
+                var dcid []byte
+                if n > 0 && packet[0]&0x80 != 0 {
+                        // Long header — DCID length is in the packet
+                        dcid, _, err = quic.ParseDCID(packet[:n])
+                } else {
+                        // Short header — use learned CID length
+                        cidLen := int(s.shortHeaderCIDLen.Load())
+                        if cidLen < 0 {
+                                cidLen = quic.DefaultShortHeaderCIDLen
+                        }
+                        // cidLen can be 0 (Chrome uses 0-length SCID).
+                        dcid, _, err = quic.ParseShortHeaderDCIDWithLen(packet[:n], cidLen)
+                }
                 if err != nil {
                         putPacket(packet)
                         continue
@@ -410,7 +435,7 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // FIX: SCID-based fallback for 0-length SCID clients
+                        // SCID-based fallback for 0-length SCID clients
                         // (Chrome/Edge). The server's reply DCID = client's SCID
                         // = ∅ (0 bytes), so demux[∅] misses (RegisterCID skips
                         // 0-length). But per RFC 9000 §7.3, the server's reply
@@ -426,10 +451,24 @@ func (s *pooledSocket) readLoop() {
                                         s.mu.RUnlock()
                                 }
                         }
-                        if !ok {
-                                putPacket(packet)
-                                continue
+                }
+                if !ok {
+                        // If DCID is empty (0-length), use lastActiveInbox
+                        // instead of dropping. This handles Chrome's 0-length SCID
+                        // where all 1-RTT replies have DCID=∅.
+                        if len(dcid) == 0 {
+                                s.mu.RLock()
+                                li := s.lastActiveInbox
+                                s.mu.RUnlock()
+                                if li != nil {
+                                        ch = li
+                                        ok = true
+                                }
                         }
+                }
+                if !ok {
+                        putPacket(packet)
+                        continue
                 }
 
                 // v26.10.21-link: non-blocking send with large channel (256).
@@ -595,17 +634,22 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         // mutex acquire for 99% of packets in a long-lived QUIC
         // connection (which are 1-RTT).
         if len(b) > 0 && b[0]&0x80 != 0 {
-                if scid, _, err := parseQUICSCID(b); err == nil && len(scid) > 0 {
-                        c.RegisterCID(scid)
+                if scid, _, err := parseQUICSCID(b); err == nil {
+                        // Don't register 0-length SCIDs in demux — they collide.
+                        // Instead, set lastActiveInbox so the readLoop can route
+                        // DCID=∅ replies to the most recently active connection.
+                        if len(scid) > 0 {
+                                c.RegisterCID(scid)
+                        }
+                        // Learn the short header CID length from the client's SCID.
+                        c.socket.shortHeaderCIDLen.Store(int32(len(scid)))
+                        // Update lastActiveInbox on every WriteTo call
+                        c.socket.mu.Lock()
+                        c.socket.lastActiveInbox = c.inbox
+                        c.socket.mu.Unlock()
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
-                // the server's reply SCID = client's Initial DCID. For
-                // 0-length SCID clients (Chrome/Edge), RegisterCID(scid)
-                // is skipped (len==0), so demux has no entry for the
-                // connection and the server's reply (DCID=∅) is silently
-                // dropped. By registering the DCID, the readLoop's
-                // SCID-based fallback can route the reply by looking up
-                // demux[serverSCID] = demux[clientDCID].
+                // the server's reply SCID = client's Initial DCID.
                 if dcid, _, err := quic.ParseDCID(b); err == nil && len(dcid) > 0 {
                         c.RegisterCID(dcid)
                 }
