@@ -596,6 +596,33 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // For non-warm-pool paths, close normally.
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
                 defer h.tcpWarmPool.Release(conn, destination)
+        } else if destination.Network != net.Network_TCP && h.socketPool == nil {
+                // v26.11.196: For UDP non-pool path ONLY (pool is OFF):
+                // Store the outbound conn in udpConn for reuse across Process
+                // restarts. Keeps source port stable → no Google path validation
+                // → no CID rotation when WireGuard/DNS keeps sending packets.
+                // The persistent conn is closed by udpConn.Close() (called from
+                // clean() after the idle timeout, or from worker shutdown).
+                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                        if udpConn, ok := inbound.Conn.(interface {
+                                GetOutboundConn() net.Conn
+                                SetOutboundConn(net.Conn, net.Destination)
+                        }); ok {
+                                existingConn := udpConn.GetOutboundConn()
+                                if existingConn != nil {
+                                        conn = existingConn
+                                        errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
+                                } else {
+                                        defer func() {
+                                                udpConn.SetOutboundConn(conn, destination)
+                                        }()
+                                }
+                        } else {
+                                defer conn.Close()
+                        }
+                } else {
+                        defer conn.Close()
+                }
         } else {
                 defer conn.Close()
         }
@@ -605,68 +632,117 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // Only QUIC traffic can be demuxed by DCID in the pool's readLoop, so
         // non-QUIC UDP (e.g. WireGuard, DNS, games) falls back to the existing
         // per-session socket path. This prevents the pool from breaking non-QUIC UDP.
-        var pooledConn *pooledConn
+        var pconn *pooledConn
         var peekedPackets buf.MultiBuffer
         if destination.Network != net.Network_TCP && h.socketPool != nil {
-                // Peek at the first packet(s) to check if this is QUIC traffic.
-                mb, peekErr := input.ReadMultiBuffer()
-                if peekErr == nil && len(mb) > 0 {
-                        peekedPackets = mb
-                        if isQUICLongHeader(mb[0].Bytes()) {
-                                remoteAddr := conn.RemoteAddr()
-                                var udpRemote *net.UDPAddr
-                                if u, ok := remoteAddr.(*net.UDPAddr); ok {
-                                        udpRemote = u
-                                } else {
-                                        udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
-                                }
-                                if udpRemote != nil {
-                                        pooledConn, err = h.socketPool.Acquire(udpRemote)
-                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
-                                        if err != nil {
-                                                // v26.10.34-link (C3 fix): release peeked packets
-                                                // before returning. Without this, every Acquire
-                                                // failure leaks one MultiBuffer (up to 8KB+ per
-                                                // failure) — unbounded growth under flapping dest.
-                                                buf.ReleaseMulti(peekedPackets)
-                                                peekedPackets = nil
-                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
-                                        }
-                                        // v26.11.52-link (Solution B): bind the pooled socket's
-                                        // source to the inbound client's source IP:port so that
-                                        // pool reply packets (read via wildcard listen) are
-                                        // demuxed back to the originating client. Without this,
-                                        // all QUIC sessions sharing a pooled socket collapse to
-                                        // the socket's local (kernel-chosen) source and the
-                                        // 4-tuple-based reply routing breaks under NAT.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                pooledConn.source = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
-                                                }
-                                        }
-                                        defer pooledConn.Close()
-                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
-                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
-                                        outGateway = nil
-                                        // v26.11.156: Set up pool CID registration callback.
-                                        // When the inbound worker detects CID rotation in a
-                                        // 1-RTT short header, it calls this to register the
-                                        // new DCID in the pool's demux. Without this, Google's
-                                        // replies with the rotated DCID get dropped.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                                if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
-                                                        pc := pooledConn
-                                                        uc.SetRegisterPoolCID(func(newDCID []byte) {
-                                                                pc.RegisterCID(newDCID)
-                                                        })
-                                                }
+                // v26.11.202: Check if the inbound udpConn has a pconn from a
+                // previous Process call (goroutine restart). If so, reuse it —
+                // this handles short-header (1-RTT) packets that arrive after
+                // Process returned. Without this, short headers skip the pool
+                // → new socket → stall.
+                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                        if getter, ok := inbound.Conn.(interface {
+                                GetPooledConn() interface{}
+                                SetPooledConn(interface{})
+                        }); ok {
+                                if existing := getter.GetPooledConn(); existing != nil {
+                                        // v26.11.203: assert to *pooledConn (the actual type
+                                        // stored by SetPooledConn), not *PooledPacketReader.
+                                        // *pooledConn is in the same package (freedom) so we
+                                        // can type-assert to it. The local variable is named
+                                        // `pconn` (not `pooledConn`) precisely so the type
+                                        // name `pooledConn` is unshadowed at the assertion.
+                                        if pc, ok := existing.(*pooledConn); ok && !pc.IsClosed() {
+                                                pconn = pc
+                                                outGateway = nil
+                                                errors.LogInfo(ctx, "freedom: reused persistent pconn (goroutine restart)")
                                         }
                                 }
                         }
-                        // If not QUIC, pooledConn stays nil — existing per-session path is used.
                 }
-                // If peek failed, proceed with existing path (pooledConn stays nil).
+
+                if pconn == nil {
+                        // Peek at the first packet(s) to check if this is QUIC traffic.
+                        mb, peekErr := input.ReadMultiBuffer()
+                        if peekErr == nil && len(mb) > 0 {
+                                peekedPackets = mb
+                                if isQUICLongHeader(mb[0].Bytes()) {
+                                        remoteAddr := conn.RemoteAddr()
+                                        var udpRemote *net.UDPAddr
+                                        if u, ok := remoteAddr.(*net.UDPAddr); ok {
+                                                udpRemote = u
+                                        } else {
+                                                udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
+                                        }
+                                        if udpRemote != nil {
+                                                pconn, err = h.socketPool.Acquire(udpRemote)
+                                                errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pconn != nil, " err=", err)
+                                                if err != nil {
+                                                        // v26.10.34-link (C3 fix): release peeked packets
+                                                        // before returning. Without this, every Acquire
+                                                        // failure leaks one MultiBuffer (up to 8KB+ per
+                                                        // failure) — unbounded growth under flapping dest.
+                                                        buf.ReleaseMulti(peekedPackets)
+                                                        peekedPackets = nil
+                                                        return errors.New("failed to acquire pooled UDP conn").Base(err)
+                                                }
+                                                // v26.11.52-link (Solution B): bind the pooled socket's
+                                                // source to the inbound client's source IP:port so that
+                                                // pool reply packets (read via wildcard listen) are
+                                                // demuxed back to the originating client. Without this,
+                                                // all QUIC sessions sharing a pooled socket collapse to
+                                                // the socket's local (kernel-chosen) source and the
+                                                // 4-tuple-based reply routing breaks under NAT.
+                                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                        pconn.source = &stdnet.UDPAddr{
+                                                                IP:   inbound.Source.Address.IP(),
+                                                                Port: int(inbound.Source.Port),
+                                                        }
+                                                }
+                                                // v26.11.200: DON'T close pconn on Process return.
+                                                // The goroutine restart (worker.go callback) will reuse it.
+                                                // Closing it kills the inbox → Google's replies panic → stall.
+                                                // The pool's reaper (300s unused timeout) cleans up the socket.
+                                                // Pool uses wildcard socket; clear outGateway for QUIC path.
+                                                // Non-QUIC UDP keeps outGateway (sendThrough honored).
+                                                outGateway = nil
+                                                // v26.11.156: Set up pool CID registration callback.
+                                                // When the inbound worker detects CID rotation in a
+                                                // 1-RTT short header, it calls this to register the
+                                                // new DCID in the pool's demux. Without this, Google's
+                                                // replies with the rotated DCID get dropped.
+                                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                        if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
+                                                                pc := pconn
+                                                                uc.SetRegisterPoolCID(func(newDCID []byte) {
+                                                                        pc.RegisterCID(newDCID)
+                                                                })
+                                                        }
+                                                        // v26.11.202: Store the pconn for reuse by
+                                                        // future Process calls (goroutine restart). The
+                                                        // pconn is closed by udpConn.Close() (clean()
+                                                        // retirement), which calls pconn.Close() via
+                                                        // the interface{} pointer.
+                                                        if setter, ok := inbound.Conn.(interface{ SetPooledConn(interface{}) }); ok {
+                                                                setter.SetPooledConn(pconn)
+                                                        }
+                                                        // v26.11.212: Wire up the activity callback so
+                                                        // clean() doesn't retire active connections.
+                                                        // BufferedPacketReader and PooledPacketWriter
+                                                        // bypass udpConn.Write/Read, so lastActivityTime
+                                                        // is never updated without this hook. The pool's
+                                                        // WriteTo and ReadFrom call onActivity() on every
+                                                        // packet, refreshing the timer.
+                                                        if updater, ok := inbound.Conn.(interface{ UpdateActivity() }); ok {
+                                                                pconn.onActivity = updater.UpdateActivity
+                                                        }
+                                                }
+                                        }
+                                }
+                                // If not QUIC, pconn stays nil — existing per-session path is used.
+                        }
+                        // If peek failed, proceed with existing path (pconn stays nil).
+                }
         }
 
         var newCtx context.Context
@@ -686,7 +762,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pooledConn != nil)
+                errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pconn != nil)
 
                 var writer buf.Writer
                 if destination.Network == net.Network_TCP {
@@ -700,12 +776,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         } else {
                                 writer = buf.NewWriter(conn)
                         }
-                } else if pooledConn != nil {
+                } else if pconn != nil {
                         var statWrite stats.Counter
                         if statConn, ok := conn.(*stat.CounterConnection); ok {
                                 statWrite = statConn.WriteCounter
                         }
-                        writer = NewPooledPacketWriter(pooledConn, statWrite)
+                        writer = NewPooledPacketWriter(pconn, statWrite)
                 } else {
                         writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
                         if h.config.Noises != nil {
@@ -745,7 +821,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pooledConn != nil)
+                errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pconn != nil)
                 // v26.10.37-link: signal the inputCloser goroutine to interrupt
                 // the inbound input pipe when responseDone returns — whether
                 // the outbound closed cleanly (EOF) or with an error. This
@@ -766,8 +842,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 var reader buf.Reader
                 if destination.Network == net.Network_TCP {
                         reader = buf.NewReader(conn)
-                } else if pooledConn != nil {
-                        reader = NewPooledPacketReader(pooledConn)
+                } else if pconn != nil {
+                        // v26.11.201: Wrap PooledPacketReader with BufferedPacketReader.
+                        // This decouples the pool's inbox from Process. When Process
+                        // returns (video switch, CID rotation), the BufferedPacketReader's
+                        // readLoop keeps draining the inbox — Google's replies are buffered
+                        // and delivered when the goroutine restarts. Without this, the
+                        // inbox fills up and replies are dropped → stall at ~10 seconds.
+                        bpr := NewBufferedPacketReader(NewPooledPacketReader(pconn))
+                        reader = bpr
+                        // v26.11.211: Close BufferedPacketReader when responseDone exits.
+                        // Without this, the readLoop competes with the new Process's
+                        // BufferedPacketReader for the same pconn's inbox.
+                        defer bpr.Close()
                 } else {
                         reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
                         // v26.11.117: Wrap reader to detect server SCID from
@@ -791,6 +878,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return errors.New("failed to process response").Base(err)
                 }
                 errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
+                // v26.11.209: Cancel the context so requestDone also returns.
+                // Without this, responseDone exits (e.g. on a 30s timeout) but
+                // requestDone keeps blocking on input → Process never returns →
+                // goroutine never restarts → new packets from Chrome go to the
+                // dead pipe → stall. Combined with v26.11.196 (processRunning)
+                // in the worker, this lets the next packet re-enter Process
+                // and reuse the persistent outboundConn / pconn.
+                cancel()
+                // v26.11.210: Also directly interrupt the input pipe. cancel()
+                // alone doesn't work because buf.Copy(input, writer) blocks on
+                // input.ReadMultiBuffer() which doesn't check context. We need
+                // to explicitly interrupt the pipe so requestDone unblocks and
+                // Process returns. This prevents Shorts-swiping goroutines from
+                // accumulating (one per swipe that never returned).
+                common.Interrupt(input)
                 return nil
         }
 

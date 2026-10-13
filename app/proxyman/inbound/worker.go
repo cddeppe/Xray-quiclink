@@ -197,6 +197,26 @@ type udpConn struct {
         // the pool's readLoop drops replies with the new DCID, causing Google
         // to think the connection is dead and stop replying (20-second freeze).
         registerPoolCID func([]byte)
+        // v26.11.196: Persistent outbound conn (to Google). Survives Process
+        // restarts so the source port stays stable for the entire QUIC
+        // connection. Without this, each Process restart dials a new socket
+        // with a new source port → Google sees connection migration → path
+        // validation → stall.
+        outboundConn net.Conn
+        outboundMu   sync.Mutex
+        outboundDest net.Destination
+        // v26.11.196: Track whether the Process goroutine is running. The
+        // inbound callback uses this to decide whether to start (or restart)
+        // the goroutine: a returning Process (e.g. from responseDone's
+        // goroutine-leak fix) leaves the persistent outboundConn alive so
+        // the next packet can re-enter Process and reuse it.
+        processRunning atomic.Bool
+        // v26.11.202: Persistent pooledConn. Survives Process restarts so
+        // short-header (1-RTT) packets that arrive after Process returned
+        // still use the pool (same socket, same source port). Without this,
+        // the goroutine restart peeks a short header, skips the pool, and
+        // dials a new socket → stall.
+        pooledConnPtr interface{} // *pooledConn, stored as interface to avoid import cycle
 }
 
 func (c *udpConn) setInactive() {
@@ -205,6 +225,53 @@ func (c *udpConn) setInactive() {
 
 func (c *udpConn) updateActivity() {
         atomic.StoreInt64(&c.lastActivityTime, time.Now().Unix())
+}
+
+// v26.11.212: UpdateActivity is an exported wrapper for updateActivity.
+// Called by pooledConn.onActivity when data flows through the pool path
+// (WriteTo or ReadFrom). This keeps clean() from retiring active
+// connections — without it, BufferedPacketReader and PooledPacketWriter
+// bypass udpConn.Write/Read, so lastActivityTime is never updated and
+// clean() retires the conn after sessionIdleTimeout, killing the pool
+// socket mid-session.
+func (c *udpConn) UpdateActivity() {
+        c.updateActivity()
+}
+
+// v26.11.196: GetOutboundConn returns the persistent outbound conn (to
+// Google). Called by freedom.Process to check if a previous Process call
+// left a conn that can be reused (keeping the source port stable).
+func (c *udpConn) GetOutboundConn() net.Conn {
+        c.outboundMu.Lock()
+        defer c.outboundMu.Unlock()
+        return c.outboundConn
+}
+
+// v26.11.196: SetOutboundConn stores the outbound conn for reuse by future
+// Process calls. Called by freedom.Process after a successful dial.
+// If a previous conn exists that isn't the same one, it is closed first
+// to avoid leaking sockets when the destination changes.
+func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
+        c.outboundMu.Lock()
+        defer c.outboundMu.Unlock()
+        if c.outboundConn != nil && c.outboundConn != conn {
+                c.outboundConn.Close()
+        }
+        c.outboundConn = conn
+        c.outboundDest = dest
+}
+
+// v26.11.202: GetPooledConn returns the persistent pooledConn.
+// Called by freedom.Process to check if a previous Process call left
+// a pooledConn that can be reused (goroutine restart for short headers).
+func (c *udpConn) GetPooledConn() interface{} {
+        return c.pooledConnPtr
+}
+
+// v26.11.202: SetPooledConn stores the pooledConn for reuse by future
+// Process calls. Called by freedom.Process after creating a pooledConn.
+func (c *udpConn) SetPooledConn(pc interface{}) {
+        c.pooledConnPtr = pc
 }
 
 // v26.11.117: RegisterServerSCID is called by freedom's reader wrapper
@@ -291,6 +358,32 @@ func (c *udpConn) Close() error {
         }
         common.Must(c.done.Close())
         common.Must(common.Close(c.writer))
+        // v26.11.196: Close the persistent outbound conn too. Without this,
+        // Process restarts accumulate outbound sockets (one per dial), which
+        // eventually exhausts file descriptors and stalls new connections.
+        c.outboundMu.Lock()
+        if c.outboundConn != nil {
+                c.outboundConn.Close()
+                c.outboundConn = nil
+        }
+        c.outboundMu.Unlock()
+        // v26.11.231: Close the persistent pooledConn too. Without this,
+        // pool sockets survive udpConn retirement and accumulate forever
+        // (the pool's refCount never reaches 0, so the reaper never evicts
+        // them). Closing the pooledConn here decrements refCount so the
+        // reaper can do its job.
+        //
+        // The interface{} dance avoids an import cycle: app/proxyman/inbound
+        // cannot import proxy/freedom (which would form a cycle through
+        // proxy/proxyman/etc.), so the pooledConn pointer is stored as
+        // interface{} and only Close() is called via a tiny interface.
+        if c.pooledConnPtr != nil {
+                type closer interface{ Close() error }
+                if pc, ok := c.pooledConnPtr.(closer); ok {
+                        pc.Close()
+                }
+                c.pooledConnPtr = nil
+        }
         return nil
 }
 
@@ -618,9 +711,21 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
         // payload will be discarded in pipe is full.
         conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 
-        if !existing {
-                errors.LogWarning(context.Background(), "DIAG: NEW conn src=", source, " dest=", id.dest)
-                common.Must(w.checker.Start())
+        // v26.11.196: Start (or restart) the Process goroutine. The condition
+        // covers two cases:
+        //   1. !existing — first packet for this conn, start the goroutine.
+        //   2. existing && !processRunning — Process returned (e.g. from
+        //      responseDone's goroutine-leak fix on a timer fire), but the
+        //      conn is still alive. Restart it so the persistent
+        //      outboundConn / pooledConnPtr are reused: this keeps the
+        //      outbound source port stable (no Google path validation) and
+        //      keeps the pool socket's DCID registrations alive.
+        if !existing || (existing && !conn.processRunning.Load()) {
+                if !existing {
+                        errors.LogWarning(context.Background(), "DIAG: NEW conn src=", source, " dest=", id.dest)
+                        common.Must(w.checker.Start())
+                }
+                conn.processRunning.Store(true)
 
                 go func() {
                         startTime := time.Now()
@@ -663,12 +768,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
                                 errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
                         }
                         errors.LogWarning(context.Background(), "DIAG: Process RETURNED src=", source, " after=", time.Since(startTime).Round(time.Millisecond))
-                        conn.Close()
-                        if !conn.inactive {
-                                conn.setInactive()
-                                w.removeConn(id)
-                                errors.LogWarning(context.Background(), "DIAG: removeConn src=", source, " dcid=", len(w.dcidIndex), " src=", len(w.srcIndex))
-                        }
+                        // v26.11.196: DON'T close conn or removeConn here.
+                        // The persistent outboundConn / pooledConnPtr survive
+                        // Process restarts. clean() retires the conn after
+                        // the idle timeout (SessionIdleSeconds) — and the
+                        // v26.11.212 activity tracking keeps it alive while
+                        // packets are flowing through the pool path.
+                        conn.processRunning.Store(false)
                 }()
         }
 }

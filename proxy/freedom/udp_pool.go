@@ -114,6 +114,13 @@ type pooledConn struct {
         // so Close() can index demux directly without converting from
         // hex string. Replaces the old scids map[string]bool.
         scidsDCID map[dcidKey]bool
+        // v26.11.212: onActivity is called when data flows through this conn
+        // (both WriteTo and ReadFrom). Set by freedom.Process to update the
+        // inbound udpConn's lastActivityTime, preventing clean() from retiring
+        // active connections. Without this, clean() sees no activity updates
+        // (because BufferedPacketReader and PooledPacketWriter bypass
+        // udpConn.Write/Read) and retires connections after sessionIdleTimeout.
+        onActivity func()
 }
 
 func NewUDPSocketPool(staleness, idle, unused time.Duration, sockopt *internet.SocketConfig) *UDPSocketPool {
@@ -632,6 +639,11 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.MarkDead()
                 }
         }
+        // v26.11.212: update activity timer so clean() doesn't retire active
+        // connections while the pool path is flowing traffic.
+        if c.onActivity != nil {
+                c.onActivity()
+        }
         return n, err
 }
 
@@ -645,6 +657,10 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
                 // v26.10.42-link (audit P3): return the pooled buffer
                 // after copying the data out.
                 putPacket(rr.data)
+                // v26.11.212: update activity timer.
+                if c.onActivity != nil {
+                        c.onActivity()
+                }
                 return n, rr.addr, nil
         case <-c.done:
                 return 0, nil, io.EOF
@@ -886,4 +902,112 @@ func isQUICLongHeader(b []byte) bool {
                 return false
         }
         return b[0]&0x80 != 0 && b[0]&0x40 != 0
+}
+
+// ============================================================
+// v26.11.201: BufferedPacketReader — decouples pool inbox from Process
+// ============================================================
+//
+// When Process returns (video switch, CID rotation, response-side timer
+// fires), responseDone stops reading from PooledPacketReader. Without
+// BufferedPacketReader, nobody drains pooledConn.inbox → inbox fills up
+// (256 cap) → readLoop drops replies (non-blocking send) → the QUIC peer
+// never gets ACKs → stall at ~10 seconds.
+//
+// BufferedPacketReader wraps PooledPacketReader with a readLoop goroutine
+// that continuously drains the underlying reader into an internal buffer.
+// When Process returns and responseDone stops, the readLoop keeps running —
+// Google's replies keep being consumed and buffered. When a new Process
+// starts, the new responseDone reads from the buffer, getting all the
+// accumulated replies — no stall.
+//
+// The buffer is a buf.MultiBuffer channel with large capacity (256) to
+// absorb bursts of replies during the Process gap.
+type BufferedPacketReader struct {
+        base   buf.Reader      // underlying PooledPacketReader
+        buffer chan buf.MultiBuffer
+        done   chan struct{}
+        closed atomic.Bool
+}
+
+func NewBufferedPacketReader(base buf.Reader) *BufferedPacketReader {
+        r := &BufferedPacketReader{
+                base:   base,
+                buffer: make(chan buf.MultiBuffer, 256),
+                done:   make(chan struct{}),
+        }
+        go r.readLoop()
+        return r
+}
+
+func (r *BufferedPacketReader) readLoop() {
+        for {
+                select {
+                case <-r.done:
+                        return
+                default:
+                }
+                mb, err := r.base.ReadMultiBuffer()
+                if err != nil {
+                        // v26.11.211: Don't push nil mb to buffer on error.
+                        // Just exit — the error will be returned by ReadMultiBuffer
+                        // on the next call (buffer is empty, r.done is closed).
+                        if mb != nil {
+                                buf.ReleaseMulti(mb)
+                        }
+                        return
+                }
+                if mb == nil || len(mb) == 0 {
+                        continue
+                }
+                select {
+                case r.buffer <- mb:
+                case <-r.done:
+                        buf.ReleaseMulti(mb)
+                        return
+                default:
+                        // Buffer full — drop oldest to make room
+                        select {
+                        case old := <-r.buffer:
+                                buf.ReleaseMulti(old)
+                        default:
+                        }
+                        select {
+                        case r.buffer <- mb:
+                        case <-r.done:
+                                buf.ReleaseMulti(mb)
+                                return
+                        }
+                }
+        }
+}
+
+func (r *BufferedPacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+        select {
+        case mb, ok := <-r.buffer:
+                if !ok || len(mb) == 0 {
+                        return nil, io.EOF
+                }
+                return mb, nil
+        case <-r.done:
+                return nil, io.EOF
+        }
+}
+
+func (r *BufferedPacketReader) Close() error {
+        if !r.closed.CompareAndSwap(false, true) {
+                return nil
+        }
+        close(r.done)
+        // Drain and release any buffered packets
+        for {
+                select {
+                case mb := <-r.buffer:
+                        if mb != nil {
+                                buf.ReleaseMulti(mb)
+                        }
+                default:
+                        return nil
+                }
+        }
 }
