@@ -275,9 +275,12 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 }
 
 // v26.12.27: EnsureSessionReader starts a permanent reader goroutine.
-// Idempotent via sync.Once. Reads from sessionSocket into sessionReplyCh.
-// Runs for the lifetime of udpConn — never installed/removed per Process.
-// Ported from v26.11.272.
+// Idempotent via sync.Once. Reads from outboundConn (the persisted UDP
+// socket) into sessionReplyCh. Runs for the lifetime of udpConn — never
+// installed/removed per Process.
+// v26.12.29-link: FIXED — reader was reading from sessionSocket (never set).
+// Now reads from outboundConn (set by SetOutboundConn in freedom.go).
+// Uses Read() not ReadFrom() because outboundConn is a connected UDP socket.
 func (c *udpConn) EnsureSessionReader() {
 	c.sessionReaderOnce.Do(func() {
 		c.sessionReplyCh = make(chan []byte, 1024)
@@ -290,13 +293,14 @@ func (c *udpConn) EnsureSessionReader() {
 					return
 				default:
 				}
-				c.sessionSocketMu.Lock()
-				pc := c.sessionSocket
-				c.sessionSocketMu.Unlock()
-				if pc == nil {
+				// Read from outboundConn (set by SetOutboundConn).
+				c.outboundMu.Lock()
+				oc := c.outboundConn
+				c.outboundMu.Unlock()
+				if oc == nil {
 					return
 				}
-				n, _, err := pc.ReadFrom(buf)
+				n, err := oc.Read(buf)
 				if err != nil {
 					select {
 					case <-c.sessionReaderDn:
