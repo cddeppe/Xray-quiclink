@@ -62,6 +62,15 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // Fix E: lastActiveInboxSource is the source IP of the last WriteTo.
+        // Compared against the reply's source IP to detect when lastActiveInbox
+        // is wrong (multiple DCID=∅ connections to different IPs). Stored as
+        // atomic.Pointer for lock-free reads — no Lock, no allocation.
+        lastActiveInboxSource atomic.Pointer[stdnet.UDPAddr]
+        // Fix E: lastInboxBySourceIP routes DCID=∅ replies by source IP when
+        // lastActiveInbox is wrong. sync.Map — lock-free Load/Store. Only
+        // accessed when the source IP mismatch is detected (rare for YouTube).
+        lastInboxBySourceIP sync.Map // string -> chan readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -431,17 +440,47 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
-                        // instead of demux[∅]. This avoids collisions when multiple
-                        // connections share the pool socket (all Chrome connections
-                        // have 0-length SCID → all replies have DCID=∅).
+                        // Fix E: For DCID=∅ replies, use lastActiveInbox but verify
+                        // the source IP matches. If it doesn't match (multiple DCID=∅
+                        // connections to different IPs — h3 + YouTube), fall back to
+                        // sync.Map lookup by source IP.
+                        //
+                        // Common case (YouTube only): source IP matches → zero overhead
+                        // beyond one atomic pointer read + bytes.Equal. No string alloc,
+                        // no sync.Map lookup, no lock.
                         if len(dcid) == 0 {
+                                // Fast path: check lastActiveInbox + verify source IP
                                 s.mu.RLock()
                                 li := s.lastActiveInbox
                                 s.mu.RUnlock()
                                 if li != nil {
-                                        ch = li
-                                        ok = true
+                                        // Verify the reply's source IP matches what lastActiveInbox
+                                        // was set for. If it matches, lastActiveInbox is correct.
+                                        lastSrc := s.lastActiveInboxSource.Load()
+                                        if lastSrc != nil && addr != nil {
+                                                if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk {
+                                                        if lastSrc.IP.Equal(srcUDP.IP) {
+                                                                // Source IP matches — lastActiveInbox is correct
+                                                                ch = li
+                                                                ok = true
+                                                        }
+                                                }
+                                        } else {
+                                                // No source tracking yet — trust lastActiveInbox (v249 behavior)
+                                                ch = li
+                                                ok = true
+                                        }
+                                }
+                                // Slow path: source IP mismatch — do sync.Map lookup
+                                if !ok && addr != nil {
+                                        if srcUDP, srcOk := addr.(*stdnet.UDPAddr); srcOk && srcUDP.IP != nil {
+                                                if si, siOk := s.lastInboxBySourceIP.Load(srcUDP.IP.String()); siOk {
+                                                        if sic, sicOk := si.(chan readResult); sicOk && sic != nil {
+                                                                ch = sic
+                                                                ok = true
+                                                        }
+                                                }
+                                        }
                                 }
                         }
                 }
@@ -652,6 +691,13 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.socket.mu.Lock()
                         c.socket.lastActiveInbox = c.inbox
                         c.socket.mu.Unlock()
+                        // Fix E: Track the dest IP for this WriteTo so the readLoop
+                        // can verify lastActiveInbox is correct. Lock-free atomic store.
+                        if destUDP, destOk := addr.(*stdnet.UDPAddr); destOk && destUDP.IP != nil {
+                                destCopy := &stdnet.UDPAddr{IP: destUDP.IP}
+                                c.socket.lastActiveInboxSource.Store(destCopy)
+                                c.socket.lastInboxBySourceIP.Store(destUDP.IP.String(), c.inbox)
+                        }
                 }
                 // FIX: also register the outgoing DCID. Per RFC 9000 §7.3,
                 // the server's reply SCID = client's Initial DCID. For
