@@ -503,6 +503,17 @@ func (s *pooledSocket) readLoop() {
                                 if scid, _, perr := quic.ParseSCID(packet[:n]); perr == nil && len(scid) > 0 {
                                         scidCopy := append([]byte(nil), scid...)
                                         quic.NotifyServerSCID(scidCopy, src)
+                                        // Fix A: Register server SCID in demux so future 1-RTT
+                                        // packets from Chrome (DCID = server SCID) can be routed.
+                                        // No new lock — reuses the existing s.mu that NotifyServerSCID
+                                        // already needs. Only fires for Initial replies (long headers).
+                                        scidKey := makeDCIDKey(scidCopy)
+                                        s.mu.Lock()
+                                        if _, exists := s.demux[scidKey]; !exists {
+                                                s.demux[scidKey] = ch
+                                                s.demuxSource[scidKey] = src
+                                        }
+                                        s.mu.Unlock()
                                 }
                         }
                 }
