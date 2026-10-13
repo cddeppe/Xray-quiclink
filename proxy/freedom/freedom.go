@@ -621,59 +621,54 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         udpRemote, _ = net.ResolveUDPAddr("udp", remoteAddr.String())
                                 }
                                 if udpRemote != nil {
-                                        // Skip pool for loopback (127.0.0.1, ::1) — DNS/localhost
-                                        // traffic doesn't need source port stability, and routing
-                                        // it through the pool overwrites lastActiveInbox, breaking
-                                        // QUIC handshake routing for Google traffic.
+                                        // v26.12.14: Skip pool for loopback (127.0.0.1, ::1,
+                                        // 0.0.0.0, [::]) — DNS/localhost traffic doesn't need
+                                        // source port stability, and routing it through the pool
+                                        // overwrites lastActiveInbox, corrupting pool state and
+                                        // causing crashes. Wrap the ENTIRE pool setup (Acquire,
+                                        // error check, source bind, defer Close, outGateway=nil,
+                                        // CID callback) so loopback falls through to the
+                                        // per-session path with pooledConn left nil.
                                         isLoopback := udpRemote.IP.IsLoopback() || udpRemote.IP.IsUnspecified()
                                         if !isLoopback {
-                                            pooledConn, err = h.socketPool.Acquire(udpRemote)
-                                        }
-                                        errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
-                                        if err != nil {
-                                                buf.ReleaseMulti(peekedPackets)
-                                                peekedPackets = nil
-                                                return errors.New("failed to acquire pooled UDP conn").Base(err)
-                                        }
-                                        // Skip pool setup if loopback — pooledConn is nil
-                                        if pooledConn == nil {
-                                                // Not a pool connection — use per-session path
-                                                // Write peeked packets and continue to normal path
-                                                if len(peekedPackets) > 0 {
-                                                        // Fall through to non-pool path below
+                                                pooledConn, err = h.socketPool.Acquire(udpRemote)
+                                                errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pooledConn != nil, " err=", err)
+                                                if err != nil {
+                                                        buf.ReleaseMulti(peekedPackets)
+                                                        peekedPackets = nil
+                                                        return errors.New("failed to acquire pooled UDP conn").Base(err)
                                                 }
-                                        } else {
-                                        // v26.11.52-link (Solution B): bind the pooled socket's
-                                        // source to the inbound client's source IP:port so that
-                                        // pool reply packets (read via wildcard listen) are
-                                        // demuxed back to the originating client. Without this,
-                                        // all QUIC sessions sharing a pooled socket collapse to
-                                        // the socket's local (kernel-chosen) source and the
-                                        // 4-tuple-based reply routing breaks under NAT.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
-                                                pooledConn.source = &stdnet.UDPAddr{
-                                                        IP:   inbound.Source.Address.IP(),
-                                                        Port: int(inbound.Source.Port),
+                                                // v26.11.52-link (Solution B): bind the pooled socket's
+                                                // source to the inbound client's source IP:port so that
+                                                // pool reply packets (read via wildcard listen) are
+                                                // demuxed back to the originating client. Without this,
+                                                // all QUIC sessions sharing a pooled socket collapse to
+                                                // the socket's local (kernel-chosen) source and the
+                                                // 4-tuple-based reply routing breaks under NAT.
+                                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Source.IsValid() {
+                                                        pooledConn.source = &stdnet.UDPAddr{
+                                                                IP:   inbound.Source.Address.IP(),
+                                                                Port: int(inbound.Source.Port),
+                                                        }
                                                 }
-                                        }
-                                        defer pooledConn.Close()
-                                        // Pool uses wildcard socket; clear outGateway for QUIC path.
-                                        // Non-QUIC UDP keeps outGateway (sendThrough honored).
-                                        outGateway = nil
-                                        // v26.11.156: Set up pool CID registration callback.
-                                        // When the inbound worker detects CID rotation in a
-                                        // 1-RTT short header, it calls this to register the
-                                        // new DCID in the pool's demux. Without this, Google's
-                                        // replies with the rotated DCID get dropped.
-                                        if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-                                                if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
-                                                        pc := pooledConn
-                                                        uc.SetRegisterPoolCID(func(newDCID []byte) {
-                                                                pc.RegisterCID(newDCID)
-                                                        })
+                                                defer pooledConn.Close()
+                                                // Pool uses wildcard socket; clear outGateway for QUIC path.
+                                                // Non-QUIC UDP keeps outGateway (sendThrough honored).
+                                                outGateway = nil
+                                                // v26.11.156: Set up pool CID registration callback.
+                                                // When the inbound worker detects CID rotation in a
+                                                // 1-RTT short header, it calls this to register the
+                                                // new DCID in the pool's demux. Without this, Google's
+                                                // replies with the rotated DCID get dropped.
+                                                if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+                                                        if uc, ok := inbound.Conn.(interface{ SetRegisterPoolCID(func([]byte)) }); ok {
+                                                                pc := pooledConn
+                                                                uc.SetRegisterPoolCID(func(newDCID []byte) {
+                                                                        pc.RegisterCID(newDCID)
+                                                                })
+                                                        }
                                                 }
                                         }
-                                        } // end if pooledConn != nil
                                 }
                         }
                         // If not QUIC, pooledConn stays nil — existing per-session path is used.
