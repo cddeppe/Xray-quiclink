@@ -146,8 +146,8 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
 }
 
 // ResolveFresh is Resolve without stale-while-revalidate: an expired entry is
-// not handed back, the caller waits for the lookup. Worth using wherever
-doing the lookup is cheaper than failing once, such as the start of a QUIC
+// not handed back and the caller waits for the lookup. Worth using wherever
+// waiting is cheaper than failing once, such as at the start of a QUIC
 // handshake, where a dead address costs a whole handshake.
 func (s *StickyResolver) ResolveFresh(ctx context.Context, hostname string) (net.Address, error) {
 	s.mu.RLock()
