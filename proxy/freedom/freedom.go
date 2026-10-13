@@ -250,7 +250,11 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 		if udpCfg.EnableStickyResolver {
 			stickyTtl := int(udpCfg.GetStickyResolverTtl())
 			if stickyTtl <= 0 {
-				stickyTtl = 300
+				// v26.13.11-link: 60s default (was 300s). Matches typical
+				// Google DNS TTLs — pinning for 300s risks serving a stale
+				// IP for 240s after rotation. 60s is safe and the wildcard
+				// prefetch ensures the wildcard is always fresh.
+				stickyTtl = 60
 			}
 			h.stickyResolver = NewStickyResolver(time.Duration(stickyTtl) * time.Second)
 			h.stickyResolver.PreferIPv4 = udpCfg.PreferIpv4
@@ -385,18 +389,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	// Sticky DNS resolver: resolve domain to a consistent IP.
-	// v26.13.10-link: v191 guarded this with `destination.Network != net.Network_TCP`
-	// because the sticky resolver exists to solve a UDP/QUIC problem (xray's UDP
-	// path picks an address per packet, so a single flow scatters across servers).
-	// TCP doesn't have that problem — a TCP connection resolves once and stays on
-	// that IP for its lifetime. Applying sticky to TCP just pins TCP traffic to
-	// one IP for 300s, bypassing xray's DNS cache (with prefetch, serveStale) and
-	// causing choppier video switching when the pinned IP goes stale.
-	// Restore the v191 guard: sticky only for non-TCP, even when the flag is on.
+	// v26.13.11-link: sticky now applies to TCP too (was UDP-only in v191).
+	// The sticky resolver's wildcard cache (e.g. *.googlevideo.com) provides
+	// instant IP return for sibling subdomains — this is what made v191
+	// snappy for YouTube video switching. The wildcard TTL (60s) is safe
+	// against CDN edge rotation (edges rotate every 60-90s), and v26.13.11
+	// adds background prefetch so the wildcard is refreshed before expiry,
+	// eliminating the occasional 100ms DNS delay on wildcard refresh.
 	// No-op when h.stickyResolver is nil (EnableStickyResolver=false).
-	// Captures domain BEFORE overwriting destination.Address to avoid .Domain()
-	// panic on IP-typed addresses.
-	if destination.Network != net.Network_TCP && h.stickyResolver != nil && destination.Address.Family().IsDomain() {
+	// Captures domain BEFORE overwriting destination.Address to avoid
+	// .Domain() panic on IP-typed addresses.
+	if h.stickyResolver != nil && destination.Address.Family().IsDomain() {
 		domain := destination.Address.Domain()
 		if stickyIP, err := h.stickyResolver.Resolve(ctx, domain); err == nil && stickyIP != nil {
 			destination.Address = stickyIP

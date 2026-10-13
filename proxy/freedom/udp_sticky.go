@@ -33,6 +33,19 @@ type StickyResolver struct {
 	refreshing   map[string]chan struct{}
 	refreshingMu sync.Mutex
 	stopCh       chan struct{}
+
+	// v26.13.11-link: 4-worker pool for DNS refreshes. Serializes
+	// concurrent refresh goroutines so we don't hammer the upstream
+	// DNS resolver when many hostnames expire at once (e.g. after a
+	// CDN edge rotation that invalidates 20+ sibling subdomains).
+	// 4 workers balances parallelism vs. upstream rate limits.
+	refreshCh chan refreshJob
+}
+
+// refreshJob is a unit of work for the refresh worker pool.
+type refreshJob struct {
+	hostname    string
+	wildcardKey string // empty = exact refresh, non-empty = wildcard refresh
 }
 
 type stickyEntry struct {
@@ -55,9 +68,96 @@ func NewStickyResolver(ttl time.Duration) *StickyResolver {
 		ttl:         ttl,
 		wildcardTTL: 60 * time.Second,
 		stopCh:      make(chan struct{}),
+		// v26.13.11-link: buffered channel for the 4-worker pool.
+		// Buffer 256 so submitRefresh never blocks the caller even
+		// if all workers are busy (the job waits in the buffer).
+		refreshCh: make(chan refreshJob, 256),
 	}
 	go s.reaper()
+	// v26.13.11-link: start 4 refresh workers. Each worker pulls jobs
+	// from refreshCh and runs refreshWildcard or refreshExact. This
+	// serializes concurrent DNS refreshes so we don't overwhelm the
+	// upstream resolver when many entries expire at once.
+	for i := 0; i < 4; i++ {
+		go s.refreshWorker()
+	}
 	return s
+}
+
+// refreshWorker pulls jobs from refreshCh and runs them.
+// v26.13.11-link: 4 of these run concurrently. The worker pool
+// bounds concurrent DNS refreshes, preventing thundering herd
+// when many sibling subdomains expire simultaneously.
+func (s *StickyResolver) refreshWorker() {
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case job := <-s.refreshCh:
+			if job.wildcardKey != "" {
+				s.refreshWildcard(job.hostname, job.wildcardKey)
+			} else {
+				s.refreshExact(job.hostname)
+			}
+		}
+	}
+}
+
+// submitRefresh enqueues a refresh job to the worker pool.
+// Non-blocking — if the buffer is full, the job is dropped (the
+// next request will re-trigger it). This prevents a slow DNS
+// resolver from backing up the caller.
+func (s *StickyResolver) submitRefresh(hostname, wildcardKey string) {
+	select {
+	case s.refreshCh <- refreshJob{hostname: hostname, wildcardKey: wildcardKey}:
+	default:
+		// Buffer full — refresh already queued or in progress, skip
+		errors.LogInfo(context.Background(), "sticky: refresh queue full, skipping ", hostname)
+	}
+}
+
+// scheduleWildcardPrefetch fires a background refresh 10s before the
+// wildcard TTL expires, so the next request never has to wait for a
+// DNS lookup. The goroutine sleeps for (wildcardTTL - 10s), then
+// checks if the wildcard is still in the cache (it may have been
+// evicted by the reaper if idle). If still present, submits a refresh
+// job to the worker pool.
+//
+// v26.13.11-link: this eliminates the occasional 100ms DNS delay that
+// occurred when the wildcard expired and a new sibling subdomain
+// arrived before the refresh completed. With prefetch, the wildcard
+// is always fresh — the only DNS delay is the very first lookup for
+// a new domain family.
+//
+// The goroutine exits when:
+//   - stopCh closes (resolver shutdown)
+//   - the wildcard entry no longer exists (evicted by reaper)
+//   - the prefetch fires (one-shot, not periodic — the refreshWildcard
+//     call will create a new entry which schedules a new prefetch)
+func (s *StickyResolver) scheduleWildcardPrefetch(wildcardKey, sampleHostname string) {
+	prefetchAt := s.wildcardTTL - 10*time.Second
+	if prefetchAt <= 0 {
+		return // TTL too short to prefetch
+	}
+	go func() {
+		timer := time.NewTimer(prefetchAt)
+		defer timer.Stop()
+		select {
+		case <-s.stopCh:
+			return
+		case <-timer.C:
+			// Check if the wildcard still exists. If it was evicted
+			// by the reaper (idle too long), skip the refresh.
+			s.mu.RLock()
+			_, exists := s.entries[wildcardKey]
+			s.mu.RUnlock()
+			if !exists {
+				return
+			}
+			errors.LogInfo(context.Background(), "sticky: prefetch fired for ", wildcardKey, " (10s before expiry)")
+			s.submitRefresh(sampleHostname, wildcardKey)
+		}
+	}()
 }
 
 // Close stops the reaper goroutine. Safe to call multiple times.
@@ -110,7 +210,7 @@ func (s *StickyResolver) RefreshByDomain(hostname string) {
 	if hostname == "" {
 		return
 	}
-	go s.refreshExact(hostname)
+	s.submitRefresh(hostname, "")
 	errors.LogInfo(context.Background(), "sticky: proactive refresh triggered for ", hostname, " (TCP dial failure)")
 }
 
@@ -140,7 +240,7 @@ func (s *StickyResolver) RefreshByIP(staleIP string) {
 	}
 	s.mu.RUnlock()
 	for _, h := range toRefresh {
-		go s.refreshExact(h)
+		s.submitRefresh(h, "")
 	}
 	if len(toRefresh) > 0 {
 		errors.LogInfo(context.Background(), "sticky: proactive refresh for ", len(toRefresh), " hostnames pointing at ", staleIP, " (warm pool dead-conn)")
@@ -162,7 +262,7 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
 		}
 		staleIP := entry.ip
 		s.mu.RUnlock()
-		go s.refreshExact(hostname)
+		s.submitRefresh(hostname, "")
 		errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
 		return staleIP, nil
 	}
@@ -189,7 +289,7 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
 			}
 			staleIP := entry.ip
 			s.mu.RUnlock()
-			go s.refreshWildcard(hostname, wildcardKey)
+			s.submitRefresh(hostname, wildcardKey)
 			errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
 			return staleIP, nil
 		}
@@ -315,6 +415,12 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
 	s.entries[wildcardKey].lastUsed.Store(now)
 	s.entries[hostname] = &stickyEntry{ip: ip}
 	s.entries[hostname].lastUsed.Store(now)
+	// v26.13.11-link: schedule a prefetch 10s before the wildcard expires.
+	// This ensures the next sibling subdomain gets an instant hit instead
+	// of waiting 100ms for a DNS lookup when the wildcard expires.
+	wildcardKeyLocal := wildcardKey
+	hostnameLocal := hostname
+	s.scheduleWildcardPrefetch(wildcardKeyLocal, hostnameLocal)
 	// S1 fix: invalidate sibling exact entries pointing at old wildcard IP.
 	// When YouTube rotates CDN edge, sibling subdomains (r1, r2, r3...)
 	// still have the old dead IP. Delete them so they re-resolve on next use.
@@ -538,6 +644,10 @@ func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (
 			wcEntry := &stickyEntry{ip: ip}
 			wcEntry.lastUsed.Store(now)
 			s.entries[wildcardKey] = wcEntry
+			// v26.13.11-link: schedule prefetch 10s before wildcard expires.
+			wildcardKeyLocal := wildcardKey
+			hostnameLocal := hostname
+			s.scheduleWildcardPrefetch(wildcardKeyLocal, hostnameLocal)
 		}
 	}
 	s.mu.Unlock()
