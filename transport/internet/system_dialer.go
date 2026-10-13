@@ -33,9 +33,18 @@ type DefaultSystemDialer struct {
 //   - src is nil or a wildcard (AnyIP/AnyIPv6);
 //   - dest is a loopback IP and src is a non-loopback IP (EADDRNOTAVAIL);
 //   - src and dest are IPs of different families (EADDRNOTAVAIL).
+//
 // This guard is what makes sendThrough:"origin" safe for multi-IP servers:
 // the listen IP is used whenever possible, and the kernel is allowed to
 // pick a valid source for loopback or cross-family destinations.
+//
+// v26.13.4-link (BUG-21 fix): when dest.Address is a domain (not an IP),
+// the family check is skipped — the kernel handles the family at
+// connect() time after the dialer resolves the name. Pre-checking family
+// here would either need a DNS lookup (extra latency) or guess wrong for
+// dual-stack hostnames.
+// v26.13.4-link (BUG-22 fix): aligned the UDPAddr return's Port field
+// with the TCPAddr return (was over-indented).
 func resolveSrcAddr(network net.Network, src net.Address, dest net.Destination) net.Addr {
 	if src == nil || src == net.AnyIP || src == net.AnyIPv6 {
 		return nil
@@ -56,7 +65,7 @@ func resolveSrcAddr(network net.Network, src net.Address, dest net.Destination) 
 	}
 	return &net.UDPAddr{
 		IP:   src.IP(),
-			Port: 0,
+		Port: 0,
 	}
 }
 

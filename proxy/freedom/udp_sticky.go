@@ -248,10 +248,6 @@ func (s *StickyResolver) refreshWildcard(hostname, wildcardKey string) {
         for i, ip := range ips {
                 addrs[i] = net.IPAddr{IP: ip}
         }
-        if err != nil || len(addrs) == 0 {
-                errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname, ": ", err)
-                return
-        }
 
         // v26.10.26-link: honor PreferIPv4/PreferIPv6 (was addrs[0])
         ip := net.IPAddress(selectAddr(addrs, s.PreferIPv4, s.PreferIPv6))
@@ -324,10 +320,6 @@ func (s *StickyResolver) refreshExact(hostname string) {
         addrs := make([]net.IPAddr, len(ips))
         for i, ip := range ips {
                 addrs[i] = net.IPAddr{IP: ip}
-        }
-        if err != nil || len(addrs) == 0 {
-                errors.LogInfo(ctx, "sticky: background refresh failed for ", hostname)
-                return
         }
 
         selectedAddr := selectAddr(addrs, s.PreferIPv4, s.PreferIPv6)
@@ -413,7 +405,16 @@ func (s *StickyResolver) finishRefresh(hostname string) {
 }
 
 // selectAddr applies IPv4/IPv6 preference to the address list and
-// returns the selected IP. If no preference is set, returns addrs[0].IP.
+// returns the selected IP. If the preferred family is not found,
+// falls back to addrs[0].IP so the caller still gets a usable IP.
+//
+// v26.13.4-link (BUG-1/BUG-17 fix): previously returned nil when the
+// preferred family was unavailable, causing net.IPAddress(nil) to log
+// "invalid IP format: []" and the sticky entry to be discarded — the
+// next request then re-resolved, amplifying DNS load and causing the
+// sticky resolver to never actually stick. Falling back to addrs[0]
+// keeps the resolver functional when only one family is reachable
+// (common with IPv6-only or IPv4-only resolvers).
 func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
         if preferIPv4 || preferIPv6 {
                 for _, addr := range addrs {
@@ -424,9 +425,13 @@ func selectAddr(addrs []net.IPAddr, preferIPv4, preferIPv6 bool) net.IP {
                                 return addr.IP
                         }
                 }
-                // M3 fix: return nil if preferred family not found.
-                // Callers already check ip == nil. Previously returned
-                // addrs[0] (wrong family) causing IPv4/IPv6 flips.
+                // BUG-1/BUG-17 fix: fall back to addrs[0] when the preferred
+                // family is not present. Returning nil causes the sticky
+                // resolver to silently discard the entry and triggers
+                // "invalid IP format: []" log spam from net.IPAddress(nil).
+                if len(addrs) > 0 {
+                        return addrs[0].IP
+                }
                 return nil
         }
         return addrs[0].IP

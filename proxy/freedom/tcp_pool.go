@@ -2,11 +2,14 @@ package freedom
 
 import (
         "context"
+        "io"
+        "net"
+        "strings"
         "sync"
         "time"
 
         "github.com/xtls/xray-core/common/errors"
-        "github.com/xtls/xray-core/common/net"
+        xnet "github.com/xtls/xray-core/common/net"
         "github.com/xtls/xray-core/transport/internet"
         "github.com/xtls/xray-core/transport/internet/stat"
 )
@@ -21,35 +24,41 @@ import (
 // site family instead of 20 globally. More targeted: pre-warms the
 // IPs the browser hits first (page load), not the ones it hits most
 // (analytics/tracking fire after the page loads).
+//
+// v26.13.4-link (BUG-3/BUG-4 fix): Acquire/Release now use isConnAlive
+// to verify the underlying TCP socket is still half-open before handing
+// it back to callers or storing it. Previously a half-closed socket
+// could be returned to a fresh request, causing an instant EPIPE on
+// the first write.
 type TCPSocketPool struct {
-        mu       sync.Mutex
-        warm     map[string]*warmConn
-        timeout  time.Duration
+        mu      sync.Mutex
+        warm    map[string]*warmConn
+        timeout time.Duration
 
         // v26.10.46-link: per-wildcard first-N learning
-        patterns   map[string]*wildcardPattern
-        preWarmN   int    // how many first-N to pre-warm per wildcard
-        learnVisits int   // how many visits before a pattern is stable
-        dialFunc   func(ctx context.Context, dest net.Destination) (stat.Connection, error)
-        stopCh     chan struct{}
+        patterns     map[string]*wildcardPattern
+        preWarmN     int // how many first-N to pre-warm per wildcard
+        learnVisits  int // how many visits before a pattern is stable
+        dialFunc     func(ctx context.Context, dest xnet.Destination) (stat.Connection, error)
+        stopCh       chan struct{}
 }
 
 // wildcardPattern tracks the critical-path IPs for a site family
 // (e.g., *.hulu.com). It learns which IPs are hit first on each visit,
 // stabilizes after learnVisits visits, and is then used for pre-warming.
 type wildcardPattern struct {
-        mu          sync.Mutex
-        wildcard    string
-        candidate   []string
-        stable      []string
-        visitCount  int
-        lastVisit   time.Time
-        stabilized  bool
+        mu         sync.Mutex
+        wildcard   string
+        candidate  []string
+        stable     []string
+        visitCount int
+        lastVisit  time.Time
+        stabilized bool
         // v26.10.47-link: track total domains seen (before dedup by IP)
         // so the stabilization log shows how many domains map to the
         // learned unique IPs — confirms the dedup is working.
-        totalDomains  int
-        uniqueIPs     map[string]bool // dedup tracker
+        totalDomains int
+        uniqueIPs    map[string]bool // dedup tracker
 }
 
 type warmConn struct {
@@ -76,7 +85,7 @@ func NewTCPSocketPool(timeout time.Duration, preWarmN int, preWarmFirstN int, le
 }
 
 // SetDialFunc provides the dialer function needed for pre-warming.
-func (p *TCPSocketPool) SetDialFunc(f func(ctx context.Context, dest net.Destination) (stat.Connection, error)) {
+func (p *TCPSocketPool) SetDialFunc(f func(ctx context.Context, dest xnet.Destination) (stat.Connection, error)) {
         if p == nil {
                 return
         }
@@ -85,9 +94,71 @@ func (p *TCPSocketPool) SetDialFunc(f func(ctx context.Context, dest net.Destina
         p.mu.Unlock()
 }
 
+// isConnAlive performs a non-destructive liveness check on a TCP conn.
+// It sets a zero read deadline (i.e., "expire immediately") and tries
+// to read one byte. Results:
+//   - n > 0: there is pending data — caller must not put it back in
+//     the pool (the next reader would see stale bytes). Returns false.
+//   - err == io.EOF: peer closed (FIN received). Returns false.
+//   - err == nil with n == 0: impossible for a blocking read, but if
+//     it happens we treat the conn as healthy. Returns true.
+//   - err is a net.Error.Timeout(): the deadline fired while the
+//     socket was idle — that's exactly what we want. Returns true.
+//   - any other error: socket is dead. Returns false.
+//
+// v26.13.4-link (BUG-3 fix): a warm connection sitting in the pool can
+// be killed by the remote (FIN), the local kernel (RST after a NAT
+// timeout), or by the kernel half-closing it during OOM. Without a
+// liveness check, Acquire would hand this dead socket to the next
+// caller, who would write their request and get an instant EPIPE.
+func isConnAlive(conn net.Conn) bool {
+        if conn == nil {
+                return false
+        }
+        // Unwrap stat.CounterConnection if present — the underlying socket
+        // is what we actually want to poke.
+        if sc, ok := conn.(*stat.CounterConnection); ok && sc != nil {
+                conn = sc.Connection
+        }
+        tcpConn, ok := conn.(*net.TCPConn)
+        if !ok {
+                // Not a TCP conn (e.g., TLS, websocket). Can't cheaply probe,
+                // assume alive — the next I/O will fail loudly if it isn't.
+                return true
+        }
+        // Set a deadline in the past so the next Read returns immediately
+        // with a timeout error if there is no pending data.
+        if err := tcpConn.SetReadDeadline(time.Now()); err != nil {
+                // Setting a deadline on a closed fd fails — conn is dead.
+                return false
+        }
+        // Always reset the deadline so we don't poison the next reader.
+        defer tcpConn.SetReadDeadline(time.Time{})
+
+        oneByte := make([]byte, 1)
+        n, err := tcpConn.Read(oneByte)
+        if n > 0 {
+                // Got pending data — don't put back in the pool, the next
+                // reader would see stale bytes.
+                return false
+        }
+        if err == nil {
+                // Zero bytes, no error — should be rare for a blocking read
+                // with an expired deadline; treat as alive.
+                return true
+        }
+        if err == io.EOF {
+                return false // peer closed
+        }
+        if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                return true // deadline fired while idle — healthy
+        }
+        return false // some other error — socket is dead
+}
+
 // Acquire returns a warm TCP connection for the given destination.
 // Also tracks the access for first-N learning.
-func (p *TCPSocketPool) Acquire(dest net.Destination) stat.Connection {
+func (p *TCPSocketPool) Acquire(dest xnet.Destination) stat.Connection {
         if p == nil {
                 return nil
         }
@@ -111,12 +182,30 @@ func (p *TCPSocketPool) Acquire(dest net.Destination) stat.Connection {
                 wc.conn.Close()
                 return nil
         }
+        // v26.13.4-link (BUG-3 fix): probe the socket before handing it
+        // out. A pooled conn may have been killed by the remote (FIN),
+        // the kernel NAT, or an OOM close. Without this check we'd
+        // return a dead fd to the next caller, who'd see an instant
+        // EPIPE on the first write.
+        if !isConnAlive(wc.conn) {
+                wc.conn.Close()
+                return nil
+        }
         return wc.conn
 }
 
 // Release puts a TCP connection into the warm pool for reuse.
-func (p *TCPSocketPool) Release(conn stat.Connection, dest net.Destination) {
+//
+// v26.13.4-link (BUG-4 fix): probe the socket before storing it.
+// freedom.go's caller only invokes Release when task.Run succeeded,
+// but the kernel may have RST'd the conn between the success check
+// and now (e.g., a NAT entry aged out mid-flight). Defensive.
+func (p *TCPSocketPool) Release(conn stat.Connection, dest xnet.Destination) {
         if p == nil {
+                conn.Close()
+                return
+        }
+        if !isConnAlive(conn) {
                 conn.Close()
                 return
         }
@@ -141,7 +230,7 @@ func (p *TCPSocketPool) Release(conn stat.Connection, dest net.Destination) {
 // the original domain from the connection context — but for simplicity,
 // we track by IP. The first-N learning groups IPs by their DNS wildcard
 // parent, which is tracked at resolve time.
-func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
+func (p *TCPSocketPool) trackFirstN(dest xnet.Destination) {
         if p == nil || p.preWarmN == 0 {
                 return
         }
@@ -180,9 +269,9 @@ func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
         // frequency problem (analytics IPs fire later, not in the first N).
         if p.patterns["__global__"] == nil {
                 p.patterns["__global__"] = &wildcardPattern{
-                        wildcard:   "__global__",
-                        lastVisit:  time.Now(),
-                        uniqueIPs:  make(map[string]bool),
+                        wildcard:  "__global__",
+                        lastVisit: time.Now(),
+                        uniqueIPs: make(map[string]bool),
                 }
         }
         wp := p.patterns["__global__"]
@@ -203,7 +292,9 @@ func (p *TCPSocketPool) trackFirstN(dest net.Destination) {
                                                 wp.stable = append([]string{}, wp.candidate...)
                                                 wp.stabilized = true
                                                 dupCount := wp.totalDomains - len(wp.stable)
-                                                if dupCount < 0 { dupCount = 0 }
+                                                if dupCount < 0 {
+                                                        dupCount = 0
+                                                }
                                                 errors.LogInfo(context.Background(), "tcp warm pool: first-N pattern stabilized after ", wp.visitCount, " visits, ", len(wp.stable), " critical-path IPs (from ", wp.totalDomains, " domains — ", dupCount, " shared IPs)")
                                         } else if stringSlicesMatch(wp.stable, wp.candidate) {
                                                 // Already stable, still matches — good
@@ -289,7 +380,7 @@ func (p *TCPSocketPool) doPreWarm() {
                 }
 
                 wg.Add(1)
-                go func(d net.Destination, k string) {
+                go func(d xnet.Destination, k string) {
                         defer wg.Done()
                         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
                         conn, err := dialFunc(ctx, d)
@@ -304,8 +395,8 @@ func (p *TCPSocketPool) doPreWarm() {
                         p.warm[k] = &warmConn{
                                 conn:      conn,
                                 dest:      k,
-                                expiresAt:  time.Now().Add(p.timeout * 12),
-                                preWarmed:  true,
+                                expiresAt: time.Now().Add(p.timeout * 12),
+                                preWarmed: true,
                         }
                         p.mu.Unlock()
                         errors.LogInfo(context.Background(), "tcp warm pool: pre-warmed connection to ", k)
@@ -359,33 +450,54 @@ func (p *TCPSocketPool) Close() {
 }
 
 // tcpDestKey converts a net.Destination to a string key.
-func tcpDestKey(dest net.Destination) string {
-        return dest.Address.String() + ":" + dest.Port.String()
+//
+// v26.13.4-link (BUG-12 fix): include the network type in the key so
+// TCP and UDP destinations to the same host:port don't collide. The
+// warm pool is TCP-only today, but encoding the network now prevents
+// a future UDP pool from silently sharing entries (and serving a UDP
+// request from a TCP socket — instant ECONNREFUSED).
+//
+// Format: "<network>:<address>:<port>", e.g. "tcp:1.2.3.4:443",
+// "tcp:[::1]:443", "tcp:example.com:443".
+func tcpDestKey(dest xnet.Destination) string {
+        return dest.Network.String() + ":" + dest.Address.String() + ":" + dest.Port.String()
 }
 
 // parseDestKey converts a string key back to a net.Destination.
-func parseDestKey(key string) *net.Destination {
-        addr, portStr := "", ""
-        for i := len(key) - 1; i >= 0; i-- {
-                if key[i] == ':' {
-                        addr = key[:i]
-                        portStr = key[i+1:]
-                        break
-                }
+// Inverse of tcpDestKey. The first ':' splits off the network token;
+// the LAST ':' in the remainder splits off the port (works for IPv6
+// in brackets, since the brackets absorb the internal colons).
+func parseDestKey(key string) *xnet.Destination {
+        firstColon := strings.Index(key, ":")
+        if firstColon <= 0 {
+                return nil
         }
+        networkStr := key[:firstColon]
+        rest := key[firstColon+1:]
+
+        lastColon := strings.LastIndex(rest, ":")
+        if lastColon <= 0 {
+                return nil
+        }
+        addr := rest[:lastColon]
+        portStr := rest[lastColon+1:]
         if addr == "" || portStr == "" {
                 return nil
         }
-        address := net.ParseAddress(addr)
+        address := xnet.ParseAddress(addr)
         if address == nil {
                 return nil
         }
-        port, err := net.PortFromString(portStr)
+        port, err := xnet.PortFromString(portStr)
         if err != nil {
                 return nil
         }
-        return &net.Destination{
-                Network: net.Network_TCP,
+        network := xnet.Network_TCP
+        if n, ok := xnet.Network_value[networkStr]; ok {
+                network = xnet.Network(n)
+        }
+        return &xnet.Destination{
+                Network: network,
                 Address: address,
                 Port:    port,
         }

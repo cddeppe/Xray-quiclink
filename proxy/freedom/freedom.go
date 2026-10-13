@@ -5,6 +5,7 @@ import (
         "crypto/rand"
         "io"
         "strings"
+        "sync"
         "sync/atomic"
         "time"
 
@@ -56,6 +57,9 @@ func init() {
                 if streamSettings, ok := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig); ok && streamSettings.SocketSettings != nil {
                         h.resolveStrategy = streamSettings.SocketSettings.DomainStrategy
                         h.usesDialerProxy = len(streamSettings.SocketSettings.DialerProxy) > 0
+                        // v26.13.4-link (BUG-11 fix): retain the stream config so the
+                        // TCP warm pool's pre-warm dialer can reuse it.
+                        h.streamSettings = streamSettings
                 }
                 if err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
                         return h.Init(config.(*Config), pm)
@@ -100,6 +104,11 @@ type Handler struct {
         usesDialerProxy bool
         tcpWarmPool     *TCPSocketPool
         stickyResolver  *StickyResolver
+        // v26.13.4-link (BUG-11 fix): store streamSettings so the warm pool's
+        // pre-warm dialer can use the same sock config (and transport) as the
+        // real freedom outbound. Without this, SetDialFunc was never called
+        // and preWarmLoop was a no-op.
+        streamSettings *internet.MemoryStreamConfig
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -215,6 +224,14 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
                 preWarmFirstN := int(config.UdpConfig.GetPreWarmFirstN())
                 preWarmLearnVisits := int(config.UdpConfig.GetPreWarmLearnVisits())
                 h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, 0, preWarmFirstN, preWarmLearnVisits)
+                // v26.13.4-link (BUG-11 fix): wire up the dialer so preWarmLoop
+                // can actually open connections. Previously SetDialFunc was
+                // never called and preWarmLoop did nothing useful — it
+                // returned early every tick because dialFunc was nil.
+                streamSettings := h.streamSettings
+                h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+                        return internet.Dial(ctx, dest, streamSettings)
+                })
                 errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s preWarmFirstN=", preWarmFirstN, " preWarmLearnVisits=", preWarmLearnVisits, ")")
         }
         // Sticky DNS resolver
@@ -329,10 +346,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         // Sticky resolver: resolve domain to a consistent IP
+        // v26.13.4-link (BUG-2 fix): capture the domain BEFORE overwriting
+        // destination.Address with the sticky IP. Calling .Domain() on an IP
+        // panics inside net.ParseAddress; the old code logged the IP
+        // post-reassignment, so the panic only manifested on the log line.
         if h.stickyResolver != nil && destination.Address.Family().IsDomain() {
-                if stickyIP, err := h.stickyResolver.Resolve(ctx, destination.Address.Domain()); err == nil && stickyIP != nil {
+                domain := destination.Address.Domain()
+                if stickyIP, err := h.stickyResolver.Resolve(ctx, domain); err == nil && stickyIP != nil {
                         destination.Address = stickyIP
-                        errors.LogInfo(ctx, "freedom: sticky: resolved ", destination.Address.Domain(), " -> ", stickyIP)
+                        errors.LogInfo(ctx, "freedom: sticky: resolved ", domain, " -> ", stickyIP)
                 }
         }
 
@@ -413,8 +435,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         if blockedDest != nil {
                 return h.blackhole(ctx, input, output, blockedRule, blockedDest)
         }
-        if destination.Address.Family().IsDomain() && (defaultRule != nil || len(h.finalRules) > 0) {
-                // pre-check may fail or dialer may select another IP
+        // v26.13.4-link (BUG-9 fix): the IsDomain() guard was wrong after
+        // sticky-resolved destinations — destination.Address is now an IP, so
+        // IsDomain() returns false and the post-dial finalRule check is
+        // silently skipped. The pre-dial check may also have selected a
+        // different IP via the dialer. Always run the post-dial finalRule
+        // check when there are finalRules, regardless of family.
+        if defaultRule != nil || len(h.finalRules) > 0 {
                 remoteDest := net.DestinationFromAddr(conn.RemoteAddr())
                 if rule := h.matchFinalRule(remoteDest.Network, remoteDest.Address, remoteDest.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
                         conn.Close()
@@ -432,9 +459,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         return errors.New("failed to set PROXY protocol v", version).Base(err)
                 }
         }
-        // TCP warm pool: release to pool instead of closing
+        // TCP warm pool: release to pool instead of closing.
+        // v26.13.4-link (BUG-4/BUG-5 fix): only Release if the connection
+        // ended cleanly (no error from task.Run). On the error path, the
+        // peer may have half-closed or the kernel may have RST'd the socket
+        // mid-stream; returning it to the pool would let the next caller
+        // inherit a dead fd. We track connErr from task.Run below.
+        var connErr error
         if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
-                defer h.tcpWarmPool.Release(conn, destination)
+                defer func() {
+                        if connErr != nil {
+                                conn.Close()
+                        } else {
+                                h.tcpWarmPool.Release(conn, destination)
+                        }
+                }()
         } else {
                 defer conn.Close()
         }
@@ -460,7 +499,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         // triggers common.Interrupt(input) which unblocks requestDone's
         // buf.Copy(input, writer). Without this, requestDone blocks forever
         // and the TCP socket sits in CLOSE-WAIT.
+        //
+        // v26.13.4-link (BUG-6 fix): use a sync.Once-guarded close so the
+        // error path (task.Run returned an error before responseDone ran)
+        // can also close(inputCloser) to unblock this goroutine without
+        // panicking on the success path where responseDone's defer already
+        // closed it.
         inputCloser := make(chan struct{})
+        var closeInputCloserOnce sync.Once
+        closeInputCloser := func() {
+                closeInputCloserOnce.Do(func() { close(inputCloser) })
+        }
         go func() {
                 <-inputCloser
                 common.Interrupt(input)
@@ -511,14 +560,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-                defer close(inputCloser)
-                defer func() {
-                        // Cancel context + interrupt input so requestDone also returns.
-                        // Without this, responseDone exits but requestDone keeps blocking
-                        // on input → Process never returns → goroutine never restarts.
-                        cancel()
-                        common.Interrupt(input)
-                }()
+                // v26.13.4-link (BUG-7 fix): the inputCloser goroutine now
+                // owns the common.Interrupt(input) call. Calling it from
+                // this defer as well was redundant and could fire Interrupt
+                // twice on the success path (once via the goroutine, once
+                // via the defer). Keep only cancel() + closeInputCloser()
+                // here; the goroutine delivers the interrupt.
+                defer closeInputCloser()
+                defer cancel()
                 if destination.Network == net.Network_TCP && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
                         var writeConn net.Conn
                         var inTimer *signal.ActivityTimer
@@ -545,6 +594,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         }
 
         if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
+                // v26.13.4-link (BUG-4/BUG-5/BUG-6 fix): record the error so
+                // the deferred Release/close above chooses conn.Close()
+                // instead of putting a half-closed fd back into the pool
+                // (BUG-4). Also force-cancel the per-conn context and
+                // close the socket so any goroutine still blocked inside
+                // the OnSuccess chain's reader.ReadMultiBuffer unblocks
+                // (BUG-5 — the race where Release fires while responseDone
+                // is still mid-read). Finally, closeInputCloser() so the
+                // inputCloser goroutine doesn't leak if responseDone
+                // never got to run (BUG-6 — requestDone failed first).
+                connErr = err
+                cancel()
+                conn.Close()
+                closeInputCloser()
                 return errors.New("connection ends").Base(err)
         }
 
@@ -697,6 +760,13 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                                 if err != nil {
                                                         // drop packet if resolve failed when forceIP
                                                         if strategy.ForceIP() {
+                                                                // v26.13.4-link (BUG-24 fix): previously silent.
+                                                                // A dropped UDP packet on a QUIC stream causes the
+                                                                // Initial to never reach the server, the handshake
+                                                                // times out, and Chrome falls back to TCP — but the
+                                                                // operator sees nothing in the logs. Surface the
+                                                                // failure with the domain and the underlying error.
+                                                                errors.LogInfo(context.Background(), "freedom: dropping UDP packet — DNS resolution for ", b.UDP.Address.Domain(), " failed (forceIP): ", err)
                                                                 b.Release()
                                                                 continue
                                                         }
@@ -708,6 +778,8 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                         if shouldUseSystemResolver {
                                                 udpAddr, err := net.ResolveUDPAddr("udp", b.UDP.NetAddr())
                                                 if err != nil {
+                                                        // v26.13.4-link (BUG-24 fix): previously silent.
+                                                        errors.LogInfo(context.Background(), "freedom: dropping UDP packet — system ResolveUDPAddr for ", b.UDP.NetAddr(), " failed: ", err)
                                                         b.Release()
                                                         continue
                                                 } else {
@@ -716,6 +788,12 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
                                         }
                                         if ip != nil {
                                                 b.UDP.Address, _ = w.ResolvedUDPAddr.LoadOrStore(b.UDP.Address.Domain(), ip)
+                                        } else {
+                                                // v26.13.4-link (BUG-24 fix): both resolvers
+                                                // returned no error but also no IP — drop and log.
+                                                errors.LogInfo(context.Background(), "freedom: dropping UDP packet — no IP resolved for ", b.UDP.Address.Domain())
+                                                b.Release()
+                                                continue
                                         }
                                 }
                         }
