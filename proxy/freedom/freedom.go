@@ -608,15 +608,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// to the warm pool instead of closing. The warm pool will close the
 	// conn when it expires (default 5s) or when a new inbound reuses it.
 	// For non-warm-pool paths, close normally.
+	// v26.12.28-link: For UDP, ALWAYS persist the conn (even when pool is
+	// enabled). The 0-length SCID check (v26.12.26) already decided to skip
+	// the pool for Chrome's QUIC. The persistent socket + permanent reader
+	// is needed for the handshake to complete and 1-RTT data to flow.
 	if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
 		defer h.tcpWarmPool.Release(conn, destination)
-	} else if destination.Network != net.Network_TCP && h.socketPool == nil {
-		// v26.11.196: For UDP non-pool path ONLY (pool is OFF):
-		// Store the outbound conn in udpConn for reuse across Process
-		// restarts. Keeps source port stable → no Google path validation
-		// → no CID rotation when WireGuard/DNS keeps sending packets.
-		// The persistent conn is closed by udpConn.Close() (called from
-		// clean() after the idle timeout, or from worker shutdown).
+	} else if destination.Network != net.Network_TCP {
+		// v26.11.196: Store the outbound conn in udpConn for reuse across
+		// Process restarts. Keeps source port stable → no Google path
+		// validation → no CID rotation when WireGuard/DNS keeps sending
+		// packets. The persistent conn is closed by udpConn.Close()
+		// (called from clean() after the idle timeout, or from worker
+		// shutdown).
+		// v26.12.27: Also start the permanent reader goroutine so 1-RTT
+		// data packets that arrive after Process returned can still be read.
 		if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
 			if udpConn, ok := inbound.Conn.(interface {
 				GetOutboundConn() net.Conn
@@ -629,8 +635,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
 				} else {
 					// v26.12.27: Persist conn + start permanent reader goroutine.
-					// The socket survives Process restarts so 1-RTT data packets
-					// that arrive after Process returned can still be read.
 					udpConn.SetOutboundConn(conn, destination)
 					udpConn.EnsureSessionReader()
 					errors.LogInfo(ctx, "freedom: persisted session socket + started reader for ", destination)
