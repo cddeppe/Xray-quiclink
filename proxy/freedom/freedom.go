@@ -444,6 +444,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
         }, plcy.Timeouts.ConnectionIdle)
 
+        // inputCloser propagates EOF from outbound→inbound.
+        // When responseDone returns (outbound closed), close(inputCloser)
+        // triggers common.Interrupt(input) which unblocks requestDone's
+        // buf.Copy(input, writer). Without this, requestDone blocks forever
+        // and the TCP socket sits in CLOSE-WAIT.
+        inputCloser := make(chan struct{})
+        go func() {
+                <-inputCloser
+                common.Interrupt(input)
+        }()
+
         requestDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
 
@@ -474,7 +485,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                 }
 
                 if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-                        return errors.New("failed to process request").Base(err)
+                        // Swallow ErrClosedPipe when inputCloser has fired
+                        // (responseDone returned, outbound closed, input pipe interrupted).
+                        select {
+                        case <-inputCloser:
+                                return nil // graceful
+                        default:
+                                return errors.New("failed to process request").Base(err)
+                        }
                 }
 
                 return nil
@@ -482,6 +500,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
         responseDone := func() error {
                 defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+                defer close(inputCloser)
+                defer func() {
+                        // Cancel context + interrupt input so requestDone also returns.
+                        // Without this, responseDone exits but requestDone keeps blocking
+                        // on input → Process never returns → goroutine never restarts.
+                        cancel()
+                        common.Interrupt(input)
+                }()
                 if destination.Network == net.Network_TCP && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
                         var writeConn net.Conn
                         var inTimer *signal.ActivityTimer
