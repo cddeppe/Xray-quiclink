@@ -1,0 +1,93 @@
+name: Publish bare binaries
+
+# Attaches bare xray-linux-amd64 and xray-linux-arm64 binaries to a release, so
+# a server can install with:
+#
+#   cd /tmp && wget -q https://github.com/cddeppe/Xray-quiclink/releases/download/<tag>/xray-linux-amd64
+#   chmod +x xray-linux-amd64 && mv xray-linux-amd64 /usr/local/bin/xray
+#   systemctl restart xray
+#   cd /tmp && rm -f xray-linux-amd64
+#
+# Runs whether the release is published from the GitHub web UI or from a pushed
+# v* tag, so no local clone is needed. If the tag exists but the release does
+# not, the release is created here.
+#
+# Publishing a release also triggers release.yml, which builds the usual
+# Xray-<platform>.zip assets, so both forms are available.
+#
+# This file is intentionally present on the default branch as well as on the
+# release branch, because workflow definitions for some events are resolved
+# from the repository's default branch rather than from the ref that triggered
+# the run. The checkout below still uses the triggering ref, so the binaries are
+# always built from the tagged commit.
+#
+# It is a separate workflow rather than another step in release.yml so that a
+# mistake here cannot break the zip build.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Get project dependencies
+        run: go mod download
+
+      - name: Build bare linux binaries
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -eu
+          COMMID=$(git describe --always --dirty)
+          mkdir -p bare
+          for PAIR in "amd64:xray-linux-amd64" "arm64:xray-linux-arm64"; do
+            GOARCH="${PAIR%%:*}"
+            NAME="${PAIR##*:}"
+            echo "Building ${NAME}..."
+            GOOS=linux GOARCH="${GOARCH}" go build \
+              -o "bare/${NAME}" \
+              -trimpath \
+              -buildvcs=false \
+              -gcflags="all=-l=4" \
+              -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
+              ./main
+          done
+          ls -l bare
+
+      - name: Attach bare binaries to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG_NAME="${GITHUB_REF_NAME}"
+          case "${TAG_NAME}" in
+            v*) ;;
+            *) echo "::error::expected a v* tag, got '${TAG_NAME}'"; exit 1 ;;
+          esac
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Release ${TAG_NAME} already exists."
+          else
+            gh release create "${TAG_NAME}" --title "${TAG_NAME}" --generate-notes
+          fi
+          gh release upload "${TAG_NAME}" \
+            bare/xray-linux-amd64 \
+            bare/xray-linux-arm64 \
+            --clobber
+          echo "Assets now attached to ${TAG_NAME}:"
+          gh release view "${TAG_NAME}" --json assets --jq '.assets[].name'
