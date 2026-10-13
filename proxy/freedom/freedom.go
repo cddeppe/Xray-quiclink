@@ -342,6 +342,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
         var conn stat.Connection
         var blockedDest *net.Destination
         var blockedRule *FinalRule
+        
         err := retry.ExponentialBackoff(5, 100).On(func() error {
                 if destination.Address.Family().IsDomain() {
                         if defaultRule != nil || len(h.finalRules) > 0 {
@@ -384,6 +385,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                         if rule := h.matchFinalRule(destination.Network, destination.Address, destination.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
                                 blockedDest = &destination
                                 blockedRule = rule
+                                return nil
+                        }
+                }
+
+                // TCP warm pool: try to acquire a warm connection first
+                if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
+                        if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
+                                conn = warmConn
+                                errors.LogInfo(ctx, "freedom: reused warm TCP connection to ", destination)
+                                
                                 return nil
                         }
                 }
