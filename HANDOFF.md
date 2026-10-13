@@ -401,3 +401,46 @@ The single `readLoop` goroutine was the scheduling bottleneck. When YouTube stre
 5. ❌ `lastActiveSource` from v253 — YouTube mixes DCID=∅ and DCID=8
 6. ❌ Per-packet diagnostic logging — fatal latency overhead
 7. ❌ Per-connection sockets — Chrome abandons after 10 seconds (protocol-level issue, not relay)
+8. ❌ Multi-socket pool (4 sockets per port key) — Google treats multiple source ports as suspicious, same failure as per-conn
+
+---
+
+## CRITICAL CONSTRAINT: Google QUIC Requires Single Source Port
+
+**This is the single most important architectural constraint.** It limits
+us to the pool architecture and rules out alternatives.
+
+### What was proved
+
+1. **Per-connection sockets (v26.11.272-v26.11.287):** Each connection gets
+   its own outbound socket (different source port). Chrome abandons every
+   connection after ~10 seconds. Packet capture showed Google IS replying,
+   but Chrome's QUIC stack rejects the traffic pattern.
+
+2. **Multi-socket pool (v26.12.2, deleted):** 4 pool sockets with round-robin
+   distribution instead of 1. Google sees 4 source ports instead of 1.
+   **Immediately broke** — same failure mode as per-conn.
+
+3. **Single-socket pool (v249/v217, v26.12.1):** ONE shared socket for ALL
+   `:443` traffic. Google sees ONE source port. **Works.**
+
+### The constraint
+
+Google's QUIC implementation expects a **single source port** per VPS IP.
+Multiple source ports — whether per-connection (50+) or multi-socket (4) —
+cause Chrome to abandon connections after ~10 seconds.
+
+This means:
+- **The pool's single shared socket is architecturally required.** It cannot
+  be replaced with per-connection sockets or multi-socket pools.
+- **The pool's wildcard bind is intentional.** Binding to a specific IP
+  breaks the port-only keying that makes the single socket work.
+- **The DCID=∅ demux problem is unsolvable in the pool.** Multiple connections
+  share one socket, and Chrome's 0-length SCID means Google's replies have
+  DCID=∅. The `lastInboxBySourceIP` heuristic is the best we can do.
+
+### Why this matters
+
+This constraint means we are locked into the pool architecture. Any future
+optimization must work within the single-socket constraint. Ideas that
+require multiple sockets (per-conn, multi-socket pool, sharding) are dead.
