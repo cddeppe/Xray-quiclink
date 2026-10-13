@@ -140,6 +140,10 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			serveExpiredTTL = *ns.ServeExpiredTTL
 		}
 
+		// v26.10.40-link: prefetch config (global, no per-server override for now)
+		prefetchInterval := config.PrefetchInterval
+		prefetchThreshold := config.PrefetchThreshold
+
 		tag := defaultTag
 		if len(ns.Tag) > 0 {
 			tag = ns.Tag
@@ -150,7 +154,7 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 			return nil, errors.New("no QueryStrategy available for ", ns.Address)
 		}
 
-		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, tag, clientIPOption, updateRules)
+		client, err := NewClient(ctx, ns, myClientIP, disableCache, serveStale, serveExpiredTTL, prefetchInterval, prefetchThreshold, tag, clientIPOption, updateRules)
 		if err != nil {
 			return nil, errors.New("failed to create client").Base(err)
 		}
@@ -550,24 +554,24 @@ func makeGroups( /*ctx context.Context,*/ clients []*Client) ([]group, []int) {
 	// b.WriteString(strconv.Itoa(len(groups)))
 
 	// for gi, g := range groups {
-	// 	b.WriteString("\n  [")
-	// 	b.WriteString(strconv.Itoa(g.start))
-	// 	b.WriteString("..")
-	// 	b.WriteString(strconv.Itoa(g.end))
-	// 	b.WriteString("] gid=")
-	// 	b.WriteString(strconv.Itoa(gi))
-	// 	b.WriteString(" pid=")
-	// 	b.WriteString(strconv.FormatUint(uint64(clients[g.start].policyID), 10))
-	// 	b.WriteString(" members: ")
+	//      b.WriteString("\n  [")
+	//      b.WriteString(strconv.Itoa(g.start))
+	//      b.WriteString("..")
+	//      b.WriteString(strconv.Itoa(g.end))
+	//      b.WriteString("] gid=")
+	//      b.WriteString(strconv.Itoa(gi))
+	//      b.WriteString(" pid=")
+	//      b.WriteString(strconv.FormatUint(uint64(clients[g.start].policyID), 10))
+	//      b.WriteString(" members: ")
 
-	// 	for i := g.start; i <= g.end; i++ {
-	// 		if i > g.start {
-	// 			b.WriteString(", ")
-	// 		}
-	// 		b.WriteString(strconv.Itoa(i))
-	// 		b.WriteByte(':')
-	// 		b.WriteString(clients[i].Name())
-	// 	}
+	//      for i := g.start; i <= g.end; i++ {
+	//              if i > g.start {
+	//                      b.WriteString(", ")
+	//              }
+	//              b.WriteString(strconv.Itoa(i))
+	//              b.WriteByte(':')
+	//              b.WriteString(clients[i].Name())
+	//      }
 	// }
 	// errors.LogDebug(ctx, b.String())
 

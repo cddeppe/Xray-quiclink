@@ -33,6 +33,12 @@ type CacheController struct {
 	ips      map[string]*record
 	dirtyips map[string]*record
 
+	// v26.10.40-link: prefetch config and refresher
+	prefetchInterval   time.Duration
+	prefetchThreshold  time.Duration
+	prefetchNameserver CachedNameserver // back-reference for issuing refresh queries
+	prefetchWorker     *task.Periodic
+
 	sync.RWMutex
 	pub           *pubsub.Service
 	cacheCleanup  *task.Periodic
@@ -55,6 +61,106 @@ func NewCacheController(name string, disableCache bool, serveStale bool, serveEx
 		Execute:  c.CacheCleanup,
 	}
 	return c
+}
+
+// v26.10.40-link: SetPrefetch configures background prefetch of near-expiry
+// cache entries. Interval=0 disables prefetch. Threshold is how long before
+// expiry to trigger a refresh (e.g. threshold=30s on an entry with TTL=60s
+// will be refreshed at T+30s). The nameserver is the back-reference needed
+// to issue the refresh query via the existing pull() path.
+//
+// Must be called once, after the CacheController is wired into a nameserver,
+// before the nameserver starts serving queries. Safe to call multiple times
+// (later call replaces earlier).
+func (c *CacheController) SetPrefetch(interval, threshold time.Duration, ns CachedNameserver) {
+	c.prefetchInterval = interval
+	c.prefetchThreshold = threshold
+	c.prefetchNameserver = ns
+	if c.prefetchWorker != nil {
+		_ = c.prefetchWorker.Close()
+		c.prefetchWorker = nil
+	}
+	if interval <= 0 || threshold <= 0 || ns == nil {
+		return
+	}
+	c.prefetchWorker = &task.Periodic{
+		Interval: interval,
+		Execute:  c.Prefetch,
+	}
+}
+
+// Prefetch scans the cache for near-expiry entries and issues background
+// refresh queries. Called periodically by prefetchWorker. Returns nil to
+// keep the periodic task running; an error would stop it (we never want
+// that, so always return nil).
+//
+// v26.10.49-link: also refreshes "zombie" entries whose A/AAAA records
+// were set to nil by CacheCleanup but the entry still exists in the map.
+// This keeps the cache warm even during idle periods when CacheCleanup
+// has cleaned the records but not yet deleted the entry.
+func (c *CacheController) Prefetch() error {
+	if c.prefetchNameserver == nil {
+		return nil
+	}
+	candidates := c.collectPrefetchCandidates()
+	if len(candidates) == 0 {
+		return nil
+	}
+	errors.LogInfo(context.Background(), c.name, " prefetch: refreshing ", len(candidates), " near-expiry entries")
+	// Issue refresh queries in parallel so we don't block the prefetch
+	// worker goroutine for 1s × N entries. pull() uses an 8s timeout
+	// and respects singleflight (concurrent prefetch + foreground
+	// queries are coalesced). IPv4+IPv6 both enabled — same as the
+	// foreground path, so we always refresh both A and AAAA records.
+	var wg sync.WaitGroup
+	for _, fqdn := range candidates {
+		wg.Add(1)
+		go func(fqdn string) {
+			defer wg.Done()
+			pull(context.Background(), c.prefetchNameserver, fqdn, dns_feature.IPOption{
+				IPv4Enable: true,
+				IPv6Enable: true,
+			})
+		}(fqdn)
+	}
+	wg.Wait()
+	return nil
+}
+
+// collectPrefetchCandidates returns the FQDNs of cache entries whose A or
+// AAAA record expires within prefetchThreshold, OR whose A/AAAA records
+// have been cleaned (set to nil by CacheCleanup) but the entry still
+// exists in the map. The caller (Prefetch) does not hold the lock; we
+// take it briefly, snapshot the candidates, then release. Refresh queries
+// run outside the lock.
+func (c *CacheController) collectPrefetchCandidates() []string {
+	c.RLock()
+	defer c.RUnlock()
+	if len(c.ips) == 0 {
+		return nil
+	}
+	threshold := time.Now().Add(c.prefetchThreshold)
+	out := make([]string, 0, 16)
+	for domain, rec := range c.ips {
+		if rec == nil {
+			continue
+		}
+		// v26.10.49-link: also collect entries whose A/AAAA was
+		// cleaned by CacheCleanup (set to nil) but the entry still
+		// exists. These need refresh before they're fully deleted.
+		if rec.A == nil && rec.AAAA == nil {
+			out = append(out, domain)
+			continue
+		}
+		if rec.A != nil && rec.A.Expire.Before(threshold) {
+			out = append(out, domain)
+			continue
+		}
+		if rec.AAAA != nil && rec.AAAA.Expire.Before(threshold) {
+			out = append(out, domain)
+		}
+	}
+	return out
 }
 
 // CacheCleanup clears expired items from cache
@@ -305,6 +411,12 @@ func (c *CacheController) updateRecord(req *dnsRequest, rep *IPRecord) {
 
 	if !c.serveStale || c.serveExpiredTTL != 0 {
 		common.Must(c.cacheCleanup.Start())
+	}
+	// v26.10.40-link: also kick off the prefetch worker if configured.
+	// common.Must(cacheCleanup.Start) is idempotent (task.Periodic.Start
+	// is a no-op if already running), and so is prefetchWorker.Start.
+	if c.prefetchWorker != nil {
+		common.Must(c.prefetchWorker.Start())
 	}
 }
 

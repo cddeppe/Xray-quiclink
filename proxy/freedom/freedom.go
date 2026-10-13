@@ -3,10 +3,12 @@ package freedom
 import (
 	"context"
 	"crypto/rand"
+	stderrors "errors"
 	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -220,6 +222,25 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 			h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
 				return internet.Dial(ctx, dest, streamSettings)
 			})
+			// v26.11.2-link: wire up onSocketStale so the warm pool can
+			// notify the sticky resolver when a dead/expired connection
+			// is detected. The dest key is "ip:port" — extract the IP
+			// and call RefreshByIP, which finds all hostnames pointing
+			// at that IP and triggers background DNS refresh for each.
+			// No-op when sticky resolver is nil (Path 2 default) — the
+			// callback is set only when sticky is enabled.
+			if h.stickyResolver != nil {
+				resolver := h.stickyResolver
+				h.tcpWarmPool.onSocketStale = func(destKey string) {
+					ip := destKey
+					if idx := strings.LastIndex(destKey, ":"); idx > 0 {
+						ip = destKey[:idx]
+					}
+					ip = strings.TrimPrefix(ip, "[")
+					ip = strings.TrimSuffix(ip, "]")
+					resolver.RefreshByIP(ip)
+				}
+			}
 			errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s preWarmFirstN=", preWarmFirstN, " preWarmLearnVisits=", preWarmLearnVisits, ")")
 		}
 		// Sticky resolver is OFF by default for Path 2 (see HANDOFF
@@ -308,6 +329,24 @@ func isValidAddress(addr *net.IPOrDomain) bool {
 
 	a := addr.AsAddress()
 	return a != net.AnyIP && a != net.AnyIPv6
+}
+
+// isNetworkUnreachable returns true if the error indicates the
+// network is unreachable (ENETUNREACH). This covers both connect
+// failures (IPv6 gateway down) and write failures (gateway can't
+// route). Used for automatic IPv6 to IPv4 fallback.
+//
+// v26.10.31-link: simplified from v26.10.30's isNetworkUnreachableOnV6
+// to not require checking the destination — just the error.
+func isNetworkUnreachable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if stderrors.As(err, &errno) {
+		return errno == syscall.ENETUNREACH
+	}
+	return strings.Contains(err.Error(), "network is unreachable")
 }
 
 // Process implements proxy.Outbound.
@@ -422,6 +461,45 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 		rawConn, err := dialer.Dial(ctx, destination)
 		if err != nil {
+			// v26.10.30-link / v26.10.31-link: IPv6→IPv4 fallback on
+			// ENETUNREACH. If the destination is a domain and the dial
+			// failed with "network is unreachable", re-resolve to IPv4
+			// only and retry. Catches the case where kernel routing is
+			// broken for IPv6 but IPv4 works.
+			if destination.Address.Family().IsDomain() && isNetworkUnreachable(err) {
+				errors.LogWarning(ctx, "freedom: network unreachable for ", destination, ", falling back to IPv4-only")
+				if ips, lerr := net.DefaultResolver.LookupIP(ctx, "ip4", destination.Address.Domain()); lerr == nil && len(ips) > 0 {
+					retryDest := destination
+					retryDest.Address = net.IPAddress(ips[0])
+					if rawConn2, derr := dialer.Dial(ctx, retryDest); derr == nil {
+						conn = rawConn2
+						errors.LogInfo(ctx, "freedom: IPv4 fallback succeeded for ", destination.Address.Domain(), " -> ", ips[0])
+						return nil
+					}
+				}
+			}
+			// v26.11.2-link: TCP dial-failure retry with DNS refresh.
+			// If the dial failed (connection refused, timeout, etc.)
+			// and the destination was a domain, the cached IP may be
+			// stale (CDN edge rotated). Proactively refresh DNS via
+			// the sticky resolver and retry with the fresh IP. This
+			// catches the case where the warm pool didn't have a dead
+			// conn to detect (first connection to this host, or pool
+			// empty). No-op when sticky resolver is nil (Path 2 default).
+			if destination.Address.Family().IsDomain() && h.stickyResolver != nil {
+				domain := destination.Address.Domain()
+				errors.LogWarning(ctx, "freedom: TCP dial to ", destination, " failed, refreshing DNS and retrying")
+				h.stickyResolver.RefreshByDomain(domain)
+				if freshIP, rerr := h.stickyResolver.ResolveFresh(ctx, domain); rerr == nil && freshIP != nil {
+					retryDest := destination
+					retryDest.Address = freshIP
+					if rawConn3, derr := dialer.Dial(ctx, retryDest); derr == nil {
+						conn = rawConn3
+						errors.LogInfo(ctx, "freedom: TCP dial retry succeeded with fresh IP ", freshIP, " for ", domain)
+						return nil
+					}
+				}
+			}
 			return err
 		}
 

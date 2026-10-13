@@ -63,6 +63,13 @@ type TCPSocketPool struct {
 
 	dialFunc func(ctx context.Context, dest xnet.Destination) (stat.Connection, error)
 	stopCh   chan struct{}
+
+	// v26.11.2-link: callback to notify the sticky resolver when a
+	// warm TCP connection is found dead or expired. The resolver
+	// proactively refreshes DNS for the destination's hostname so the
+	// next dial gets a fresh IP without waiting for the TTL.
+	// The callback receives the destination key (ip:port string).
+	onSocketStale func(destKey string)
 }
 
 // visitGap is the idle period that ends one "visit" and begins the next.
@@ -200,6 +207,14 @@ func isConnAlive(conn net.Conn) bool {
 // Acquire returns a warm, still-pristine connection for the given
 // destination, or nil if the pool has nothing usable. A nil return means the
 // caller must dial.
+//
+// v26.11.2-link: dead-conn detection. When a warm connection is found
+// but is closed (RemoteAddr is nil or the conn is already closed), we
+// notify the onSocketStale callback so the sticky resolver can
+// proactively refresh DNS for the stale IP. This catches CDN edge
+// rotation on the TCP side — without this, the resolver keeps
+// returning the old IP for up to TTL seconds and the phone retries
+// into a black hole.
 func (p *TCPSocketPool) Acquire(dest xnet.Destination) stat.Connection {
 	if p == nil {
 		return nil
@@ -227,14 +242,36 @@ func (p *TCPSocketPool) Acquire(dest xnet.Destination) stat.Connection {
 	// established TLS session.
 	if !wc.pristine {
 		wc.conn.Close()
+		if p.onSocketStale != nil {
+			go p.onSocketStale(key)
+		}
 		return nil
 	}
 	if time.Now().After(wc.expiresAt) {
+		// v26.11.2-link: warm conn expired — notify stale callback.
+		// The IP may have rotated while the conn sat in the pool.
 		wc.conn.Close()
+		if p.onSocketStale != nil {
+			go p.onSocketStale(key)
+		}
+		return nil
+	}
+	// v26.11.2-link: detect dead connections. A warm conn whose
+	// RemoteAddr is nil has been closed by the remote (RST/FIN) or
+	// by the kernel. Don't return it to the caller — it would fail
+	// immediately. Notify the stale callback so the resolver refreshes.
+	if wc.conn.RemoteAddr() == nil {
+		wc.conn.Close()
+		if p.onSocketStale != nil {
+			go p.onSocketStale(key)
+		}
 		return nil
 	}
 	if !isConnAlive(wc.conn) {
 		wc.conn.Close()
+		if p.onSocketStale != nil {
+			go p.onSocketStale(key)
+		}
 		return nil
 	}
 	return wc.conn
