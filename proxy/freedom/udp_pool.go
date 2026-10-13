@@ -62,6 +62,11 @@ type pooledSocket struct {
         // DCID=∅ (Chrome 0-length SCID), we deliver to this inbox instead
         // of using demux[∅] (which would collide across connections).
         lastActiveInbox chan<- readResult
+        // Fix F: activeConnCount — atomic counter for active connections.
+        // When count > 1, DCID=∅ replies are broadcast to all connections
+        // (each filters by its own Google dest IP). When count <= 1,
+        // lastActiveInbox is always correct (no broadcast needed).
+        activeConnCount atomic.Int64
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -118,6 +123,10 @@ type pooledConn struct {
         // pool can bind outbound packets to the originating client. nil
         // for non-QUIC / per-session paths.
         source *stdnet.UDPAddr
+        // Fix F: googleDestIP is the Google IP this connection is talking to.
+        // Set in WriteTo. Used by the broadcast filter to check if a reply
+        // belongs to this connection.
+        googleDestIP atomic.Pointer[stdnet.UDPAddr]
         // v26.10.16-link: scidsDCID stores the SCIDs we've registered
         // in the socket's demux map. Keyed on dcidKey (struct, zero-alloc)
         // so Close() can index demux directly without converting from
@@ -333,6 +342,8 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
         sock.mu.Lock()
         sock.conns = append(sock.conns, conn)
         sock.mu.Unlock()
+        // Fix F: Increment active connection count
+        sock.activeConnCount.Add(1)
         return conn, nil
 }
 
@@ -431,17 +442,54 @@ func (s *pooledSocket) readLoop() {
                 s.lastReplyTime.Store(nowNano)
 
                 if !ok {
-                        // v26.11.217: If DCID is empty (0-length), use lastActiveInbox
-                        // instead of demux[∅]. This avoids collisions when multiple
-                        // connections share the pool socket (all Chrome connections
-                        // have 0-length SCID → all replies have DCID=∅).
+                        // Fix F: For DCID=∅ replies, check active connection count.
+                        // When count <= 1, lastActiveInbox is always correct (v249 behavior).
+                        // When count > 1 (h3 + YouTube), broadcast to all conns —
+                        // each filters by its own googleDestIP in the reader.
                         if len(dcid) == 0 {
-                                s.mu.RLock()
-                                li := s.lastActiveInbox
-                                s.mu.RUnlock()
-                                if li != nil {
-                                        ch = li
-                                        ok = true
+                                if s.activeConnCount.Load() <= 1 {
+                                        // Fast path: single connection — lastActiveInbox is correct
+                                        s.mu.RLock()
+                                        li := s.lastActiveInbox
+                                        s.mu.RUnlock()
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
+                                        }
+                                } else {
+                                        // Multiple connections — broadcast to all
+                                        // Each conn filters by googleDestIP in the reader
+                                        s.mu.RLock()
+                                        conns := make([]*pooledConn, len(s.conns))
+                                        copy(conns, s.conns)
+                                        s.mu.RUnlock()
+                                        broadcastSent := false
+                                        for _, pc := range conns {
+                                                if pc.closed.Load() {
+                                                        continue
+                                                }
+                                                // Copy packet data for each conn (they can't share)
+                                                pktCopy := getPacket()
+                                                copy(pktCopy, packet[:n])
+                                                func(pc *pooledConn, pkt []byte) {
+                                                        defer func() {
+                                                                if r := recover(); r != nil {
+                                                                        putPacket(pkt)
+                                                                }
+                                                        }()
+                                                        select {
+                                                        case pc.inbox <- readResult{data: pkt, addr: addr}:
+                                                                broadcastSent = true
+                                                        default:
+                                                                putPacket(pkt)
+                                                        }
+                                                }(pc, pktCopy)
+                                        }
+                                        putPacket(packet) // original packet not sent directly
+                                        if broadcastSent {
+                                                // Broadcast already handled — skip normal send
+                                                continue
+                                        }
                                 }
                         }
                 }
@@ -679,6 +727,10 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
         if udp, ok := addr.(*stdnet.UDPAddr); ok {
                 dest = udp
         }
+        // Fix F: Store the Google dest IP so the reader can filter broadcast packets
+        if dest != nil && dest.IP != nil {
+                c.googleDestIP.Store(&stdnet.UDPAddr{IP: dest.IP})
+        }
         n, err := c.socket.conn.WriteTo(b, dest)
         if err != nil {
                 // v26.10.15-link: only mark the socket dead on persistent
@@ -707,22 +759,38 @@ func (c *pooledConn) ReadFrom(p []byte) (int, stdnet.Addr, error) {
         // alive forever — goroutine leak that stalls new connections.
         timer := time.NewTimer(30 * time.Second)
         defer timer.Stop()
-        select {
-        case rr, ok := <-c.inbox:
-                if !ok {
+        // Fix F: Use a loop so we can skip broadcast packets that aren't ours
+        for {
+                select {
+                case rr, ok := <-c.inbox:
+                        if !ok {
+                                return 0, nil, io.EOF
+                        }
+                        // Fix F: If broadcast mode (multiple connections), filter by googleDestIP
+                        if c.socket.activeConnCount.Load() > 1 {
+                                myDest := c.googleDestIP.Load()
+                                if myDest != nil {
+                                        if srcUDP, srcOk := rr.addr.(*stdnet.UDPAddr); srcOk {
+                                                if !myDest.IP.Equal(srcUDP.IP) {
+                                                        // Not ours — drop and try next
+                                                        putPacket(rr.data)
+                                                        continue
+                                                }
+                                        }
+                                }
+                        }
+                        n := copy(p, rr.data)
+                        putPacket(rr.data)
+                        // v26.11.212: update activity timer
+                        if c.onActivity != nil {
+                                c.onActivity()
+                        }
+                        return n, rr.addr, nil
+                case <-c.done:
+                        return 0, nil, io.EOF
+                case <-timer.C:
                         return 0, nil, io.EOF
                 }
-                n := copy(p, rr.data)
-                putPacket(rr.data)
-                // v26.11.212: update activity timer
-                if c.onActivity != nil {
-                        c.onActivity()
-                }
-                return n, rr.addr, nil
-        case <-c.done:
-                return 0, nil, io.EOF
-        case <-timer.C:
-                return 0, nil, io.EOF
         }
 }
 
@@ -750,6 +818,8 @@ func (c *pooledConn) Close() error {
         // We still need to release the socket's refCount so the reaper can close
         // it when it's truly unused.
         c.socket.release()
+        // Fix F: Decrement active connection count
+        c.socket.activeConnCount.Add(-1)
         return nil
 }
 
