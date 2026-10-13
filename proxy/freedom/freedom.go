@@ -385,10 +385,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	// Sticky DNS resolver: resolve domain to a consistent IP.
-	// No-op when h.stickyResolver is nil (EnableStickyResolver=false, the
-	// Path 2 default). Captures domain BEFORE overwriting destination.Address
-	// to avoid .Domain() panic on IP-typed addresses.
-	if h.stickyResolver != nil && destination.Address.Family().IsDomain() {
+	// v26.13.10-link: v191 guarded this with `destination.Network != net.Network_TCP`
+	// because the sticky resolver exists to solve a UDP/QUIC problem (xray's UDP
+	// path picks an address per packet, so a single flow scatters across servers).
+	// TCP doesn't have that problem — a TCP connection resolves once and stays on
+	// that IP for its lifetime. Applying sticky to TCP just pins TCP traffic to
+	// one IP for 300s, bypassing xray's DNS cache (with prefetch, serveStale) and
+	// causing choppier video switching when the pinned IP goes stale.
+	// Restore the v191 guard: sticky only for non-TCP, even when the flag is on.
+	// No-op when h.stickyResolver is nil (EnableStickyResolver=false).
+	// Captures domain BEFORE overwriting destination.Address to avoid .Domain()
+	// panic on IP-typed addresses.
+	if destination.Network != net.Network_TCP && h.stickyResolver != nil && destination.Address.Family().IsDomain() {
 		domain := destination.Address.Domain()
 		if stickyIP, err := h.stickyResolver.Resolve(ctx, domain); err == nil && stickyIP != nil {
 			destination.Address = stickyIP
@@ -424,12 +432,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 						}
 					}
 				} else {
-					addrs, err := net.DefaultResolver.LookupIPAddr(ctx, destination.Address.Domain())
+					// v26.13.10-link: use internet.LookupForIP (xray's DNS)
+					// instead of net.DefaultResolver.LookupIPAddr (Go stdlib).
+					// See IPv4 fallback comment above for why this matters.
+					ips, err := internet.LookupForIP(destination.Address.Domain(), internet.DomainStrategy_USE_IP, outGateway)
 					if err != nil { // dialer may retry DNS
 						errors.LogInfoInner(ctx, err, "failed to get IP address for domain ", destination.Address.Domain())
 					}
-					for _, addr := range addrs {
-						if ipAddr := net.IPAddress(addr.IP); ipAddr != nil {
+					for _, ip := range ips {
+						ipAddr := net.IPAddress(ip)
+						if ipAddr != nil {
 							if rule := h.matchFinalRule(destination.Network, ipAddr, destination.Port, defaultRule); rule != nil && rule.action == RuleAction_Block {
 								blockedDest = &destination
 								blockedDest.Address = ipAddr
@@ -468,13 +480,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			// broken for IPv6 but IPv4 works.
 			if destination.Address.Family().IsDomain() && isNetworkUnreachable(err) {
 				errors.LogWarning(ctx, "freedom: network unreachable for ", destination, ", falling back to IPv4-only")
-				if ips, lerr := net.DefaultResolver.LookupIP(ctx, "ip4", destination.Address.Domain()); lerr == nil && len(ips) > 0 {
-					retryDest := destination
-					retryDest.Address = net.IPAddress(ips[0])
-					if rawConn2, derr := dialer.Dial(ctx, retryDest); derr == nil {
-						conn = rawConn2
-						errors.LogInfo(ctx, "freedom: IPv4 fallback succeeded for ", destination.Address.Domain(), " -> ", ips[0])
-						return nil
+				// v26.13.10-link: use internet.LookupForIP (xray's DNS)
+				// instead of net.DefaultResolver.LookupIP (Go stdlib).
+				// The stdlib reads /etc/resolv.conf and bypasses xray's
+				// entire DNS config — servers, prefetch, serveStale,
+				// domain rules, finalQuery. For setups with custom DNS
+				// routing this was a terrible miss.
+				if ips, lerr := internet.LookupForIP(destination.Address.Domain(), internet.DomainStrategy_USE_IP4, outGateway); lerr == nil && len(ips) > 0 {
+					for _, ip := range ips {
+						retryDest := destination
+						retryDest.Address = net.IPAddress(ip)
+						if rawConn2, derr := dialer.Dial(ctx, retryDest); derr == nil {
+							conn = rawConn2
+							errors.LogInfo(ctx, "freedom: IPv4 fallback succeeded for ", destination.Address.Domain(), " -> ", ip)
+							return nil
+						}
 					}
 				}
 			}
