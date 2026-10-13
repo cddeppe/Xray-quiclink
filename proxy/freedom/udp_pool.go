@@ -21,6 +21,11 @@ import (
         "github.com/xtls/xray-core/transport/internet"
 )
 
+// v26.11.291w4: 4 readLoop workers on the Fix A only baseline.
+// Testing whether the hiccups were caused by Fix D (lastInboxBySourceIP)
+// or by the 4 workers. This is v26.11.291 + workers loop only.
+const readLoopWorkers = 4
+
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
 // UDP socket. Reply packets are demuxed by parsing the QUIC DCID.
@@ -317,7 +322,9 @@ func (p *UDPSocketPool) Acquire(dest *stdnet.UDPAddr) (*pooledConn, error) {
                         sock.mu.Lock()
                         sock.refCount++
                         sock.mu.Unlock()
-                        go sock.readLoop()
+                        for i := 0; i < readLoopWorkers; i++ {
+                                go sock.readLoop()
+                        }
                 }
                 p.mu.Unlock()
         }
