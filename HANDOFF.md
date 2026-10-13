@@ -1,23 +1,33 @@
 # Handoff: TCP warm pool on the clean-tcp branch
 
-Written 2026-10-13. Supersedes the `HANDOFF.md` on `main`, which describes the
-earlier UDP/QUIC-era fork (UDP socket pool, CID migration, `XRAY_UDP_POOL` env
-vars). None of that applies here: `clean-tcp` is TCP-only, has no
+Written 2026-10-13. Updated 2026-10-14 for v26.13.7 (Path 2: warm pool
+restored, sticky off). Supersedes the `HANDOFF.md` on `main`, which describes
+the earlier UDP/QUIC-era fork (UDP socket pool, CID migration, `XRAY_UDP_POOL`
+env vars). None of that applies here: `clean-tcp` is TCP-only, has no
 `udp_pool.go`, and is driven by `udpConfig` fields rather than env vars.
 
 Branch layout as of writing:
 
 - Release branch: `clean-tcp`
 - `main` is behind (`v26.11.287`, UDP era) and still contains `udp_pool.go`
-- Latest release: `v26.13.5` (tag points at `105007d`, which is on `clean-tcp`)
+- Latest release: `v26.13.7` (commit `486024e9`, on `clean-tcp`)
 
 ---
 
-## 0. The headline: the warm pool has never run
+## 0. The headline (v26.13.7 status)
 
-`enableTcpWarmPool` is silently discarded by the config loader. The feature is
-unreachable until the generated protobuf file is regenerated. Details in
-section 2. Everything else below is either already fixed or a smaller open item.
+**v26.13.6 regenerated `config.pb.go` correctly but accidentally reverted
+`freedom.go` to stock upstream**, losing the warm pool Init wiring, the
+Acquire/Release calls in Process, and the `inputCloser`/`cancel`/`Interrupt`
+lifecycle fix from v26.13.2. The warm pool was still dead code: config parsed,
+never used.
+
+**v26.13.7 restores all of that** under Path 2 (prefetch + warm pool, sticky
+off). The warm pool now actually runs when `enableTcpWarmPool: true` is set in
+config. Verification: `xray run -confdir /etc/xray/` should log
+`freedom: TCP warm pool enabled (timeout=... preWarmFirstN=... ...)`.
+With `loglevel: "info"`, `grep "reused warm TCP connection"` should appear
+once pre-warmed sockets start serving.
 
 ---
 
@@ -260,7 +270,7 @@ error log:
 xray runs as `xray run -confdir /etc/xray/`, so **every file in that directory is
 loaded**, not just `config.json`. The live config is `/etc/xray/config.json`.
 
-Target `udpConfig` once the proto is regenerated:
+Target `udpConfig` for v26.13.7 (Path 2):
 
 ```json
 "udpConfig": {
@@ -272,8 +282,20 @@ Target `udpConfig` once the proto is regenerated:
 }
 ```
 
-The `udpConfig` block must be present even while the features are off — see the
-nil-dereference item in section 4.
+Notes:
+
+- `enableStickyResolver: false` is **mandatory** for Path 2. The wildcard
+  collapse bug (§1.2) is still in `udp_sticky.go` — PR #2 was not merged.
+  Flipping this flag back on without merging PR #2 will reintroduce the
+  buffering.
+- The `udpConfig` block is now safe to omit entirely (v26.13.7 nil-checks it),
+  but including it with `enableTcpWarmPool: true` is required for the warm
+  pool to actually run.
+- The warm pool's pre-warm dialer does NOT apply the outbound gateway (HANDOFF
+  §4 item 2). If `sendThrough: "origin"` is set on the freedom outbound, the
+  pre-warmed sockets bind to the kernel's default source instead of the
+  inbound's local address. On a single-address VPS this is harmless. On a
+  multi-address host, skip `enableTcpWarmPool` until §4.2 is fixed.
 
 Housekeeping: there is a stray `/etc/xray/config.jsonu` in the confdir. It
 duplicates config that also exists in `config.json` and should be removed or
@@ -285,8 +307,7 @@ renamed out of the directory.
 
 Ordered by importance.
 
-1. **Regenerate `config.pb.go`** (section 2). This is the only thing standing
-   between the user and a working warm pool.
+1. **Regenerate `config.pb.go`** (section 2). ✅ Fixed in v26.13.6.
 2. **The pre-warm dialer does not apply the outbound gateway.** `Init` wires
    `SetDialFunc` to `internet.Dial(ctx, dest, streamSettings)` with a fresh
    `context.Background()`. There is no inbound in that context, so
@@ -297,31 +318,19 @@ Ordered by importance.
    host with more than one address. Fix before enabling the pool in a chain
    where the source address is load-bearing — for example, skip pre-warming when
    the configured send-through is `origin`.
-3. **Nil-pointer panic on a missing `udpConfig`.** `Handler.Init` uses direct
-   field access:
-
-   ```go
-   if config.UdpConfig.EnableTcpWarmPool {
-   ```
-
-   `UdpConfig` is a `*UDPConfig`, so any freedom outbound whose JSON has no
-   `udpConfig` block panics during config load. Use `config.GetUdpConfig()` and
-   nil-check it. The current deployment always has the block, so this is latent.
+3. **Nil-pointer panic on a missing `udpConfig`.** ✅ Fixed in v26.13.7.
+   `Handler.Init` now uses `config.GetUdpConfig()` with a nil-check.
 4. **Warm pool and sticky resolver are skipped when `sockopt.dialerProxy` is
-   set.** Both are initialised *after* `Init`'s early return for that case, so
-   they are silently disabled in exactly the multi-hop configuration this fork
-   targets. The old `HANDOFF.md` on `main` records this as already fixed; it is
-   not fixed here. Move the initialisation above the early return.
+   set.** ✅ Fixed in v26.13.7. Both are now initialised BEFORE the dialerProxy
+   early return.
 5. **No tests.** `tcp_pool.go` and `udp_sticky.go` have none. The original bug in
    1.1 would have been caught by a single test asserting that a `Release`d
    connection never comes back out of `Acquire`. Suggested file:
    `proxy/freedom/tcp_pool_test.go`.
-6. **`test.yml` is red independently of all of the above.** `check-proto` fails
-   on generated-file headers and `check-format` fails because `freedom.go` is
-   indented with spaces where gofmt requires tabs (compare
-   `transport/internet/system_dialer.go`, which uses tabs). The `build` jobs are
-   the only trustworthy signal in that workflow right now. Do not use
-   `check-format` as a gate until the tree is gofmt-clean.
+6. **`test.yml` check-format.** ✅ Partially fixed in v26.13.7: `freedom.go` is
+   now gofmt-clean (tabs, not spaces). The `check-proto` job may still fail on
+   generated-file header toolchain mismatches — verify before relying on it
+   as a gate.
 7. **The NXDOMAIN flood.** The error log is full of
    `failed to resolve ip > app/dns: returning nil for domain
    <name>.googlevideo.com > rcode: 3`. The deployment's local resolver returns
@@ -329,6 +338,12 @@ Ordered by importance.
    plausible cause of remaining stalls. Worth noting that the wildcard entry
    removed in 1.2 was also masking this: an unresolvable name used to receive
    another edge's address from the wildcard instead of failing.
+8. **The sticky resolver's wildcard collapse bug (§1.2) is still in the code.**
+   v26.13.6 adopted the *recommendation* (set `enableStickyResolver: false`)
+   but did not merge PR #2's code fix. With the flag off, the bug is
+   unreachable. If anyone flips the flag back on without merging PR #2,
+   buffering will return. Merge `fix/sticky-resolver-scope` (`7850f72`)
+   before re-enabling sticky.
 
 ---
 
@@ -337,12 +352,13 @@ Ordered by importance.
 | item | value |
 | --- | --- |
 | warm pool fix (merged) | squash `11ddc4c` |
-| sticky resolver fix | branch `fix/sticky-resolver-scope`, `7850f72`, PR #2 |
+| sticky resolver fix | branch `fix/sticky-resolver-scope`, `7850f72`, PR #2 (unmerged; flag off |
 | docs | `c042fff` |
 | release workflow | `105007d` (clean-tcp), `b53d26f` (main) |
-| release `v26.13.5` | tag → `105007d`, target `clean-tcp` |
-| `xray-linux-amd64` | 39,465,084 bytes, sha256 `d1424669...e62282` |
-| `xray-linux-arm64` | 36,831,356 bytes, sha256 `29524e5e...e8716` |
+| release `v26.13.7` | commit `486024e9`, target `clean-tcp` |
+| `xray-linux-amd64` (v26.13.7) | 35,508,348 bytes, sha256 `83afeea2...dbd6e` |
+| `xray-linux-arm64` (v26.13.7) | 33,095,804 bytes, sha256 `338582df...892d` |
+| Path 2 status | warm pool wired + active; sticky off in config |
 
 Install command (matches the existing deployment habit):
 
