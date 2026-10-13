@@ -669,7 +669,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                                         uc.SetRegisterPoolCID(func(newDCID []byte) {
                                                                 pc.RegisterCID(newDCID)
                                                         })
-                                                }
                                         }
                                         }
                                 }
