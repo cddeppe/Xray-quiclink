@@ -977,6 +977,57 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		ctx = newCtx
 	}
 
+	// v26.12.31-link: For UDP session reader path, skip task.Run entirely.
+	// task.Run expects both requestDone and responseDone to eventually return,
+	// but QUIC is a long-lived bidirectional packet stream that never "closes."
+	// Instead, run two independent goroutines:
+	//   1. requestDone: reads Chrome's packets from input, writes to outbound
+	//   2. reply delivery: reads from sessionReplyCh, writes to Chrome
+	// Both run until the connection is closed by the worker's clean() timeout.
+	// Process returns nil immediately — the goroutines keep running.
+	if destination.Network != net.Network_TCP && pconn == nil {
+		if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+			if sr, ok := inbound.Conn.(interface{ ReadSessionReply() ([]byte, bool) }); ok {
+				errors.LogInfo(ctx, "freedom: UDP session reader — standalone goroutines (skipping task.Run)")
+
+				// Goroutine 1: read Chrome → write Google (requestDone)
+				go func() {
+					defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
+					writer := NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
+					if len(peekedPackets) > 0 {
+						if err := writer.WriteMultiBuffer(peekedPackets); err != nil {
+							errors.LogInfoInner(ctx, err, "freedom: failed to write peeked UDP packets")
+							return
+						}
+					}
+					if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
+						// Expected when Chrome stops sending
+					}
+				}()
+
+				// Goroutine 2: read Google replies from channel → write Chrome
+				go func() {
+					defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+					for {
+						pkt, ok := sr.ReadSessionReply()
+						if !ok || len(pkt) == 0 {
+							return
+						}
+						b := buf.New()
+						b.Write(pkt)
+						if err := output.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+							return
+						}
+						timer.SetTimeout(plcy.Timeouts.ConnectionIdle)
+					}
+				}()
+
+				// Process returns immediately — goroutines keep running
+				return nil
+			}
+		}
+	}
+
 	if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
 		return errors.New("connection ends").Base(err)
 	}
