@@ -625,7 +625,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
                                         // traffic doesn't need source port stability, and routing
                                         // it through the pool overwrites lastActiveInbox, breaking
                                         // QUIC handshake routing for Google traffic.
-                                        isLoopback := udpRemote.IP.IsLoopback()
+                                        isLoopback := udpRemote.IP.IsLoopback() || udpRemote.IP.IsUnspecified()
                                         if !isLoopback {
                                             pooledConn, err = h.socketPool.Acquire(udpRemote)
                                         }
