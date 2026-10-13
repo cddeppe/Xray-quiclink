@@ -145,9 +145,12 @@ func (s *StickyResolver) reaper() {
 }
 
 // Resolve returns a sticky IP for the given hostname.
-// Both exact and wildcard matches expire after the TTL (default 5 minutes).
-// When an entry expires, we return the stale IP immediately AND
-// trigger a background refresh (stale-while-revalidate).
+// v26.12.21-link: wildcard matching REMOVED. The wildcard collapsed
+// all sibling subdomains (*.googlevideo.com) onto one IP, which caused
+// hangs when the CDN edge rotated — every sibling kept getting the stale
+// IP until the TTL expired. Now only exact-match caching is used: each
+// hostname resolves on its own (100ms once) and is cached for 60s.
+// Repeat connections to the same hostname are instant.
 func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Address, error) {
 	// Check exact match first (with TTL, stale-while-revalidate)
 	s.mu.RLock()
@@ -163,35 +166,6 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
 		errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
 		return staleIP, nil
 	}
-
-	// Check wildcard match (e.g., *.googlevideo.com)
-	// v26.10.42-link (audit H1 from 2-a): iteratively strip labels and
-	// check for a wildcard at each level. The old code only stripped the
-	// first label, so "x.y.googlevideo.com" would look for
-	// "*.y.googlevideo.com" (which doesn't exist) instead of
-	// "*.googlevideo.com". Now we strip until we find a match or run
-	// out of labels.
-	remaining := hostname
-	for {
-		parent, ok := parentDomain(remaining)
-		if !ok {
-			break
-		}
-		wildcardKey := "*." + parent
-		if entry, ok := s.entries[wildcardKey]; ok {
-			if entry.age() < s.wildcardTTL {
-				s.mu.RUnlock()
-				entry.touch() // atomic — safe under RLock
-				return entry.ip, nil
-			}
-			staleIP := entry.ip
-			s.mu.RUnlock()
-			go s.refreshWildcard(hostname, wildcardKey)
-			errors.LogInfo(ctx, "sticky: stale-while-revalidate for ", hostname, " using stale ", staleIP)
-			return staleIP, nil
-		}
-		remaining = parent
-	}
 	s.mu.RUnlock()
 
 	// No cache hit — resolve fresh
@@ -206,7 +180,7 @@ func (s *StickyResolver) Resolve(ctx context.Context, hostname string) (net.Addr
 //
 // v26.11.59-link: added for UDP/QUIC traffic to prevent stale-IP handshake failures.
 func (s *StickyResolver) ResolveFresh(ctx context.Context, hostname string) (net.Address, error) {
-	// Check exact match first
+	// Check exact match only (wildcard removed in v26.12.21)
 	s.mu.RLock()
 	if entry, ok := s.entries[hostname]; ok {
 		if entry.age() < s.ttl {
@@ -218,28 +192,6 @@ func (s *StickyResolver) ResolveFresh(ctx context.Context, hostname string) (net
 		s.mu.RUnlock()
 		errors.LogInfo(ctx, "sticky: ResolveFresh: stale entry for ", hostname, ", blocking on fresh DNS")
 		return s.resolveAndCache(ctx, hostname)
-	}
-
-	// Check wildcard match
-	remaining := hostname
-	for {
-		parent, ok := parentDomain(remaining)
-		if !ok {
-			break
-		}
-		wildcardKey := "*." + parent
-		if entry, ok := s.entries[wildcardKey]; ok {
-			if entry.age() < s.wildcardTTL {
-				s.mu.RUnlock()
-				entry.touch()
-				return entry.ip, nil
-			}
-			// Stale wildcard — don't return it. Fall through to fresh resolve.
-			s.mu.RUnlock()
-			errors.LogInfo(ctx, "sticky: ResolveFresh: stale wildcard for ", hostname, ", blocking on fresh DNS")
-			return s.resolveAndCache(ctx, hostname)
-		}
-		remaining = parent
 	}
 	s.mu.RUnlock()
 
@@ -522,22 +474,12 @@ func (s *StickyResolver) resolveAndCache(ctx context.Context, hostname string) (
 		return nil, errors.New("sticky: resolved IP is nil for ", hostname)
 	}
 
-	// Cache exact match and wildcard
+	// Cache exact match only (wildcard removed in v26.12.21)
 	s.mu.Lock()
 	now := time.Now().UnixNano()
 	exactEntry := &stickyEntry{ip: ip}
 	exactEntry.lastUsed.Store(now)
 	s.entries[hostname] = exactEntry
-	if parent, ok := parentDomain(hostname); ok {
-		wildcardKey := "*." + parent
-		if _, exists := s.entries[wildcardKey]; !exists {
-			wcEntry := &stickyEntry{ip: ip}
-			wcEntry.lastUsed.Store(now)
-			s.entries[wildcardKey] = wcEntry
-			// v191-prefetch: schedule refresh 10s before wildcard expires.
-			s.scheduleWildcardPrefetch(wildcardKey, hostname)
-		}
-	}
 	s.mu.Unlock()
 
 	errors.LogInfo(ctx, "sticky: resolved ", hostname, " -> ", ip)
