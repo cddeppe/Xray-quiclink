@@ -621,15 +621,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			if udpConn, ok := inbound.Conn.(interface {
 				GetOutboundConn() net.Conn
 				SetOutboundConn(net.Conn, net.Destination)
+				EnsureSessionReader()
 			}); ok {
 				existingConn := udpConn.GetOutboundConn()
 				if existingConn != nil {
 					conn = existingConn
 					errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
 				} else {
-					defer func() {
-						udpConn.SetOutboundConn(conn, destination)
-					}()
+					// v26.12.27: Persist conn + start permanent reader goroutine.
+					// The socket survives Process restarts so 1-RTT data packets
+					// that arrive after Process returned can still be read.
+					udpConn.SetOutboundConn(conn, destination)
+					udpConn.EnsureSessionReader()
+					errors.LogInfo(ctx, "freedom: persisted session socket + started reader for ", destination)
 				}
 			} else {
 				defer conn.Close()
@@ -887,7 +891,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			// BufferedPacketReader for the same pconn's inbox.
 			defer bpr.Close()
 		} else {
-			reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+			// v26.12.27: If conn was persisted (session reader running),
+			// use sessionReplyReader to read from the permanent reader goroutine.
+			// Otherwise use NewPacketReader (per-Process socket read).
+			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+				if sr, ok := inbound.Conn.(interface{ ReadSessionReply() ([]byte, bool) }); ok {
+					reader = &sessionReplyReader{conn: sr}
+				} else {
+					reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+				}
+			} else {
+				reader = NewPacketReader(conn, h, defaultRule, UDPOverride, destination)
+			}
 			// v26.11.117: Wrap reader to detect server SCID from
 			// long-header replies. When Google's Initial reply
 			// arrives, extract the SCID and register it in the
@@ -1323,4 +1338,23 @@ func (r *serverSCIDReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	}
 
 	return mb, nil
+}
+
+// v26.12.27: sessionReplyReader reads from the permanent session reader
+// goroutine on udpConn. The goroutine was started by EnsureSessionReader
+// and runs for the lifetime of udpConn. This reader just reads from the
+// channel — no socket I/O, no install/uninstall cycle.
+// Ported from v26.11.272.
+type sessionReplyReader struct {
+	conn interface{ ReadSessionReply() ([]byte, bool) }
+}
+
+func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	pkt, ok := r.conn.ReadSessionReply()
+	if !ok || len(pkt) == 0 {
+		return nil, io.EOF
+	}
+	b := buf.New()
+	b.Write(pkt)
+	return buf.MultiBuffer{b}, nil
 }
