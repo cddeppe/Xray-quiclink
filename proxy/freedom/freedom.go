@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +57,9 @@ func init() {
 		if streamSettings, ok := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig); ok && streamSettings.SocketSettings != nil {
 			h.resolveStrategy = streamSettings.SocketSettings.DomainStrategy
 			h.usesDialerProxy = len(streamSettings.SocketSettings.DialerProxy) > 0
+			// Retain the stream config so the TCP warm pool's pre-warm
+			// dialer can reuse it (BUG-11 fix from v26.13.4).
+			h.streamSettings = streamSettings
 		}
 		if err := core.RequireFeatures(ctx, func(pm policy.Manager) error {
 			return h.Init(config.(*Config), pm)
@@ -98,6 +102,11 @@ type Handler struct {
 	finalRules      []*FinalRule
 	resolveStrategy internet.DomainStrategy
 	usesDialerProxy bool
+	tcpWarmPool     *TCPSocketPool
+	stickyResolver  *StickyResolver
+	// streamSettings is captured at Init so the warm pool's pre-warm
+	// dialer uses the same sock/transport config as the real outbound.
+	streamSettings *internet.MemoryStreamConfig
 }
 
 func buildFinalRule(config *FinalRuleConfig) (*FinalRule, error) {
@@ -190,6 +199,45 @@ func (h *Handler) matchFinalRule(network net.Network, address net.Address, port 
 func (h *Handler) Init(config *Config, pm policy.Manager) error {
 	h.config = config
 	h.policyManager = pm
+
+	// TCP warm pool + sticky resolver init run BEFORE the dialerProxy
+	// early return (HANDOFF #4 fix). Previously both were skipped when
+	// sockopt.dialerProxy was set, disabling them in exactly the
+	// multi-hop config this fork targets.
+	//
+	// udpCfg nil-check (HANDOFF #3 fix): GetUdpConfig returns nil when
+	// the JSON has no udpConfig block, so direct field access would panic.
+	if udpCfg := config.GetUdpConfig(); udpCfg != nil {
+		if udpCfg.EnableTcpWarmPool {
+			warmTimeout := int(udpCfg.GetTcpWarmPoolTimeout())
+			if warmTimeout <= 0 {
+				warmTimeout = 300
+			}
+			preWarmFirstN := int(udpCfg.GetPreWarmFirstN())
+			preWarmLearnVisits := int(udpCfg.GetPreWarmLearnVisits())
+			h.tcpWarmPool = NewTCPSocketPool(time.Duration(warmTimeout)*time.Second, 0, preWarmFirstN, preWarmLearnVisits)
+			streamSettings := h.streamSettings
+			h.tcpWarmPool.SetDialFunc(func(ctx context.Context, dest net.Destination) (stat.Connection, error) {
+				return internet.Dial(ctx, dest, streamSettings)
+			})
+			errors.LogWarning(context.Background(), "freedom: TCP warm pool enabled (timeout=", warmTimeout, "s preWarmFirstN=", preWarmFirstN, " preWarmLearnVisits=", preWarmLearnVisits, ")")
+		}
+		// Sticky resolver is OFF by default for Path 2 (see HANDOFF
+		// §1.2 recommendation). The flag is honoured here so a future
+		// opt-in doesn't require a code change, but the deployment's
+		// config sets enableStickyResolver=false.
+		if udpCfg.EnableStickyResolver {
+			stickyTtl := int(udpCfg.GetStickyResolverTtl())
+			if stickyTtl <= 0 {
+				stickyTtl = 300
+			}
+			h.stickyResolver = NewStickyResolver(time.Duration(stickyTtl) * time.Second)
+			h.stickyResolver.PreferIPv4 = udpCfg.PreferIpv4
+			h.stickyResolver.PreferIPv6 = udpCfg.PreferIpv6
+			errors.LogWarning(context.Background(), "freedom: sticky resolver enabled (TTL=", stickyTtl, "s PreferIPv4=", udpCfg.PreferIpv4, " PreferIPv6=", udpCfg.PreferIpv6, ")")
+		}
+	}
+
 	if h.usesDialerProxy { // freedom is not the final outbound, final rules do not apply
 		if len(config.FinalRules) > 0 {
 			errors.LogWarning(context.Background(), `The "finalRules" setting is ignored when "sockopt.dialerProxy" is set, since freedom is not the final outbound.`)
@@ -203,6 +251,19 @@ func (h *Handler) Init(config *Config, pm policy.Manager) error {
 			return errors.New("failed to build final rule").Base(err)
 		}
 		h.finalRules = append(h.finalRules, rule)
+	}
+	return nil
+}
+
+// Close cleans up TCP warm pool and sticky resolver.
+func (h *Handler) Close() error {
+	if h.tcpWarmPool != nil {
+		h.tcpWarmPool.Close()
+		h.tcpWarmPool = nil
+	}
+	if h.stickyResolver != nil {
+		h.stickyResolver.Close()
+		h.stickyResolver = nil
 	}
 	return nil
 }
@@ -284,6 +345,18 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
+	// Sticky DNS resolver: resolve domain to a consistent IP.
+	// No-op when h.stickyResolver is nil (EnableStickyResolver=false, the
+	// Path 2 default). Captures domain BEFORE overwriting destination.Address
+	// to avoid .Domain() panic on IP-typed addresses.
+	if h.stickyResolver != nil && destination.Address.Family().IsDomain() {
+		domain := destination.Address.Domain()
+		if stickyIP, err := h.stickyResolver.Resolve(ctx, domain); err == nil && stickyIP != nil {
+			destination.Address = stickyIP
+			errors.LogInfo(ctx, "freedom: sticky: resolved ", domain, " -> ", stickyIP)
+		}
+	}
+
 	input := link.Reader
 	output := link.Writer
 
@@ -336,6 +409,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 
+		// TCP warm pool: try to acquire a pre-warmed (pristine) connection
+		// before dialing. Acquire returns nil if no pristine connection is
+		// available, in which case we fall through to dialer.Dial.
+		if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
+			if warmConn := h.tcpWarmPool.Acquire(destination); warmConn != nil {
+				conn = warmConn
+				errors.LogInfo(ctx, "freedom: reused warm TCP connection to ", destination)
+				return nil
+			}
+		}
+
 		rawConn, err := dialer.Dial(ctx, destination)
 		if err != nil {
 			return err
@@ -369,7 +453,24 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			return errors.New("failed to set PROXY protocol v", version).Base(err)
 		}
 	}
-	defer conn.Close()
+	// TCP warm pool: on the success path, Release the connection back to
+	// the pool (which closes it — see tcp_pool.go: a connection that has
+	// carried a TLS session cannot be reused, the peer will RST it).
+	// Pre-warmed (pristine) connections served from preWarmLoop are the
+	// only ones that skip the handshake. On the error path we close
+	// outright to avoid returning a half-closed fd.
+	var connErr error
+	if destination.Network == net.Network_TCP && h.tcpWarmPool != nil {
+		defer func() {
+			if connErr != nil {
+				conn.Close()
+			} else {
+				h.tcpWarmPool.Release(conn, destination)
+			}
+		}()
+	} else {
+		defer conn.Close()
+	}
 	errors.LogInfo(ctx, "connection opened to ", destination, ", local endpoint ", conn.LocalAddr(), ", remote endpoint ", conn.RemoteAddr())
 
 	var newCtx context.Context
@@ -386,6 +487,26 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			newCancel()
 		}
 	}, plcy.Timeouts.ConnectionIdle)
+
+	// inputCloser propagates EOF from outbound→inbound. When responseDone
+	// returns (outbound closed), close(inputCloser) triggers
+	// common.Interrupt(input) which unblocks requestDone's
+	// buf.Copy(input, writer). Without this, requestDone blocks forever
+	// and the TCP socket sits in CLOSE-WAIT.
+	//
+	// sync.Once guards the close so the error path (task.Run returned
+	// before responseDone ran) can also close inputCloser without
+	// panicking on the success path where responseDone's defer already
+	// closed it.
+	inputCloser := make(chan struct{})
+	var closeInputCloserOnce sync.Once
+	closeInputCloser := func() {
+		closeInputCloserOnce.Do(func() { close(inputCloser) })
+	}
+	go func() {
+		<-inputCloser
+		common.Interrupt(input)
+	}()
 
 	requestDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
@@ -417,7 +538,15 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
-			return errors.New("failed to process request").Base(err)
+			// Swallow ErrClosedPipe when inputCloser has fired
+			// (responseDone returned, outbound closed, input pipe
+			// interrupted). Anything else is a real error.
+			select {
+			case <-inputCloser:
+				return nil // graceful
+			default:
+				return errors.New("failed to process request").Base(err)
+			}
 		}
 
 		return nil
@@ -425,6 +554,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
+		// The inputCloser goroutine owns the common.Interrupt(input)
+		// call. Calling it from this defer as well was redundant and
+		// could fire Interrupt twice on the success path. Keep only
+		// cancel() + closeInputCloser() here; the goroutine delivers
+		// the interrupt.
+		defer closeInputCloser()
+		defer cancel()
 		if destination.Network == net.Network_TCP && useSplice.Load() && proxy.IsRAWTransportWithoutSecurity(conn) { // it would be tls conn in special use case of MITM, we need to let link handle traffic
 			var writeConn net.Conn
 			var inTimer *signal.ActivityTimer
@@ -451,6 +587,17 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	if err := task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(output))); err != nil {
+		// Record the error so the deferred Release/close above chooses
+		// conn.Close() instead of putting a half-closed fd back into the
+		// pool. Also force-cancel the per-conn context and close the
+		// socket so any goroutine still blocked inside the OnSuccess
+		// chain's reader.ReadMultiBuffer unblocks. Finally,
+		// closeInputCloser() so the inputCloser goroutine doesn't leak
+		// if responseDone never got to run (requestDone failed first).
+		connErr = err
+		cancel()
+		conn.Close()
+		closeInputCloser()
 		return errors.New("connection ends").Base(err)
 	}
 
