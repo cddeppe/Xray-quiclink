@@ -21,10 +21,11 @@ import (
         "github.com/xtls/xray-core/transport/internet"
 )
 
-// v26.12.3: 2 workers — 4 still had occasional hiccups from DCID=∅
-// collisions. 2 cuts race probability roughly in half while still
-// giving 2x throughput vs single reader.
-const readLoopWorkers = 2
+// v26.12.4: 1 worker — the DCID race with 2+ workers is too disruptive.
+// Parallel workers cause the Initial reply (stores lastInboxBySourceIP)
+// and the 1-RTT reply (loads it) to be processed out of order.
+// With 1 worker, ordering is preserved — no race.
+const readLoopWorkers = 1
 
 // UDPSocketPool pools UDP sockets by destination IP:port so that many
 // inbound QUIC sessions going to the same destination share one outbound
