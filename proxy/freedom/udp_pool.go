@@ -53,6 +53,8 @@ type pooledSocket struct {
         // v26.11.158: Track all pooledConns so readLoop can check
         // if a pooledConn is closed before sending to its inbox.
         conns []*pooledConn
+        // lastActiveInbox routes DCID=∅ replies to the most recently active connection.
+        lastActiveInbox chan<- readResult
 }
 
 // v26.10.16-link: dcidKey is a zero-allocation map key for QUIC DCID
@@ -427,6 +429,21 @@ func (s *pooledSocket) readLoop() {
                                 }
                         }
                         if !ok {
+                                // DCID=∅ (Chrome 0-length SCID) — use lastActiveInbox
+                                // ParseDCID reads 8 bytes of garbage for short headers, so len(dcid) > 0.
+                                // We can't detect DCID=∅ from the parsed result. Instead, just try
+                                // lastActiveInbox for any short-header demux miss.
+                                if n > 0 && packet[0]&0x80 == 0 {
+                                        s.mu.RLock()
+                                        li := s.lastActiveInbox
+                                        s.mu.RUnlock()
+                                        if li != nil {
+                                                ch = li
+                                                ok = true
+                                        }
+                                }
+                        }
+                        if !ok {
                                 putPacket(packet)
                                 continue
                         }
@@ -610,6 +627,11 @@ func (c *pooledConn) WriteTo(b []byte, addr stdnet.Addr) (int, error) {
                         c.RegisterCID(dcid)
                 }
         }
+
+        // Update lastActiveInbox on every WriteTo call
+        c.socket.mu.Lock()
+        c.socket.lastActiveInbox = c.inbox
+        c.socket.mu.Unlock()
 
         // v26.10.34-link (M1 fix): honor the caller-provided addr if it's a
         // *net.UDPAddr; otherwise fall back to the socket's fixed dest. The
