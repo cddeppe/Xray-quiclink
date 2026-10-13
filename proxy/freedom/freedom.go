@@ -442,6 +442,31 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// UDP-only sticky restores v26.10.36's working behavior. The CLOSE-WAIT
 	// fix (inputCloser) and tcpKeepAlive alias are kept; both are
 	// independent of the sticky-TCP change.
+	// v26.12.23-link: for UDP/QUIC traffic, use Chrome's original dest IP
+	// (from TPROXY header) instead of re-resolving via sticky/SNI.
+	//
+	// Chrome caches (IP, QUIC_server_config) pairs from previous sessions.
+	// When Chrome sends a QUIC packet to a cached Google IP, the proxy
+	// should forward to that EXACT IP — not re-resolve the SNI to a
+	// different IP. If the proxy dials a different IP, Google's QUIC
+	// server config in the reply won't match what Chrome cached for
+	// the original IP, and Chrome rejects the reply → connection fails
+	// → Chrome tries next cached IP → rotation hang.
+	//
+	// Only applies when origTargetAddr is NOT our own VPS IP (which
+	// happens when DNS hijack redirected Chrome to the VPS). If it
+	// IS our own IP, fall through to SNI/sticky resolution.
+	if destination.Network != net.Network_TCP && origTargetAddr != nil && origTargetAddr.Family().IsIP() {
+		isOurOwnIP := outGateway != nil && origTargetAddr.String() == outGateway.String()
+		if !isOurOwnIP {
+			errors.LogInfo(ctx, "freedom: UDP using original target IP ", origTargetAddr, " (Chrome cached QUIC dest)")
+			destination.Address = origTargetAddr
+			if UDPOverride.Address != nil && UDPOverride.Address.Family().IsDomain() {
+				UDPOverride.Address = origTargetAddr
+			}
+		}
+	}
+
 	// v26.12.19-prefetch-link: removed the != TCP guard so sticky
 	// also applies to TCP. This is what makes YouTube video switching
 	// snappy: new rr*.googlevideo.com sibling subdomains get the
