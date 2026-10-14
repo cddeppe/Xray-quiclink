@@ -77,6 +77,12 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 		} else {
 			errors.LogInfo(ctx, "Hub: SetReadBuffer(4MB) ok")
 		}
+		// v26.12.62: Also enlarge send buffer for reply packets.
+		if err := hub.udpConn.SetWriteBuffer(4 * 1024 * 1024); err != nil {
+			errors.LogWarning(ctx, "Hub: SetWriteBuffer(4MB) failed: ", err)
+		} else {
+			errors.LogInfo(ctx, "Hub: SetWriteBuffer(4MB) ok")
+		}
 	}
 	hub.cache = make(chan *udp.Packet, 8192)
 

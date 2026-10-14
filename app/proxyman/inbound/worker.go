@@ -1143,7 +1143,7 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 	// downloads overflowed it immediately. 256KB (~213 packets) absorbs
 	// most bursts. When it does overflow, the drop is far enough apart
 	// that QUIC retransmits recover quickly.
-	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(256*1024))
+	pReader, pWriter := pipe.New(pipe.DiscardOverflow(), pipe.WithSizeLimit(64*1024))
 	srcCopy := id.src
 	conn := &udpConn{
 		reader: pReader,
