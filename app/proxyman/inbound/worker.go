@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	stderrors "errors"
+	"hash/crc32"
 	stdnet "net"
 	"sync"
 	"syscall"
@@ -247,7 +248,15 @@ type udpConn struct {
 	// If replyOut > writeErr but sockRead freezes, the client isn't
 	// receiving → Google sees loss → cwnd collapses → video stalls.
 	cntWriteErr atomic.Int64
-	cntReqSent  atomic.Int64 // packets Chrome->Google (via PacketWriter)
+	// v26.12.57: Content integrity check. Running hash of all bytes
+	// at two points: (1) socket read in reader goroutine, (2) udpConn.Write
+	// entry before SplitCoalesced. If readBytes == writeBytes but
+	// readHash != writeHash, data was corrupted between read and write.
+	cntReadBytes  atomic.Int64
+	cntReadHash   atomic.Int64 // sum of CRC32 of each packet read
+	cntWriteBytes atomic.Int64
+	cntWriteHash  atomic.Int64 // sum of CRC32 of each packet written
+	cntReqSent    atomic.Int64 // packets Chrome->Google (via PacketWriter)
 	// v26.12.52: Inbound pipe overflow drops.
 	cntPipeDrop *atomic.Int64 // pointer to local pipeDropCounter
 	// v26.12.54: Silent drops inside PacketWriter.WriteMultiBuffer.
@@ -553,6 +562,9 @@ drainDone:
 			c.cntSockRead.Add(1)
 			pkt := make([]byte, n)
 			copy(pkt, b[:n])
+			// v26.12.57: Content integrity — hash at read point.
+			c.cntReadBytes.Add(int64(n))
+			c.cntReadHash.Add(int64(crc32.ChecksumIEEE(pkt)))
 			// v26.12.41-link: Register server SCID from long-header replies.
 			// The server's Initial/Handshake reply carries its SCID, which
 			// Chrome uses as the DCID for 1-RTT packets. Without registering
@@ -664,7 +676,11 @@ func (c *udpConn) StartCounterLogger(src string) {
 					" pipeDrop=", pd,
 					" nilAddr=", c.cntNilAddr.Load(),
 					" ruleBlock=", c.cntRuleBlock.Load(),
-					" writeErr=", c.cntWriteErr.Load())
+					" writeErr=", c.cntWriteErr.Load(),
+					" readB=", c.cntReadBytes.Load(),
+					" writeB=", c.cntWriteBytes.Load(),
+					" readH=", c.cntReadHash.Load(),
+					" writeH=", c.cntWriteHash.Load())
 				// v26.12.49: Also log worker-level inbound drops.
 				if c.worker != nil {
 					c.worker.LogWorkerDrops()
@@ -816,6 +832,11 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
 	c.cntReplyOut.Add(1)
+	// v26.12.57: Content integrity — hash at write point.
+	// Computed BEFORE SplitCoalesced so it matches the read-side hash
+	// of the original datagram.
+	c.cntWriteBytes.Add(int64(len(buf)))
+	c.cntWriteHash.Add(int64(crc32.ChecksumIEEE(buf)))
 	// v26.11.144: Re-add SplitCoalesced (from v26.11.55).
 	// Packets > 1250 bytes are split into separate UDP datagrams.
 	// This allows coalesced QUIC packets (Initial+Handshake) to be
