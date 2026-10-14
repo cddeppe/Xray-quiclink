@@ -645,17 +645,18 @@ func (c *udpConn) StartCounterLogger(src string) {
 }
 
 // v26.12.49: GetWorkerDrops returns worker-level inbound drop counters.
-func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused int64) {
-	return w.cntShortDrop.Load(), w.cntFallbackRefused.Load()
+func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused, selfDialDropped int64) {
+	return w.cntShortDrop.Load(), w.cntFallbackRefused.Load(), w.cntSelfDialDropped.Load()
 }
 
 // v26.12.49: LogWorkerDrops logs worker-level drop counters periodically.
 func (w *udpWorker) LogWorkerDrops() {
-	sd, fr := w.GetWorkerDrops()
-	if sd > 0 || fr > 0 {
+	sd, fr, sdd := w.GetWorkerDrops()
+	if sd > 0 || fr > 0 || sdd > 0 {
 		errors.LogWarning(context.Background(),
 			"DIAG WORKER DROPS shortDrop=", sd,
 			" fallbackRefused=", fr,
+			" selfDialDropped=", sdd,
 			" tag=", w.tag)
 	}
 }
@@ -927,6 +928,8 @@ type udpWorker struct {
 	// v26.12.49: Worker-level counters for inbound packet drops.
 	cntShortDrop       atomic.Int64
 	cntFallbackRefused atomic.Int64
+	// v26.12.50: Self-dial drops (127.0.0.1 on our own port).
+	cntSelfDialDropped atomic.Int64
 
 	ctx  context.Context
 	cone bool
@@ -1016,18 +1019,18 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
-	// v26.12.48: NARROWED loopback guard. v26.12.47's broad guard
-	// dropped DNS traffic to 127.0.0.1:53 (legitimate). Now only drop
-	// if the destination matches the hub's own address — the exact same
-	// check the TCP worker uses at line 96. DNS on :53 is unaffected.
-	if originalDest.IsValid() && w.hub != nil {
-		if w.hub.Addr().String() == originalDest.NetAddr() {
-			errors.LogWarning(context.Background(),
-				"DIAG: udpWorker DROPPING self-loop dest=", originalDest,
-				" src=", source)
-			b.Release()
-			return
-		}
+	// v26.12.50: Self-dial guard. A destination of 127.0.0.1 on this
+	// inbound's own listen port means the sniffer hasn't produced a
+	// destination yet and dokodemo's !FollowRedirect placeholder leaked
+	// through. Dialling it connects to ourselves and the reader then waits
+	// forever on a socket that can never receive a reply.
+	// Drop it and let the client retransmit the Initial.
+	// Port-based check: dest.Port == w.port. This can't touch DNS on :53.
+	if originalDest.IsValid() && originalDest.Port == w.port &&
+		originalDest.Address.Family().IsIP() && originalDest.Address.IP().IsLoopback() {
+		w.cntSelfDialDropped.Add(1)
+		b.Release()
+		return
 	}
 	id := connID{
 		src:    source,
