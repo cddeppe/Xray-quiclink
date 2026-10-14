@@ -706,7 +706,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					// YouTube (Google) uses non-zero SCID, so the pool works
 					// fine for Google traffic. This check only skips the pool
 					// for 0-length SCID connections.
+					//
+					// v26.12.38-link: ALSO skip pool for YouTube/Google QUIC.
+					// The other agent's analysis showed Chrome uses 0-length SCID
+					// for ALL QUIC connections (not just h3 test sites). The
+					// comment above saying "YouTube uses non-zero SCID" was
+					// WRONG — all Chrome QUIC uses 0-length SCID. This was
+					// causing the pool to be chosen for YouTube QUIC, where
+					// replies with DCID=∅ couldn't be demuxed → handshake
+					// never completed → stall.
 					scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
+					// v26.12.38: Log the decision for diagnostics
+					errors.LogWarning(context.Background(),
+						"DIAG: UDP path decision dest=", destination,
+						" scidLen=", len(scid), " scidErr=", scidErr,
+						" chosePool=", scidErr == nil && len(scid) > 0)
 					if scidErr == nil && len(scid) == 0 {
 						errors.LogInfo(ctx, "freedom: 0-length SCID QUIC — using per-session socket (h3 test site)")
 						// pconn stays nil — fall through to per-session path
