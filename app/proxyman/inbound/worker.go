@@ -407,6 +407,17 @@ func (c *udpConn) EnsureSessionReader() {
 			c.cntSockRead.Add(1)
 			pkt := make([]byte, n)
 			copy(pkt, b[:n])
+			// v26.12.41-link: Register server SCID from long-header replies.
+			// The server's Initial/Handshake reply carries its SCID, which
+			// Chrome uses as the DCID for 1-RTT packets. Without registering
+			// it in dcidIndex, every 1-RTT packet falls back to srcIndex
+			// routing — which sends packets to the wrong server when multiple
+			// QUIC connections share a client source port.
+			if c.registerServerCID != nil && len(pkt) > 0 && pkt[0]&0x80 != 0 {
+				if scid, _, perr := quic.ParseSCID(pkt); perr == nil && len(scid) > 0 {
+					c.registerServerCID(scid)
+				}
+			}
 			select {
 			case c.sessionReplyCh <- pkt:
 			case <-dn:
@@ -897,13 +908,32 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			w.RUnlock()
 		}
 
-		// DCID miss — fall back to srcIndex (single-connection case)
+		// v26.12.41-link: DCID miss — fall back to srcIndex ONLY when
+		// that source port has exactly one active connection. If multiple
+		// connections share the port, routing to the wrong one sends
+		// packets to the wrong server. A drop is recoverable by QUIC;
+		// a misroute poisons both connections.
 		w.RLock()
 		if existingID, found := w.srcIndex[id.srcKey]; found {
 			if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+				// Count active conns for this source port
+				activeCount := 0
+				for _, c := range w.activeConn {
+					if !c.done.Done() && c.src != nil && c.src.Port == id.src.Port {
+						activeCount++
+					}
+				}
+				if activeCount <= 1 {
+					w.RUnlock()
+					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+					existingConn.updateActivity()
+					return
+				}
+				// Multiple conns — don't guess. Drop and let QUIC retransmit.
 				w.RUnlock()
-				existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-				existingConn.updateActivity()
+				errors.LogWarning(context.Background(),
+					"DIAG: short header DROPPED (multi-conn srcKey) src=", source)
+				b.Release()
 				return
 			}
 		}
