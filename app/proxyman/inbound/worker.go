@@ -361,6 +361,15 @@ func (c *udpConn) EnsureSessionReader() {
 	c.sessionReaderMu.Lock()
 	defer c.sessionReaderMu.Unlock()
 
+	// v26.12.45: Diagnostic — log every call so we can see how many
+	// times this is called vs how many readers actually start.
+	// If 138 SetOutboundConn calls produce only 9 reader STARTs, this
+	// log will show whether the alive guard is the gate.
+	errors.LogWarning(context.Background(),
+		"DIAG: EnsureSessionReader called alive=", c.sessionReaderAlive,
+		" conn=", c.outboundConn != nil,
+		" src=", c.src)
+
 	// Already running — don't start a second one
 	if c.sessionReaderAlive {
 		return
@@ -376,8 +385,49 @@ func (c *udpConn) EnsureSessionReader() {
 	if c.sessionReplyCh == nil {
 		c.sessionReplyCh = make(chan []byte, 8192)
 	}
+	// v26.12.45: Fix the dn channel bug. Close() closes sessionReaderDn
+	// but never sets it to nil. The old code only checked == nil, so a
+	// closed-but-not-nil channel was passed to the goroutine, which
+	// immediately exited on `case <-dn: return` — before the START log.
+	// This caused sockRead=0: the reader "started" but never read anything.
+	// Fix: check if the channel is closed (non-blocking recv) and create
+	// a new one if so.
 	if c.sessionReaderDn == nil {
 		c.sessionReaderDn = make(chan struct{})
+	} else {
+		select {
+		case <-c.sessionReaderDn:
+			// Channel is closed (from a previous Close() call) — create fresh.
+			errors.LogWarning(context.Background(),
+				"DIAG: EnsureSessionReader dn was CLOSED, creating new channel src=", c.src)
+			c.sessionReaderDn = make(chan struct{})
+		default:
+			// Channel is open — reuse it.
+		}
+	}
+
+	// v26.12.45: Drain stale packets from the channel. If a previous
+	// Process's responseDone exited (buf.Copy returned) but the reader
+	// kept running, it filled the channel with packets that no consumer
+	// ever read. Those packets are now stale (the Process that needed
+	// them is gone). Draining prevents the new Process from receiving
+	// old packets AND prevents the reader from being blocked on a full
+	// channel (the second bug: sockRead freezes at a non-zero value
+	// because the reader is blocked on `sessionReplyCh <- pkt` with
+	// no consumer).
+	drained := 0
+	for {
+		select {
+		case <-c.sessionReplyCh:
+			drained++
+		default:
+			goto drainDone
+		}
+	}
+drainDone:
+	if drained > 0 {
+		errors.LogWarning(context.Background(),
+			"DIAG: EnsureSessionReader drained=", drained, " stale packets from channel src=", c.src)
 	}
 
 	c.sessionReaderAlive = true
@@ -671,6 +721,10 @@ func (c *udpConn) Close() error {
 	// v26.12.27: Stop the session reader goroutine and close the socket.
 	if c.sessionReaderDn != nil {
 		close(c.sessionReaderDn)
+		// v26.12.45: Set to nil so EnsureSessionReader creates a fresh one
+		// on restart. Without this, the closed-but-not-nil channel causes
+		// the reader goroutine to exit immediately on `case <-dn: return`.
+		c.sessionReaderDn = nil
 	}
 	c.sessionSocketMu.Lock()
 	if c.sessionSocket != nil {
