@@ -391,6 +391,15 @@ func (c *udpConn) EnsureSessionReader() {
 		}()
 
 		b := make([]byte, 65535)
+		// v26.12.44: Track whether we've logged the START and FIRST READ
+		// for this reader instance. These one-shot diagnostics confirm:
+		//   - START: the reader goroutine actually launched (and when)
+		//   - FIRST READ: the reader successfully read at least one packet
+		// If sockRead=0 appears in the counter without a matching FIRST READ,
+		// the reader is blocked on oc.Read() — likely on a stale socket that
+		// was replaced by SetOutboundConn while the reader was blocked.
+		loggedStart := false
+		loggedFirstRead := false
 		for {
 			select {
 			case <-dn:
@@ -409,8 +418,40 @@ func (c *udpConn) EnsureSessionReader() {
 					continue
 				}
 			}
+			if !loggedStart {
+				loggedStart = true
+				errors.LogWarning(context.Background(),
+					"DIAG: reader START local=", oc.LocalAddr(),
+					" remote=", oc.RemoteAddr())
+			}
+			// v26.12.44: Set a 1-second read deadline so oc.Read() can't
+			// block forever on a stale socket. If SetOutboundConn replaces
+			// the socket while we're blocked on Read, Go on Linux does NOT
+			// reliably unblock the Read on Close() — the goroutine stays
+			// stuck on the dead socket forever. sessionReaderAlive stays
+			// true (goroutine isn't dead, just blocked), so EnsureSessionReader
+			// won't restart it. sockRead freezes. This deadline forces Read
+			// to return every 1s; on timeout we loop back, re-read
+			// c.outboundConn (picking up any replacement), and retry.
+			type deadlineSetter interface {
+				SetReadDeadline(time.Time) error
+			}
+			if ds, ok := oc.(deadlineSetter); ok {
+				_ = ds.SetReadDeadline(time.Now().Add(1 * time.Second))
+			}
 			n, err := oc.Read(b)
 			if err != nil {
+				// v26.12.44: Check for timeout before incrementing sockErr.
+				// A timeout is EXPECTED — it means no packets arrived in 1s.
+				// Don't log it as an error, don't increment sockErr, just retry.
+				var ne stdnet.Error
+				if stderrors.As(err, &ne) && ne.Timeout() {
+					// Read deadline expired — no packets in 1s. Loop back,
+					// re-read c.outboundConn (in case it was replaced), retry.
+					// This is the critical fix: if the socket was replaced
+					// while we were blocked, we now pick up the new one.
+					continue
+				}
 				c.cntSockErr.Add(1)
 				errors.LogWarning(context.Background(),
 					"DIAG: reader EXIT sockErr=", c.cntSockErr.Load(),
@@ -430,6 +471,13 @@ func (c *udpConn) EnsureSessionReader() {
 					}
 				}
 				return
+			}
+			if !loggedFirstRead {
+				loggedFirstRead = true
+				errors.LogWarning(context.Background(),
+					"DIAG: reader FIRST READ n=", n,
+					" local=", oc.LocalAddr(),
+					" sockRead=", c.cntSockRead.Load()+1)
 			}
 			c.cntSockRead.Add(1)
 			pkt := make([]byte, n)
