@@ -635,9 +635,29 @@ func (c *udpConn) StartCounterLogger(src string) {
 					" chDrop=", cd,
 					" replyOut=", ro,
 					" reqSent=", rs)
+				// v26.12.49: Also log worker-level inbound drops.
+				if c.worker != nil {
+					c.worker.LogWorkerDrops()
+				}
 			}
 		}
 	}()
+}
+
+// v26.12.49: GetWorkerDrops returns worker-level inbound drop counters.
+func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused int64) {
+	return w.cntShortDrop.Load(), w.cntFallbackRefused.Load()
+}
+
+// v26.12.49: LogWorkerDrops logs worker-level drop counters periodically.
+func (w *udpWorker) LogWorkerDrops() {
+	sd, fr := w.GetWorkerDrops()
+	if sd > 0 || fr > 0 {
+		errors.LogWarning(context.Background(),
+			"DIAG WORKER DROPS shortDrop=", sd,
+			" fallbackRefused=", fr,
+			" tag=", w.tag)
+	}
 }
 
 // v26.11.202: GetPooledConn returns the persistent pooledConn.
@@ -904,6 +924,10 @@ type udpWorker struct {
 	sharedSockets   map[string]net.Conn
 	sharedSocketsMu sync.Mutex
 
+	// v26.12.49: Worker-level counters for inbound packet drops.
+	cntShortDrop       atomic.Int64
+	cntFallbackRefused atomic.Int64
+
 	ctx  context.Context
 	cone bool
 }
@@ -1102,6 +1126,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				}
 				// Multiple conns — don't guess. Drop and let QUIC retransmit.
 				w.RUnlock()
+				w.cntShortDrop.Add(1)
 				errors.LogWarning(context.Background(),
 					"DIAG: short header DROPPED (multi-conn srcKey) src=", source)
 				b.Release()
@@ -1113,6 +1138,8 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		// v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
 		// v26.12.38-link: Log the drop so we can see if 1-RTT packets
 		// are being silently dropped at the DCID/srcIndex transition.
+		// v26.12.49: Count it.
+		w.cntShortDrop.Add(1)
 		errors.LogWarning(context.Background(),
 			"DIAG: short header DROPPED src=", source)
 		b.Release()
