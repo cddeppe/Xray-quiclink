@@ -1288,17 +1288,13 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			w.RUnlock()
 		}
 
-		// No conn found — genuine unknown packet. Drop it.
-		w.cntShortDropNoConn.Add(1)
-		dcidLen := 0
-		if d, _, e := quic.ParseDCID(b.Bytes()); e == nil {
-			dcidLen = len(d)
-		}
-		errors.LogWarning(context.Background(),
-			"DIAG: short header DROPPED src=", source,
-			" dcidLen=", dcidLen)
-		b.Release()
-		return
+		// v26.12.65: Don't drop — fall through to getConnection.
+		// RFC 9312 §4.5: dropping mid-connection packets is 'particularly
+		// unwise' and causes 'slow and costly timeouts'. A short header
+		// from an unknown port means Chrome opened a new QUIC connection.
+		// Let getConnection create a new conn — the sharedSockets mechanism
+		// will give it an outbound socket, and the flow proceeds.
+		// (Previously this was a drop, causing shortDropNoConn=41+.)
 	}
 	// Try QUIC DCID-based migration lookup before creating a new conn
 	if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
