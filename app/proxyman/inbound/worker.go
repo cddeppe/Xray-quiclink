@@ -861,45 +861,22 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 	// Packets > 1250 bytes are split into separate UDP datagrams.
 	// This allows coalesced QUIC packets (Initial+Handshake) to be
 	// delivered even when the path MTU can't handle the full packet.
-	if len(buf) <= 1250 {
-		n, err := c.output(buf)
-		if c.downlink != nil {
-			c.downlink.Add(int64(n))
-		}
-		if err != nil {
-			c.cntWriteErr.Add(1)
-			errors.LogWarning(context.Background(),
-				"DIAG: udpConn.Write ERROR err=", err, " src=", c.src)
-		} else {
-			c.updateActivity()
-		}
-		return n, err
+	// v26.12.63: Removed SplitCoalesced. Coalesced QUIC packets MUST
+	// be delivered as a single UDP datagram. Splitting them breaks QUIC
+	// semantics — the client receives fragments that aren't valid
+	// standalone QUIC packets, causing protocol errors.
+	n, err := c.output(buf)
+	if c.downlink != nil {
+		c.downlink.Add(int64(n))
 	}
-	offsets, splitErr := quic.SplitCoalesced(buf)
-	if splitErr != nil || len(offsets) <= 1 {
-		n, err := c.output(buf)
-		if c.downlink != nil {
-			c.downlink.Add(int64(n))
-		}
-		if err == nil {
-			c.updateActivity()
-		}
-		return n, err
+	if err != nil {
+		c.cntWriteErr.Add(1)
+		errors.LogWarning(context.Background(),
+			"DIAG: udpConn.Write ERROR err=", err, " src=", c.src)
+	} else {
+		c.updateActivity()
 	}
-	total := 0
-	for _, off := range offsets {
-		packet := buf[off[0]:off[1]]
-		n, werr := c.output(packet)
-		if c.downlink != nil {
-			c.downlink.Add(int64(n))
-		}
-		if werr != nil {
-			return total, werr
-		}
-		total += n
-	}
-	c.updateActivity()
-	return total, nil
+	return n, err
 }
 
 func (c *udpConn) Close() error {
