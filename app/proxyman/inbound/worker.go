@@ -1225,22 +1225,53 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			}
 		}
 	}
-	// v26.11.117: DCID-first routing for short headers.
+	// v26.12.64: RFC 9312 §4.2 — 5-tuple (srcIndex) is the PRIMARY key.
+	// CID is used ONLY as an exception (rebind path) per §3.5.
 	//
-	// Chrome multiplexes multiple QUIC connections through ONE UDP socket
-	// (same source port). The old Solution A routed ALL short headers from
-	// a source port to the FIRST connection — connection #2's packets went
-	// to connection #1's server, causing stalls.
+	// RFC 9312 §4.2: "using the connection ID as a flow key field for
+	// stateful treatment of flows is not recommended... the use of the
+	// connection ID for functions that require state to make a forwarding
+	// decision is not viable."
 	//
-	// Fix: For short headers, try DCID lookup FIRST. The DCID in a 1-RTT
-	// short header is the server's SCID (learned from the server's Initial
-	// reply). If dcidIndex has it, route to the correct conn.
+	// The previous design (v26.12.58) made CID the primary key and the port
+	// a hint — the opposite of what the RFC says. This caused:
+	// - learnSrc bugs (stale connID, wrong port mapping)
+	// - IP fallback misrouting (v26.12.53/56)
+	// - {4,8,8,8,8} alt-CID loop (never matched)
+	// - "undetectable and unrecoverable loss of state" on CID rotation
 	//
-	// Fall back to srcIndex only if DCID lookup misses AND there's exactly
-	// one conn for this source (safe for single-connection cases like h3
-	// test sites).
+	// The RFC-consistent design: all QUIC connections from the same client
+	// 5-tuple share ONE outbound socket (via sharedSockets). Google demuxes
+	// by its own SCIDs. Replies come back on the shared socket. No CID
+	// parsing needed for routing — the 5-tuple IS the flow identity.
+	//
+	// CID lookup is the EXCEPTION path: only when a packet arrives from a
+	// NEW source port (NAT rebind). Then dcidIndex associates it with the
+	// existing conn.
 	if !id.dest.IsValid() && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-		// Try DCID lookup first
+		// PRIMARY: srcIndex (5-tuple) lookup.
+		// All connections from this source port share one outbound socket,
+		// so it doesn't matter which conn we route to — the packet reaches
+		// Google via the shared socket, and replies come back on the same
+		// socket to the same client 5-tuple.
+		w.RLock()
+		if existingID, found := w.srcIndex[id.srcKey]; found {
+			if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+				w.RUnlock()
+				w.cntSrcHit.Add(1)
+				existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+				existingConn.updateActivity()
+				return
+			}
+			// Conn is done — clean up srcIndex entry
+			delete(w.srcIndex, id.srcKey)
+		}
+		w.RUnlock()
+
+		// EXCEPTION: srcIndex missed — try DCID lookup (NAT rebind path).
+		// A packet from a new source port with a known CID means the
+		// client's NAT rebound. Associate the new port with the existing
+		// conn via learnSrc, so future packets take the primary path.
 		if dcid, _, err := quic.ParseDCID(b.Bytes()); err == nil && len(dcid) > 0 {
 			dk := makeDCIDKey(dcid)
 			w.RLock()
@@ -1248,14 +1279,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
 					w.RUnlock()
 					w.cntCidHit.Add(1)
-					// v26.12.58: Bind the source port so future packets
-					// from this port go through the fast path (srcIndex),
-					// which handles CID rotation. Without this, every
-					// packet from a new port does a DCID lookup, and
-					// CID rotation registration (which only fires when
-					// the port is known) never runs → rotated CIDs
-					// are never registered → the next rotation kills
-					// the connection.
 					existingConn.learnSrc(id.srcKey)
 					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 					existingConn.updateActivity()
@@ -1263,104 +1286,17 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				}
 			}
 			w.RUnlock()
-			// v26.12.59: Try alt CID lengths derived from dcidIndex keys.
-			// dcidKey is length-tagged (cid [20]byte; len int), so a 4-byte
-			// parse can only match a registered 4-byte CID — no cross-length
-			// false positives. The default 8 was already tried above.
-			triedLens := map[int]bool{8: true}
-			w.RLock()
-			for dk := range w.dcidIndex {
-				if !triedLens[dk.len] {
-					triedLens[dk.len] = true
-					if 1+dk.len <= len(b.Bytes()) {
-						altDcid := b.Bytes()[1 : 1+dk.len]
-						altDk := makeDCIDKey(altDcid)
-						if existingID, found := w.dcidIndex[altDk]; found {
-							if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-								w.RUnlock()
-								w.cntCidHitAlt.Add(1)
-								existingConn.learnSrc(id.srcKey)
-								existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-								existingConn.updateActivity()
-								return
-							}
-						}
-					}
-				}
-			}
-			w.RUnlock()
 		}
 
-		// v26.12.41-link: DCID miss — fall back to srcIndex ONLY when
-		// that source port has exactly one active connection. If multiple
-		// connections share the port, routing to the wrong one sends
-		// packets to the wrong server. A drop is recoverable by QUIC;
-		// a misroute poisons both connections.
-		w.RLock()
-		if existingID, found := w.srcIndex[id.srcKey]; found {
-			if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-				// Count active conns for this source port
-				activeCount := 0
-				for _, c := range w.activeConn {
-					if !c.done.Done() && c.src != nil && c.src.Port == id.src.Port {
-						activeCount++
-					}
-				}
-				if activeCount <= 1 {
-					w.RUnlock()
-					w.cntSrcHit.Add(1)
-					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-					existingConn.updateActivity()
-					return
-				}
-				// Multiple conns — don't guess. Drop and let QUIC retransmit.
-				w.RUnlock()
-				w.cntShortDrop.Add(1)
-				errors.LogWarning(context.Background(),
-					"DIAG: short header DROPPED (multi-conn srcKey) src=", source)
-				b.Release()
-				return
-			}
-		}
-		w.RUnlock()
-
-		// v26.11.120: Short headers that miss BOTH DCID and srcIndex.
-		// v26.12.38-link: Log the drop.
-		// v26.12.49: Count it.
-		// v26.12.53: Before dropping, try the client-IP fallback.
-		//   The user's original diagnosis was right: Chrome sends 1-RTT
-		//   packets with an empty DCID (DCID=0). When the source port
-		//   is also unknown (migration / new socket), the demux has
-		//   nothing to route by — and dropping kills the connection
-		//   at the exact moment Chrome switches to 1-RTT.
-		//   Fix: attribute to the most recently active conn for this
-		//   client IP, and learn the new source port so future packets
-		//   route normally via srcIndex.
+		// No conn found — genuine unknown packet. Drop it.
+		w.cntShortDropNoConn.Add(1)
 		dcidLen := 0
 		if d, _, e := quic.ParseDCID(b.Bytes()); e == nil {
 			dcidLen = len(d)
 		}
-		if conn := w.mostRecentConnForIP(source.Address); conn != nil {
-			// Attribute this packet to the most recent conn for this IP.
-			// learnSrc teaches the demux this source port so future
-			// packets route normally without needing the fallback.
-			conn.learnSrc(id.srcKey)
-			conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-			conn.updateActivity()
-			w.cntIpFallback.Add(1)
-			w.cntAttributedFallback.Add(1)
-			errors.LogWarning(context.Background(),
-				"DIAG: short header ATTRIBUTED via IP fallback src=", source,
-				" dcidLen=", dcidLen,
-				" -> conn src=", conn.src)
-			return
-		}
-		// No conn found for this IP — genuine unknown packet. Drop it.
-		w.cntShortDropNoConn.Add(1)
 		errors.LogWarning(context.Background(),
-			"DIAG: short header DROPPED (no conn for IP) src=", source,
-			" dcidLen=", dcidLen,
-			" firstByte=", b.Bytes()[0])
+			"DIAG: short header DROPPED src=", source,
+			" dcidLen=", dcidLen)
 		b.Release()
 		return
 	}
