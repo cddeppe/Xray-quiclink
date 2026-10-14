@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -23,6 +24,12 @@ const (
 type pipeOption struct {
 	limit           int32 // maximum buffer size in bytes
 	discardOverflow bool
+	// v26.12.52: Optional counter for overflow drops. When non-nil,
+	// incremented on each discarded packet batch. This is the one
+	// uncounted drop path on the request direction — without it, the
+	// pipe can silently eat client ACKs while every other counter
+	// reads clean.
+	overflowCounter *atomic.Int64
 }
 
 func (o *pipeOption) isFull(curSize int32) bool {
@@ -155,6 +162,10 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 		if err == errBufferFull {
 			if p.option.discardOverflow {
+				// v26.12.52: Count the overflow before discarding.
+				if p.option.overflowCounter != nil {
+					p.option.overflowCounter.Add(int64(len(mb)))
+				}
 				buf.ReleaseMulti(mb)
 				return nil
 			}

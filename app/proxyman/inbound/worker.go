@@ -241,7 +241,9 @@ type udpConn struct {
 	cntSockErr  atomic.Int64 // read errors (socket closed, etc.)
 	cntChDrop   atomic.Int64 // packets dropped (channel full)
 	cntReplyOut atomic.Int64 // packets written to Chrome (udpConn.Write)
-	cntReqSent  atomic.Int64 // packets Chrome→Google (via PacketWriter)
+	cntReqSent  atomic.Int64 // packets Chrome->Google (via PacketWriter)
+	// v26.12.52: Inbound pipe overflow drops.
+	cntPipeDrop *atomic.Int64 // pointer to local pipeDropCounter
 }
 
 func (c *udpConn) setInactive() {
@@ -607,9 +609,13 @@ func (c *udpConn) IncReqSent()          { c.cntReqSent.Add(1) }
 func (c *udpConn) IncReqSentBy(n int64) { c.cntReqSent.Add(n) } // v26.12.42
 
 // GetCounters returns a snapshot of all reply-path counters for logging.
-func (c *udpConn) GetCounters() (sockRead, sockErr, chDrop, replyOut, reqSent int64) {
+func (c *udpConn) GetCounters() (sockRead, sockErr, chDrop, replyOut, reqSent, pipeDrop int64) {
+	pd := int64(0)
+	if c.cntPipeDrop != nil {
+		pd = c.cntPipeDrop.Load()
+	}
 	return c.cntSockRead.Load(), c.cntSockErr.Load(), c.cntChDrop.Load(),
-		c.cntReplyOut.Load(), c.cntReqSent.Load()
+		c.cntReplyOut.Load(), c.cntReqSent.Load(), pd
 }
 
 // v26.12.36-link: StartCounterLogger starts a goroutine that logs the
@@ -624,8 +630,8 @@ func (c *udpConn) StartCounterLogger(src string) {
 			case <-c.sessionReaderDn:
 				return
 			case <-t.C:
-				sr, se, cd, ro, rs := c.GetCounters()
-				if sr == 0 && ro == 0 && rs == 0 {
+				sr, se, cd, ro, rs, pd := c.GetCounters()
+				if sr == 0 && ro == 0 && rs == 0 && pd == 0 {
 					continue // no activity yet, skip
 				}
 				// v26.12.51: Include destination so the reqSent:sockRead ratio
@@ -643,7 +649,8 @@ func (c *udpConn) StartCounterLogger(src string) {
 					" sockErr=", se,
 					" chDrop=", cd,
 					" replyOut=", ro,
-					" reqSent=", rs)
+					" reqSent=", rs,
+					" pipeDrop=", pd)
 				// v26.12.49: Also log worker-level inbound drops.
 				if c.worker != nil {
 					c.worker.LogWorkerDrops()
