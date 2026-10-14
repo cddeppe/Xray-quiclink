@@ -630,6 +630,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				EnsureSessionReader()
 				IncReqSent()
 				StartCounterLogger(string)
+				GetSharedOutboundConn(net.Destination) net.Conn
 			}); ok {
 				existingConn := udpConn.GetOutboundConn()
 				if existingConn != nil {
@@ -637,6 +638,14 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					udpConn.EnsureSessionReader()
 					errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
 				} else {
+					// v26.12.39: Check for a shared socket from a previous
+					// QUIC connection from this client to this destination.
+					// If found, reuse it to keep the source port stable.
+					if shared := udpConn.GetSharedOutboundConn(destination); shared != nil {
+						conn = shared
+						errors.LogWarning(ctx, "freedom: REUSED shared socket for ", destination,
+							" local=", conn.LocalAddr())
+					}
 					udpConn.SetOutboundConn(conn, destination)
 					udpConn.EnsureSessionReader()
 					// v26.12.36: Start the counter logger for diagnostics
