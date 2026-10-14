@@ -242,6 +242,11 @@ type udpConn struct {
 	cntSockErr  atomic.Int64 // read errors (socket closed, etc.)
 	cntChDrop   atomic.Int64 // packets dropped (channel full)
 	cntReplyOut atomic.Int64 // packets written to Chrome (udpConn.Write)
+	// v26.12.55: Write errors — hub.WriteTo failed (NAT expiry, etc).
+	// replyOut counts BEFORE the write; these count failures AFTER.
+	// If replyOut > writeErr but sockRead freezes, the client isn't
+	// receiving → Google sees loss → cwnd collapses → video stalls.
+	cntWriteErr atomic.Int64
 	cntReqSent  atomic.Int64 // packets Chrome->Google (via PacketWriter)
 	// v26.12.52: Inbound pipe overflow drops.
 	cntPipeDrop *atomic.Int64 // pointer to local pipeDropCounter
@@ -658,7 +663,8 @@ func (c *udpConn) StartCounterLogger(src string) {
 					" reqSent=", rs,
 					" pipeDrop=", pd,
 					" nilAddr=", c.cntNilAddr.Load(),
-					" ruleBlock=", c.cntRuleBlock.Load())
+					" ruleBlock=", c.cntRuleBlock.Load(),
+					" writeErr=", c.cntWriteErr.Load())
 				// v26.12.49: Also log worker-level inbound drops.
 				if c.worker != nil {
 					c.worker.LogWorkerDrops()
@@ -795,7 +801,11 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 		if c.downlink != nil {
 			c.downlink.Add(int64(n))
 		}
-		if err == nil {
+		if err != nil {
+			c.cntWriteErr.Add(1)
+			errors.LogWarning(context.Background(),
+				"DIAG: udpConn.Write ERROR err=", err, " src=", c.src)
+		} else {
 			c.updateActivity()
 		}
 		return n, err
