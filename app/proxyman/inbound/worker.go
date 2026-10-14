@@ -679,9 +679,21 @@ func (c *udpConn) StartCounterLogger(src string) {
 // fallback for 1-RTT packets with empty DCIDs arriving from a source
 // port the demux doesn't know (QUIC connection migration / new socket).
 // Returns nil if no active conn exists for that IP.
+//
+// v26.12.56: CONSTRAINED to single-connection cases only. When multiple
+// connections exist for the same client IP, the fallback would pick the
+// most recently active one — but with 14 connections live, it frequently
+// picks the WRONG one. A misattributed ACK goes to the wrong Google edge,
+// that edge never gets its ACKs, its window stalls, and the video dies.
+// The one that played was the one whose attribution happened to be right.
+//
+// Now: only return a conn when exactly one active conn exists for this IP.
+// When multiple exist, return nil (drop) — a drop is recoverable by QUIC
+// retransmission; a misroute poisons both connections.
 func (w *udpWorker) mostRecentConnForIP(addr net.Address) *udpConn {
 	var best *udpConn
 	var bestTime int64
+	count := 0
 	w.RLock()
 	for _, c := range w.activeConn {
 		if c.done.Done() || c.src == nil {
@@ -689,6 +701,7 @@ func (w *udpWorker) mostRecentConnForIP(addr net.Address) *udpConn {
 		}
 		// Match by IP address (not port — the port may have changed)
 		if c.src.Address == addr {
+			count++
 			lat := atomic.LoadInt64(&c.lastActivityTime)
 			if lat > bestTime {
 				bestTime = lat
@@ -697,6 +710,17 @@ func (w *udpWorker) mostRecentConnForIP(addr net.Address) *udpConn {
 		}
 	}
 	w.RUnlock()
+	// v26.12.56: Only return a conn when there's exactly one for this IP.
+	// With multiple conns, we can't know which one this packet belongs to,
+	// and guessing sends ACKs to the wrong server.
+	if count != 1 {
+		if count > 1 {
+			errors.LogWarning(context.Background(),
+				"DIAG: IP fallback REFUSED (multi-conn) count=", count,
+				" addr=", addr)
+		}
+		return nil
+	}
 	return best
 }
 
