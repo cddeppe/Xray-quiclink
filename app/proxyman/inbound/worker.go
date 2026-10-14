@@ -209,9 +209,10 @@ type udpConn struct {
 	// connection. Without this, each Process restart dials a new socket
 	// with a new source port → Google sees connection migration → path
 	// validation → stall.
-	outboundConn net.Conn
-	outboundMu   sync.Mutex
-	outboundDest net.Destination
+	outboundConn       net.Conn
+	outboundConnAtomic atomic.Value // v26.12.69
+	outboundMu         sync.Mutex
+	outboundDest       net.Destination
 	// v26.11.196: Track whether the Process goroutine is running. The
 	// inbound callback uses this to decide whether to start (or restart)
 	// the goroutine: a returning Process (e.g. from responseDone's
@@ -319,6 +320,7 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 			" remote=", conn.RemoteAddr())
 	}
 	c.outboundConn = conn
+	c.outboundConnAtomic.Store(conn)
 	c.outboundDest = dest
 	// v26.12.43: Enlarge the kernel UDP receive buffer on the per-session
 	// outbound socket. The blocking channel send (above) means the reader
@@ -1278,9 +1280,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				// needed for the first packet (Initial) which needs SNI
 				// sniffing. Once the outbound conn is set, every subsequent
 				// short header can go direct.
-				existingConn.outboundMu.Lock()
-				oc := existingConn.outboundConn
-				existingConn.outboundMu.Unlock()
+				raw := existingConn.outboundConnAtomic.Load()
+				var oc net.Conn
+				if raw != nil {
+					oc = raw.(net.Conn)
+				}
 				if oc != nil {
 					_, err := oc.Write(b.Bytes())
 					if err != nil {
