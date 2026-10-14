@@ -182,6 +182,7 @@ type udpConn struct {
 	writer           buf.Writer
 	output           func([]byte) (int, error)
 	remote           net.Addr
+	connID           connID // v26.12.53: stored for learnSrc (IP fallback)
 	local            net.Addr
 	done             *done.Instance
 	uplink           stats.Counter
@@ -660,19 +661,63 @@ func (c *udpConn) StartCounterLogger(src string) {
 	}()
 }
 
+// v26.12.53: mostRecentConnForIP finds the most recently active
+// connection for a given client IP address. Used as a last-resort
+// fallback for 1-RTT packets with empty DCIDs arriving from a source
+// port the demux doesn't know (QUIC connection migration / new socket).
+// Returns nil if no active conn exists for that IP.
+func (w *udpWorker) mostRecentConnForIP(addr net.Address) *udpConn {
+	var best *udpConn
+	var bestTime int64
+	w.RLock()
+	for _, c := range w.activeConn {
+		if c.done.Done() || c.src == nil {
+			continue
+		}
+		// Match by IP address (not port — the port may have changed)
+		if c.src.Address == addr {
+			lat := atomic.LoadInt64(&c.lastActivityTime)
+			if lat > bestTime {
+				bestTime = lat
+				best = c
+			}
+		}
+	}
+	w.RUnlock()
+	return best
+}
+
+// v26.12.53: learnSrc registers a source port for an existing conn,
+// so future packets from that port route normally via srcIndex.
+// Called when the IP-based fallback attributes a packet to a conn
+// whose source port differs from the packet's source port.
+func (c *udpConn) learnSrc(srcKey srcKey) {
+	if c.worker == nil {
+		return
+	}
+	c.worker.Lock()
+	// Don't overwrite if another conn already owns this srcKey
+	if _, exists := c.worker.srcIndex[srcKey]; !exists {
+		c.worker.srcIndex[srcKey] = c.connID
+	}
+	c.worker.Unlock()
+}
+
 // v26.12.49: GetWorkerDrops returns worker-level inbound drop counters.
-func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused, selfDialDropped int64) {
-	return w.cntShortDrop.Load(), w.cntFallbackRefused.Load(), w.cntSelfDialDropped.Load()
+func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused, selfDialDropped, attributedFallback int64) {
+	return w.cntShortDrop.Load(), w.cntFallbackRefused.Load(), w.cntSelfDialDropped.Load(),
+		w.cntAttributedFallback.Load()
 }
 
 // v26.12.49: LogWorkerDrops logs worker-level drop counters periodically.
 func (w *udpWorker) LogWorkerDrops() {
-	sd, fr, sdd := w.GetWorkerDrops()
-	if sd > 0 || fr > 0 || sdd > 0 {
+	sd, fr, sdd, af := w.GetWorkerDrops()
+	if sd > 0 || fr > 0 || sdd > 0 || af > 0 {
 		errors.LogWarning(context.Background(),
 			"DIAG WORKER DROPS shortDrop=", sd,
 			" fallbackRefused=", fr,
 			" selfDialDropped=", sdd,
+			" ipFallback=", af,
 			" tag=", w.tag)
 	}
 }
@@ -946,6 +991,10 @@ type udpWorker struct {
 	cntFallbackRefused atomic.Int64
 	// v26.12.50: Self-dial drops (127.0.0.1 on our own port).
 	cntSelfDialDropped atomic.Int64
+	// v26.12.53: Packets routed via client-IP fallback (empty DCID +
+	// unknown source port). These are 1-RTT packets from a migrated
+	// source port that the demux can't identify by CID or by port.
+	cntAttributedFallback atomic.Int64
 
 	ctx  context.Context
 	cone bool
@@ -1009,7 +1058,8 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		uplink:   w.uplinkCounter,
 		downlink: w.downlinkCounter,
 		src:      &srcCopy,
-		worker:   w, // v26.12.39: back-reference for shared socket
+		connID:   id, // v26.12.53: stored for learnSrc (IP fallback)
+		worker:   w,  // v26.12.39: back-reference for shared socket
 	}
 	conn.output = func(b []byte) (int, error) {
 		// Snapshot src under w.Lock() so we race-free against
@@ -1154,13 +1204,42 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		}
 		w.RUnlock()
 
-		// v26.11.120: DROP short headers that miss BOTH DCID and srcIndex.
-		// v26.12.38-link: Log the drop so we can see if 1-RTT packets
-		// are being silently dropped at the DCID/srcIndex transition.
+		// v26.11.120: Short headers that miss BOTH DCID and srcIndex.
+		// v26.12.38-link: Log the drop.
 		// v26.12.49: Count it.
+		// v26.12.53: Before dropping, try the client-IP fallback.
+		//   The user's original diagnosis was right: Chrome sends 1-RTT
+		//   packets with an empty DCID (DCID=0). When the source port
+		//   is also unknown (migration / new socket), the demux has
+		//   nothing to route by — and dropping kills the connection
+		//   at the exact moment Chrome switches to 1-RTT.
+		//   Fix: attribute to the most recently active conn for this
+		//   client IP, and learn the new source port so future packets
+		//   route normally via srcIndex.
+		dcidLen := 0
+		if d, _, e := quic.ParseDCID(b.Bytes()); e == nil {
+			dcidLen = len(d)
+		}
+		if conn := w.mostRecentConnForIP(source.Address); conn != nil {
+			// Attribute this packet to the most recent conn for this IP.
+			// learnSrc teaches the demux this source port so future
+			// packets route normally without needing the fallback.
+			conn.learnSrc(id.srcKey)
+			conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+			conn.updateActivity()
+			w.cntAttributedFallback.Add(1)
+			errors.LogWarning(context.Background(),
+				"DIAG: short header ATTRIBUTED via IP fallback src=", source,
+				" dcidLen=", dcidLen,
+				" -> conn src=", conn.src)
+			return
+		}
+		// No conn found for this IP — genuine unknown packet. Drop it.
 		w.cntShortDrop.Add(1)
 		errors.LogWarning(context.Background(),
-			"DIAG: short header DROPPED src=", source)
+			"DIAG: short header DROPPED src=", source,
+			" dcidLen=", dcidLen,
+			" firstByte=", b.Bytes()[0])
 		b.Release()
 		return
 	}
