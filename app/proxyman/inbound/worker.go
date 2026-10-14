@@ -297,6 +297,27 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 	}
 	c.outboundConn = conn
 	c.outboundDest = dest
+	// v26.12.43: Enlarge the kernel UDP receive buffer on the per-session
+	// outbound socket. The blocking channel send (above) means the reader
+	// goroutine now applies backpressure when sessionReplyCh is full; the
+	// kernel buffer absorbs the burst during that window. Without this,
+	// the kernel itself becomes the dropper when the channel is full,
+	// reproducing the same collapse one layer down. Default kernel
+	// rmem_max on many distros is 212992 (~208 KB) — try 4 MB, the kernel
+	// silently clamps to rmem_max if it's smaller. Run `sysctl -w
+	// net.core.rmem_max=4194304` to allow the full 4 MB.
+	type readBufferSetter interface {
+		SetReadBuffer(int) error
+	}
+	if rbs, ok := conn.(readBufferSetter); ok {
+		if err := rbs.SetReadBuffer(4 * 1024 * 1024); err != nil {
+			errors.LogWarning(context.Background(),
+				"DIAG: SetReadBuffer(4MB) failed: ", err)
+		} else {
+			errors.LogInfo(context.Background(),
+				"DIAG: SetReadBuffer(4MB) ok local=", conn.LocalAddr())
+		}
+	}
 	// v26.12.39: Also store in the worker's shared socket map so future
 	// QUIC connections from the same client to the same server reuse
 	// this socket (stable source port, no migration detection).
@@ -345,9 +366,15 @@ func (c *udpConn) EnsureSessionReader() {
 		return
 	}
 
-	// Initialize channels if needed
+	// Initialize channels if needed.
+	// v26.12.43: Enlarged from 1024 to 8192 to absorb Google's burst rate
+	// (observed 2260 pkt/s = 22 Mbit/s during ramp-up). 1024 slots = 450 ms
+	// headroom at burst rate; 8192 = 3.6 s. Combined with blocking send
+	// (below) and a 4 MB kernel receive buffer, this should drop to zero
+	// during normal QUIC ramp-ups. The previous 1024-slot channel overflowed
+	// in 5 seconds and dropped 1574 packets, collapsing QUIC's cwnd.
 	if c.sessionReplyCh == nil {
-		c.sessionReplyCh = make(chan []byte, 1024)
+		c.sessionReplyCh = make(chan []byte, 8192)
 	}
 	if c.sessionReaderDn == nil {
 		c.sessionReaderDn = make(chan struct{})
@@ -418,13 +445,21 @@ func (c *udpConn) EnsureSessionReader() {
 					c.registerServerCID(scid)
 				}
 			}
+			// v26.12.43: THE FIX. Removed the `default:` drop path.
+			// A relay must never drop a QUIC packet — losing ~5% of
+			// packets during Google's natural ramp-up bursts collapses
+			// QUIC's congestion window, producing a permanent ~50 KB/s
+			// limit cycle (observed: 1574 drops in 5 s at 2260 pkt/s,
+			// then sockRead collapsed to ~1/s and never recovered).
+			// The blocking send applies backpressure to the reader
+			// goroutine; the kernel's UDP receive buffer absorbs the
+			// burst. If the kernel buffer overflows, that's real path
+			// congestion and QUIC's loss signalling handles it — which
+			// is the correct behaviour, not a relay-induced collapse.
 			select {
 			case c.sessionReplyCh <- pkt:
 			case <-dn:
 				return
-			default:
-				c.cntChDrop.Add(1)
-				errors.LogDebug(context.Background(), "sticky: session reply channel full, dropping packet")
 			}
 		}
 	}()
