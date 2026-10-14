@@ -1288,13 +1288,21 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			w.RUnlock()
 		}
 
-		// v26.12.65: Don't drop — fall through to getConnection.
-		// RFC 9312 §4.5: dropping mid-connection packets is 'particularly
-		// unwise' and causes 'slow and costly timeouts'. A short header
-		// from an unknown port means Chrome opened a new QUIC connection.
-		// Let getConnection create a new conn — the sharedSockets mechanism
-		// will give it an outbound socket, and the flow proceeds.
-		// (Previously this was a drop, causing shortDropNoConn=41+.)
+		// v26.12.66: Re-add the drop. v26.12.65's fall-through to
+		// getConnection created a self-dial storm: short headers can't
+		// be sniffed for SNI, so the new conn gets 127.0.0.1:443 as
+		// destination → self-dial guard drops it → Process returns after
+		// ~22ms → Chrome retransmits → loop. Port :41251 sent dozens of
+		// these in a few seconds.
+		//
+		// RFC 9312 §4.5's concern about 'drop then timeout' doesn't apply
+		// here: these packets were never part of an established flow
+		// through the proxy. Dropping is correct — Chrome will retransmit
+		// the Initial, which DOES have a SNI, and the connection will be
+		// established properly.
+		w.cntShortDropNoConn.Add(1)
+		b.Release()
+		return
 	}
 	// Try QUIC DCID-based migration lookup before creating a new conn
 	if migratedConn := w.tryQUICMigration(b.Bytes(), id); migratedConn != nil {
