@@ -1232,12 +1232,46 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			if existingID, found := w.dcidIndex[dk]; found {
 				if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
 					w.RUnlock()
+					// v26.12.58: Bind the source port so future packets
+					// from this port go through the fast path (srcIndex),
+					// which handles CID rotation. Without this, every
+					// packet from a new port does a DCID lookup, and
+					// CID rotation registration (which only fires when
+					// the port is known) never runs → rotated CIDs
+					// are never registered → the next rotation kills
+					// the connection.
+					existingConn.learnSrc(id.srcKey)
 					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 					existingConn.updateActivity()
 					return
 				}
 			}
 			w.RUnlock()
+			// v26.12.58: Also try other known CID lengths. The default
+			// is 8 (Chrome/Firefox/Safari), but some servers use
+			// different lengths. If the default lookup missed, try
+			// each known length before giving up.
+			for _, cidLen := range []int{4, 8, 8, 8, 8} {
+				if cidLen == 8 {
+					continue // already tried above
+				}
+				if 1+cidLen > len(b.Bytes()) {
+					continue
+				}
+				altDcid := b.Bytes()[1 : 1+cidLen]
+				altDk := makeDCIDKey(altDcid)
+				w.RLock()
+				if existingID, found := w.dcidIndex[altDk]; found {
+					if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+						w.RUnlock()
+						existingConn.learnSrc(id.srcKey)
+						existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+						existingConn.updateActivity()
+						return
+					}
+				}
+				w.RUnlock()
+			}
 		}
 
 		// v26.12.41-link: DCID miss — fall back to srcIndex ONLY when
