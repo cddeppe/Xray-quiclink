@@ -470,8 +470,16 @@ drainDone:
 			}
 			if !loggedStart {
 				loggedStart = true
+				// v26.12.46: Include client source port so reader START can be
+				// correlated with DIAG COUNTERS src=udp:... lines. Without this,
+				// there's no way to match a reader START to a specific connection.
+				var srcStr string
+				if c.src != nil {
+					srcStr = c.src.String()
+				}
 				errors.LogWarning(context.Background(),
-					"DIAG: reader START local=", oc.LocalAddr(),
+					"DIAG: reader START src=", srcStr,
+					" local=", oc.LocalAddr(),
 					" remote=", oc.RemoteAddr())
 			}
 			// v26.12.44: Set a 1-second read deadline so oc.Read() can't
@@ -543,20 +551,32 @@ drainDone:
 					c.registerServerCID(scid)
 				}
 			}
-			// v26.12.43: THE FIX. Removed the `default:` drop path.
-			// A relay must never drop a QUIC packet — losing ~5% of
-			// packets during Google's natural ramp-up bursts collapses
-			// QUIC's congestion window, producing a permanent ~50 KB/s
-			// limit cycle (observed: 1574 drops in 5 s at 2260 pkt/s,
-			// then sockRead collapsed to ~1/s and never recovered).
-			// The blocking send applies backpressure to the reader
-			// goroutine; the kernel's UDP receive buffer absorbs the
-			// burst. If the kernel buffer overflows, that's real path
-			// congestion and QUIC's loss signalling handles it — which
-			// is the correct behaviour, not a relay-induced collapse.
+			// v26.12.43: Removed the `default:` drop path — a relay must
+			// never silently drop a QUIC packet.
+			// v26.12.46: THE DEADLOCK FIX. v26.12.43's blocking send
+			// traded a drop for a deadlock: if the consumer (responseDone →
+			// sessionReplyReader) exits, the channel fills to capacity and
+			// the reader blocks on the next send forever. sockRead freezes
+			// at a non-zero value, chDrop=0, sockErr=0, no reader EXIT —
+			// a clean-looking black hole. The kernel buffer then fills,
+			// Google sees loss, and the connection collapses silently.
+			//
+			// Fix: bounded block. If the channel stays full for 5 seconds,
+			// the consumer is dead. Log it, exit the reader (which sets
+			// sessionReaderAlive=false via defer), and let EnsureSessionReader
+			// restart it when a new consumer appears. The 5s bound is
+			// generous — a live consumer draining at even 10 pkt/s would
+			// never trigger it. Only a dead consumer does.
 			select {
 			case c.sessionReplyCh <- pkt:
 			case <-dn:
+				return
+			case <-time.After(5 * time.Second):
+				errors.LogWarning(context.Background(),
+					"DIAG: reader BLOCKED on full channel 5s, exiting. depth=",
+					len(c.sessionReplyCh),
+					" sockRead=", c.cntSockRead.Load(),
+					" src=", c.src)
 				return
 			}
 		}
