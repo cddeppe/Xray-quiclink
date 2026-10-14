@@ -308,3 +308,56 @@ All features are controlled via environment variables for easy deployment:
 - Pool staleness check: 30 seconds (silently dropped connections)
 - Idle reaper: 10 minutes (no replies) / 5 minutes (refCount=0)
 - UDP worker timeout: 30 minutes (was 2 minutes in stock xray)
+
+## v26.12.43 — THE BREAKTHROUGH: chDrop=1574 (root cause of QUIC stalling)
+
+### The two-day mystery
+
+YouTube Shorts (and any bursty QUIC flow) stalled permanently at ~50 KB/s after an initial burst, while regular long videos played fine. The v26.12.41 SCID registration fix had made regular QUIC work, but Shorts specifically still collapsed.
+
+### Root cause (found in the counter logs)
+
+```
+09:34:34  sockRead=19160  chDrop=0     replyOut=19160
+09:34:39  sockRead=30459  chDrop=1574  replyOut=28885
+09:34:44  sockRead=31965  chDrop=1574  replyOut=30391
+09:34:54  sockRead=31989  chDrop=1574  replyOut=30415
+```
+
+Between 09:34:34 and 09:34:39, `sockRead` went +11299 in 5 s — **2260 packets/s, about 22 Mbit/s**. Google was ramping up normally. The 1024-slot `sessionReplyCh` couldn't absorb the burst, the reader goroutine dropped 1574 packets via a `default:` clause, and QUIC saw a 5% burst loss. After that, `sockRead` collapses from 2260/s to ~100/s, then to ~1/s — **it never recovers**.
+
+`replyOut` is exactly 1574 behind `sockRead` (31989 − 30415 = 1574), proving this was the only loss path. `sockErr=0` throughout.
+
+The dropped line:
+
+```go
+select {
+case c.sessionReplyCh <- pkt:
+case <-dn:
+    return
+default:                       // ← full channel: packet discarded
+    c.cntChDrop.Add(1)
+    errors.LogDebug(ctx, "sticky: session reply channel full, dropping packet")
+}
+```
+
+This was the exact line flagged in the first code review ("the one loss path in this file with no observability"). The counter was added; it read 0 in every window observed until now, because nothing had burst yet. `chDrop` was the metric that mattered all along.
+
+Every subsequent QUIC recovery attempt ramped again, re-overflowed the channel, re-dropped packets → a permanent ~50 KB/s limit cycle.
+
+### The fix — a relay must never be the thing that drops
+
+1. **Remove the `default:` drop.** Make the channel send **blocking** so the reader applies backpressure instead of discarding QUIC packets. Losing a packet inside the proxy is worse than a momentarily blocked reader.
+2. **Enlarge `sessionReplyCh` 1024 → 8192** (3.6 s headroom at burst rate, vs 450 ms before).
+3. **`SetReadBuffer(4 MB)` on the per-session outbound UDP socket** so the kernel absorbs the burst while the reader is blocked. The kernel silently clamps to `net.core.rmem_max` — run `sysctl -w net.core.rmem_max=4194304` to allow the full 4 MB. (Before this, NO socket in the codebase had `SetReadBuffer` — neither the pool socket nor the per-session socket.)
+
+**A relay's only acceptable loss is genuine path loss.** Anything else converts the sender's natural ramp-up into a self-induced congestion collapse.
+
+### Why `sockRead == replyOut` fooled us for hours
+
+That equality held in the early, low-rate phases when nothing had been dropped. It was checked before the divergence. `chDrop` was the counter that mattered, and it was 0 in every window seen until the burst.
+
+### Lesson
+
+The counter existed. The drop was logged at Debug level. The review flagged it as the only loss path. And it still took two days, because every observed window happened to be before the burst. **Watch `chDrop` as the primary metric. Treat any `sockRead − replyOut > chDrop` divergence as an alarm.**
+
