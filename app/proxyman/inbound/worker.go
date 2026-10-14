@@ -592,17 +592,27 @@ drainDone:
 			// restart it when a new consumer appears. The 5s bound is
 			// generous — a live consumer draining at even 10 pkt/s would
 			// never trigger it. Only a dead consumer does.
-			select {
-			case c.sessionReplyCh <- pkt:
-			case <-dn:
-				return
-			case <-time.After(5 * time.Second):
-				errors.LogWarning(context.Background(),
-					"DIAG: reader BLOCKED on full channel 5s, exiting. depth=",
-					len(c.sessionReplyCh),
-					" sockRead=", c.cntSockRead.Load(),
-					" src=", c.src)
-				return
+			// v26.12.67: Direct write to client, bypassing sessionReplyCh.
+			c.cntReplyOut.Add(1)
+			c.cntWriteBytes.Add(int64(len(pkt)))
+			c.cntWriteHash.Add(int64(crc32.ChecksumIEEE(pkt)))
+			_, werr := c.output(pkt)
+			if werr != nil {
+				c.cntWriteErr.Add(1)
+				select {
+				case c.sessionReplyCh <- pkt:
+				case <-dn:
+					return
+				case <-time.After(5 * time.Second):
+					errors.LogWarning(context.Background(),
+						"DIAG: reader BLOCKED on full channel 5s, exiting. depth=",
+						len(c.sessionReplyCh),
+						" sockRead=", c.cntSockRead.Load(),
+						" src=", c.src)
+					return
+				}
+			} else {
+				c.updateActivity()
 			}
 		}
 	}()
@@ -1259,6 +1269,31 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
 				w.RUnlock()
 				w.cntSrcHit.Add(1)
+				// v26.12.67: Direct write — bypass pipe/Process for short
+				// headers when the outbound conn is available. This cuts the
+				// per-packet path from 6 hops (Hub→channel→callback→pipe→
+				// Process→PacketWriter→socket) to 3 (Hub→channel→callback→
+				// outboundConn.Write→kernel). The pipe/Process path is only
+				// needed for the first packet (Initial) which needs SNI
+				// sniffing. Once the outbound conn is set, every subsequent
+				// short header can go direct.
+				existingConn.outboundMu.Lock()
+				oc := existingConn.outboundConn
+				existingConn.outboundMu.Unlock()
+				if oc != nil {
+					_, err := oc.Write(b.Bytes())
+					if err != nil {
+						// Direct write failed — fall back to pipe path
+						existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+					} else {
+						existingConn.IncReqSentBy(1)
+						existingConn.updateActivity()
+						b.Release()
+					}
+					return
+				}
+				// No outbound conn yet (first packet still in flight) —
+				// use the pipe path
 				existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 				existingConn.updateActivity()
 				return
