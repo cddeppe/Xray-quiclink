@@ -992,22 +992,12 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
-	// v26.12.47: Loopback guard — matches the TCP worker's guard at line 89.
-	// If the packet's destination is the proxy's own listen address, or
-	// loopback, drop it. Without this, a UDP packet that gets sniffed and
-	// re-routed to 127.0.0.1:443 creates an infinite recursion: each
-	// recursion manufactures a dead connection (sockRead=0, reqSent=5).
-	if originalDest.IsValid() {
-		destIP := originalDest.Address.IP()
-		if destIP.IsLoopback() || destIP.IsUnspecified() {
-			errors.LogWarning(context.Background(),
-				"DIAG: udpWorker DROPPING loopback dest=", originalDest,
-				" src=", source)
-			b.Release()
-			return
-		}
-		// Also check if dest matches our own hub address
-		if w.hub != nil && w.hub.Addr().String() == originalDest.NetAddr() {
+	// v26.12.48: NARROWED loopback guard. v26.12.47's broad guard
+	// dropped DNS traffic to 127.0.0.1:53 (legitimate). Now only drop
+	// if the destination matches the hub's own address — the exact same
+	// check the TCP worker uses at line 96. DNS on :53 is unaffected.
+	if originalDest.IsValid() && w.hub != nil {
+		if w.hub.Addr().String() == originalDest.NetAddr() {
 			errors.LogWarning(context.Background(),
 				"DIAG: udpWorker DROPPING self-loop dest=", originalDest,
 				" src=", source)

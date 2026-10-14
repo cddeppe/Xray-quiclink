@@ -467,35 +467,22 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		}
 	}
 
-	// v26.12.47: Loopback guard. If the destination is 127.0.0.1, ::1, or
-	// any local interface address, DROP the packet instead of dialing.
-	// This prevents the proxy from dialing itself — which creates an
-	// infinite recursion: the Initial arrives at the VPS's own :443,
-	// gets sniffed, and routes again. Each recursion manufactures a dead
-	// connection that sends a handful of packets, receives nothing, and
-	// is abandoned — exactly the sockRead=0, reqSent=5 signature.
+	// v26.12.48: NARROWED loopback guard. v26.12.47's broad guard
+	// was dropping DNS traffic to 127.0.0.1:53 (a legitimate loopback
+	// destination — the local resolver). The actual bug is narrower:
+	// only drop if the destination matches the proxy's OWN listen
+	// address (the inbound's Local address). That's the self-dial
+	// recursion case — the Initial arrives at the VPS's own :443, gets
+	// sniffed, and routes again.
 	//
-	// This happens when the SNI sniffer hasn't produced a destination
-	// yet (first QUIC Initial) and the dispatcher falls back to a
-	// loopback destination. Dropping is correct: QUIC will retransmit
-	// the Initial, the sniffer gets another chance, and the next attempt
-	// will have a real destination.
-	//
-	// v26.12.24 fixed this but v26.12.25 reverted it. This restores the
-	// guard, now with a counter and logging so we can measure how often
-	// it fires.
-	if destination.Address.Family().IsIP() {
-		destIP := destination.Address.IP()
-		isLoop := false
-		if destIP.IsLoopback() {
-			isLoop = true
-		} else if destIP.IsUnspecified() {
-			// 0.0.0.0 or :: — also not a real destination
-			isLoop = true
-		}
-		if isLoop {
-			errors.LogWarning(ctx, "freedom: DROPPING loopback destination ",
-				destination, " — sniffer hasn't resolved SNI yet, waiting for retransmit")
+	// DNS on 127.0.0.1:53 must NOT be dropped — it's a real destination.
+	// The distinction: :53 loopback is a destination; :443-on-our-own-
+	// address loopback is a routing failure.
+	if inbound != nil && inbound.Local.IsValid() && destination.Network == inbound.Local.Network {
+		if destination.Address == inbound.Local.Address && destination.Port == inbound.Local.Port {
+			errors.LogWarning(ctx, "freedom: DROPPING self-loop destination ",
+				destination, " (matches inbound local ", inbound.Local,
+				") — sniffer hasn't resolved SNI yet, waiting for retransmit")
 			return nil
 		}
 	}
