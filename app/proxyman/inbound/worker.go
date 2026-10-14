@@ -224,12 +224,13 @@ type udpConn struct {
 	// DCID demux can't route replies. Each udpConn gets its own socket,
 	// reader goroutine, and replyCh. The socket survives Process restarts.
 	// Only clean() closes it.
-	sessionSocket     stdnet.PacketConn
-	sessionReplyCh    chan []byte
-	sessionReaderDn   chan struct{}
-	sessionReaderOnce sync.Once
-	sessionSocketDest net.Destination
-	sessionSocketMu   sync.Mutex
+	sessionSocket      stdnet.PacketConn
+	sessionReplyCh     chan []byte
+	sessionReaderDn    chan struct{}
+	sessionReaderMu    sync.Mutex
+	sessionReaderAlive bool
+	sessionSocketDest  net.Destination
+	sessionSocketMu    sync.Mutex
 }
 
 func (c *udpConn) setInactive() {
@@ -275,64 +276,103 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 }
 
 // v26.12.27: EnsureSessionReader starts a permanent reader goroutine.
-// Idempotent via sync.Once. Reads from outboundConn (the persisted UDP
-// socket) into sessionReplyCh. Runs for the lifetime of udpConn — never
-// installed/removed per Process.
-// v26.12.29-link: FIXED — reader was reading from sessionSocket (never set).
-// Now reads from outboundConn (set by SetOutboundConn in freedom.go).
-// Uses Read() not ReadFrom() because outboundConn is a connected UDP socket.
+// v26.12.35-link: REMOVED sync.Once — made reader restartable. The old
+// sync.Once meant the goroutine could die permanently (when SetOutboundConn
+// closed the old socket on CDN rotation) and never restart. Now each call
+// checks if the reader is alive and starts a new one if not.
+// v26.12.29-link: reads from outboundConn (set by SetOutboundConn).
 func (c *udpConn) EnsureSessionReader() {
-	c.sessionReaderOnce.Do(func() {
+	c.sessionReaderMu.Lock()
+	defer c.sessionReaderMu.Unlock()
+
+	// Already running — don't start a second one
+	if c.sessionReaderAlive {
+		return
+	}
+
+	// Initialize channels if needed
+	if c.sessionReplyCh == nil {
 		c.sessionReplyCh = make(chan []byte, 1024)
+	}
+	if c.sessionReaderDn == nil {
 		c.sessionReaderDn = make(chan struct{})
-		go func() {
-			buf := make([]byte, 65535)
-			for {
+	}
+
+	c.sessionReaderAlive = true
+	dn := c.sessionReaderDn
+
+	go func() {
+		defer func() {
+			c.sessionReaderMu.Lock()
+			c.sessionReaderAlive = false
+			c.sessionReaderMu.Unlock()
+		}()
+
+		b := make([]byte, 65535)
+		for {
+			select {
+			case <-dn:
+				return
+			default:
+			}
+			c.outboundMu.Lock()
+			oc := c.outboundConn
+			c.outboundMu.Unlock()
+			if oc == nil {
+				// Socket not set yet — wait and retry instead of dying
 				select {
-				case <-c.sessionReaderDn:
+				case <-dn:
 					return
-				default:
-				}
-				// Read from outboundConn (set by SetOutboundConn).
-				c.outboundMu.Lock()
-				oc := c.outboundConn
-				c.outboundMu.Unlock()
-				if oc == nil {
-					return
-				}
-				n, err := oc.Read(buf)
-				if err != nil {
-					select {
-					case <-c.sessionReaderDn:
-						return
-					default:
-					}
-					var errno syscall.Errno
-					if stderrors.As(err, &errno) {
-						switch errno {
-						case syscall.EAGAIN, syscall.ENOMEM, syscall.ENOBUFS,
-							syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNREFUSED:
-							continue
-						}
-					}
-					return
-				}
-				pkt := make([]byte, n)
-				copy(pkt, buf[:n])
-				select {
-				case c.sessionReplyCh <- pkt:
-				case <-c.sessionReaderDn:
-					return
-				default:
+				case <-time.After(100 * time.Millisecond):
+					continue
 				}
 			}
-		}()
-	})
+			n, err := oc.Read(b)
+			if err != nil {
+				select {
+				case <-dn:
+					return
+				default:
+				}
+				var errno syscall.Errno
+				if stderrors.As(err, &errno) {
+					switch errno {
+					case syscall.EAGAIN, syscall.ENOMEM, syscall.ENOBUFS,
+						syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ECONNREFUSED:
+						continue
+					}
+				}
+				// Socket was closed (e.g. SetOutboundConn replacing it).
+				// Don't die — wait for a new socket, then the next
+				// EnsureSessionReader call or Process restart will re-enter.
+				// Actually, since we set sessionReaderAlive=false in defer,
+				// the next EnsureSessionReader call WILL restart us.
+				return
+			}
+			pkt := make([]byte, n)
+			copy(pkt, b[:n])
+			select {
+			case c.sessionReplyCh <- pkt:
+			case <-dn:
+				return
+			default:
+				// Channel full — drop packet (QUIC retransmits)
+				errors.LogDebug(context.Background(), "sticky: session reply channel full, dropping packet")
+			}
+		}
+	}()
 }
 
 // v26.12.27: ReadSessionReply returns one reply packet from the permanent
 // reader goroutine. Called by freedom.Process's responseDone.
+// v26.12.35-link: guard against nil channels — return false instead of
+// hanging forever if reader was never started or died.
 func (c *udpConn) ReadSessionReply() ([]byte, bool) {
+	ch := c.sessionReplyCh
+	dn := c.sessionReaderDn
+	if ch == nil || dn == nil {
+		return nil, false
+	}
 	select {
 	case pkt, ok := <-c.sessionReplyCh:
 		return pkt, ok

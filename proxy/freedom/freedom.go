@@ -632,6 +632,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				existingConn := udpConn.GetOutboundConn()
 				if existingConn != nil {
 					conn = existingConn
+					// v26.12.35: Also call EnsureSessionReader on restart.
+					// If the reader died (socket replacement), this restarts it.
+					udpConn.EnsureSessionReader()
 					errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
 				} else {
 					// v26.12.27: Persist conn + start permanent reader goroutine.
