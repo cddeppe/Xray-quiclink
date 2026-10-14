@@ -753,6 +753,7 @@ func (c *udpConn) learnSrc(srcKey srcKey) {
 	// Don't overwrite if another conn already owns this srcKey
 	if _, exists := c.worker.srcIndex[srcKey]; !exists {
 		c.worker.srcIndex[srcKey] = c.connID
+		c.worker.cntPortLearned.Add(1)
 	}
 	c.worker.Unlock()
 }
@@ -770,25 +771,32 @@ func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused, selfDialDroppe
 }
 
 // v26.12.59: GetRoutingCounts returns per-routing-method counters.
-func (w *udpWorker) GetRoutingCounts() (srcHit, cidHit, cidHitAlt, ipFallback, fallbackRefusedMulti, shortDropNoConn, newConnFromShort int64) {
+func (w *udpWorker) GetRoutingCounts() (srcHit, cidHit, cidHitAlt, ipFallback, fallbackRefusedMulti, shortDropNoConn, newConnFromShort, pktIn, longHdr, portLearned int64) {
 	return w.cntSrcHit.Load(), w.cntCidHit.Load(), w.cntCidHitAlt.Load(),
 		w.cntIpFallback.Load(), w.cntFallbackRefusedMulti.Load(),
-		w.cntShortDropNoConn.Load(), w.cntNewConnFromShort.Load()
+		w.cntShortDropNoConn.Load(), w.cntNewConnFromShort.Load(),
+		w.cntPktIn.Load(), w.cntLongHdr.Load(), w.cntPortLearned.Load()
 }
 
 // v26.12.49: LogWorkerDrops logs worker-level drop counters periodically.
 func (w *udpWorker) LogWorkerDrops() {
 	sd, fr, sdd, af := w.GetWorkerDrops()
-	sh, ch, cha, ipf, frm, sdn, ncs := w.GetRoutingCounts()
-	if sd > 0 || fr > 0 || sdd > 0 || af > 0 || sh > 0 || ch > 0 || cha > 0 || ipf > 0 || frm > 0 || sdn > 0 || ncs > 0 {
+	sh, ch, cha, ipf, frm, sdn, ncs, pi, lh, pl := w.GetRoutingCounts()
+	identityCheck := sh + ch + cha + ipf + frm + sdn + ncs + lh
+	bal := pi - identityCheck
+	if sd > 0 || fr > 0 || sdd > 0 || af > 0 || pi > 0 {
 		errors.LogWarning(context.Background(),
-			"DIAG ROUTING srcHit=", sh,
+			"DIAG ROUTING pktIn=", pi,
+			" longHdr=", lh,
+			" srcHit=", sh,
 			" cidHit=", ch,
 			" cidHitAlt=", cha,
 			" ipFallback=", ipf,
 			" fbRefusedMulti=", frm,
 			" shortDropNoConn=", sdn,
 			" newConnFromShort=", ncs,
+			" portLearned=", pl,
+			" unbalanced=", bal,
 			" tag=", w.tag)
 	}
 }
@@ -1085,6 +1093,10 @@ type udpWorker struct {
 	cntFallbackRefusedMulti atomic.Int64 // IP fallback refused (multi-conn) — was never incremented before v26.12.59
 	cntShortDropNoConn      atomic.Int64 // dropped: no conn found for this IP
 	cntNewConnFromShort     atomic.Int64 // invisible path: short header created a NEW conn (orphaned 1-RTT re-homed)
+	// v26.12.60: Identity-check counters.
+	cntPktIn       atomic.Int64 // every UDP packet entering callback
+	cntLongHdr     atomic.Int64 // long-header packets (Initials etc)
+	cntPortLearned atomic.Int64 // learnSrc actually inserted a new key
 
 	ctx  context.Context
 	cone bool
@@ -1175,6 +1187,10 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
+	w.cntPktIn.Add(1)
+	if pb := b.Bytes(); len(pb) > 0 && pb[0]&0x80 != 0 {
+		w.cntLongHdr.Add(1)
+	}
 	// v26.12.50: Self-dial guard. A destination of 127.0.0.1 on this
 	// inbound's own listen port means the sniffer hasn't produced a
 	// destination yet and dokodemo's !FollowRedirect placeholder leaked
