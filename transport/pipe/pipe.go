@@ -2,7 +2,6 @@ package pipe
 
 import (
 	"context"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/signal/done"
@@ -30,16 +29,6 @@ func WithSizeLimit(limit int32) Option {
 func DiscardOverflow() Option {
 	return func(opt *pipeOption) {
 		opt.discardOverflow = true
-	}
-}
-
-// WithOverflowCounter returns an Option that increments the given counter
-// each time a write is discarded due to overflow. This is the one uncounted
-// drop path on the request direction — without it, the pipe can silently
-// eat client ACKs while every other counter reads clean.
-func WithOverflowCounter(counter *atomic.Int64) Option {
-	return func(opt *pipeOption) {
-		opt.overflowCounter = counter
 	}
 }
 

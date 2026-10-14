@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 	stderrors "errors"
-	"hash/crc32"
 	stdnet "net"
 	"sync"
 	"syscall"
@@ -237,35 +236,6 @@ type udpConn struct {
 	sessionReaderAlive bool
 	sessionSocketDest  net.Destination
 	sessionSocketMu    sync.Mutex
-
-	// v26.12.36-link: Diagnostic counters for the QUIC reply path.
-	// Logged every 5 seconds by the counter logger goroutine.
-	// These tell us exactly which segment of the reply path dies.
-	cntSockRead atomic.Int64 // packets read from Google's socket
-	cntSockErr  atomic.Int64 // read errors (socket closed, etc.)
-	cntChDrop   atomic.Int64 // packets dropped (channel full)
-	cntReplyOut atomic.Int64 // packets written to Chrome (udpConn.Write)
-	// v26.12.55: Write errors — hub.WriteTo failed (NAT expiry, etc).
-	// replyOut counts BEFORE the write; these count failures AFTER.
-	// If replyOut > writeErr but sockRead freezes, the client isn't
-	// receiving → Google sees loss → cwnd collapses → video stalls.
-	cntWriteErr atomic.Int64
-	// v26.12.57: Content integrity check. Running hash of all bytes
-	// at two points: (1) socket read in reader goroutine, (2) udpConn.Write
-	// entry before SplitCoalesced. If readBytes == writeBytes but
-	// readHash != writeHash, data was corrupted between read and write.
-	cntReadBytes  atomic.Int64
-	cntReadHash   atomic.Int64 // sum of CRC32 of each packet read
-	cntWriteBytes atomic.Int64
-	cntWriteHash  atomic.Int64 // sum of CRC32 of each packet written
-	cntReqSent    atomic.Int64 // packets Chrome->Google (via PacketWriter)
-	// v26.12.52: Inbound pipe overflow drops.
-	cntPipeDrop *atomic.Int64 // pointer to local pipeDropCounter
-	// v26.12.54: Silent drops inside PacketWriter.WriteMultiBuffer.
-	cntNilAddr           atomic.Int64
-	cntRuleBlock         atomic.Int64
-	cntResolveFail       atomic.Int64
-	cntSystemResolveFail atomic.Int64
 }
 
 func (c *udpConn) setInactive() {
@@ -303,21 +273,11 @@ func (c *udpConn) GetOutboundConn() net.Conn {
 func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 	c.outboundMu.Lock()
 	defer c.outboundMu.Unlock()
-	// v26.12.37-link: Log socket replacement. If the socket changes
-	// mid-connection, Google sees QUIC connection migration (source
-	// port/IP changed) → path validation → silent death. This log line
-	// tells us if that's happening.
-	replacing := c.outboundConn != nil && c.outboundConn != conn
-	if replacing {
-		errors.LogWarning(context.Background(),
-			"DIAG: SetOutboundConn REPLACING socket old=", c.outboundConn.LocalAddr(),
-			"->", c.outboundConn.RemoteAddr(),
-			" new=", conn.LocalAddr(), "->", conn.RemoteAddr())
+	// v26.12.37-link: If the socket changes mid-connection, Google sees
+	// QUIC connection migration (source port/IP changed) → path validation
+	// → silent death. Close any prior conn that isn't this one.
+	if c.outboundConn != nil && c.outboundConn != conn {
 		c.outboundConn.Close()
-	} else {
-		errors.LogInfo(context.Background(),
-			"DIAG: SetOutboundConn installing socket local=", conn.LocalAddr(),
-			" remote=", conn.RemoteAddr())
 	}
 	c.outboundConn = conn
 	c.outboundConnAtomic.Store(conn)
@@ -335,13 +295,7 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 		SetReadBuffer(int) error
 	}
 	if rbs, ok := conn.(readBufferSetter); ok {
-		if err := rbs.SetReadBuffer(4 * 1024 * 1024); err != nil {
-			errors.LogWarning(context.Background(),
-				"DIAG: SetReadBuffer(4MB) failed: ", err)
-		} else {
-			errors.LogInfo(context.Background(),
-				"DIAG: SetReadBuffer(4MB) ok local=", conn.LocalAddr())
-		}
+		_ = rbs.SetReadBuffer(4 * 1024 * 1024)
 	}
 	// v26.12.39: Also store in the worker's shared socket map so future
 	// QUIC connections from the same client to the same server reuse
@@ -349,9 +303,6 @@ func (c *udpConn) SetOutboundConn(conn net.Conn, dest net.Destination) {
 	if c.worker != nil {
 		key := c.src.String() + "->" + dest.String()
 		c.worker.SetSharedOutboundConn(key, conn)
-		errors.LogInfo(context.Background(),
-			"DIAG: shared socket stored key=", key,
-			" local=", conn.LocalAddr())
 	}
 }
 
@@ -369,9 +320,6 @@ func (c *udpConn) GetSharedOutboundConn(dest net.Destination) net.Conn {
 		if conn.RemoteAddr() == nil {
 			return nil
 		}
-		errors.LogInfo(context.Background(),
-			"DIAG: shared socket REUSED key=", key,
-			" local=", conn.LocalAddr())
 	}
 	return conn
 }
@@ -386,15 +334,6 @@ func (c *udpConn) EnsureSessionReader() {
 	c.sessionReaderMu.Lock()
 	defer c.sessionReaderMu.Unlock()
 
-	// v26.12.45: Diagnostic — log every call so we can see how many
-	// times this is called vs how many readers actually start.
-	// If 138 SetOutboundConn calls produce only 9 reader STARTs, this
-	// log will show whether the alive guard is the gate.
-	errors.LogWarning(context.Background(),
-		"DIAG: EnsureSessionReader called alive=", c.sessionReaderAlive,
-		" conn=", c.outboundConn != nil,
-		" src=", c.src)
-
 	// Already running — don't start a second one
 	if c.sessionReaderAlive {
 		return
@@ -405,26 +344,20 @@ func (c *udpConn) EnsureSessionReader() {
 	// (observed 2260 pkt/s = 22 Mbit/s during ramp-up). 1024 slots = 450 ms
 	// headroom at burst rate; 8192 = 3.6 s. Combined with blocking send
 	// (below) and a 4 MB kernel receive buffer, this should drop to zero
-	// during normal QUIC ramp-ups. The previous 1024-slot channel overflowed
-	// in 5 seconds and dropped 1574 packets, collapsing QUIC's cwnd.
+	// during normal QUIC ramp-ups.
 	if c.sessionReplyCh == nil {
 		c.sessionReplyCh = make(chan []byte, 8192)
 	}
 	// v26.12.45: Fix the dn channel bug. Close() closes sessionReaderDn
 	// but never sets it to nil. The old code only checked == nil, so a
 	// closed-but-not-nil channel was passed to the goroutine, which
-	// immediately exited on `case <-dn: return` — before the START log.
-	// This caused sockRead=0: the reader "started" but never read anything.
-	// Fix: check if the channel is closed (non-blocking recv) and create
-	// a new one if so.
+	// immediately exited on `case <-dn: return`.
 	if c.sessionReaderDn == nil {
 		c.sessionReaderDn = make(chan struct{})
 	} else {
 		select {
 		case <-c.sessionReaderDn:
 			// Channel is closed (from a previous Close() call) — create fresh.
-			errors.LogWarning(context.Background(),
-				"DIAG: EnsureSessionReader dn was CLOSED, creating new channel src=", c.src)
 			c.sessionReaderDn = make(chan struct{})
 		default:
 			// Channel is open — reuse it.
@@ -437,22 +370,14 @@ func (c *udpConn) EnsureSessionReader() {
 	// ever read. Those packets are now stale (the Process that needed
 	// them is gone). Draining prevents the new Process from receiving
 	// old packets AND prevents the reader from being blocked on a full
-	// channel (the second bug: sockRead freezes at a non-zero value
-	// because the reader is blocked on `sessionReplyCh <- pkt` with
-	// no consumer).
-	drained := 0
+	// channel.
+drainLoop:
 	for {
 		select {
 		case <-c.sessionReplyCh:
-			drained++
 		default:
-			goto drainDone
+			break drainLoop
 		}
-	}
-drainDone:
-	if drained > 0 {
-		errors.LogWarning(context.Background(),
-			"DIAG: EnsureSessionReader drained=", drained, " stale packets from channel src=", c.src)
 	}
 
 	c.sessionReaderAlive = true
@@ -466,15 +391,6 @@ drainDone:
 		}()
 
 		b := make([]byte, 65535)
-		// v26.12.44: Track whether we've logged the START and FIRST READ
-		// for this reader instance. These one-shot diagnostics confirm:
-		//   - START: the reader goroutine actually launched (and when)
-		//   - FIRST READ: the reader successfully read at least one packet
-		// If sockRead=0 appears in the counter without a matching FIRST READ,
-		// the reader is blocked on oc.Read() — likely on a stale socket that
-		// was replaced by SetOutboundConn while the reader was blocked.
-		loggedStart := false
-		loggedFirstRead := false
 		for {
 			select {
 			case <-dn:
@@ -493,29 +409,15 @@ drainDone:
 					continue
 				}
 			}
-			if !loggedStart {
-				loggedStart = true
-				// v26.12.46: Include client source port so reader START can be
-				// correlated with DIAG COUNTERS src=udp:... lines. Without this,
-				// there's no way to match a reader START to a specific connection.
-				var srcStr string
-				if c.src != nil {
-					srcStr = c.src.String()
-				}
-				errors.LogWarning(context.Background(),
-					"DIAG: reader START src=", srcStr,
-					" local=", oc.LocalAddr(),
-					" remote=", oc.RemoteAddr())
-			}
 			// v26.12.44: Set a 1-second read deadline so oc.Read() can't
 			// block forever on a stale socket. If SetOutboundConn replaces
 			// the socket while we're blocked on Read, Go on Linux does NOT
 			// reliably unblock the Read on Close() — the goroutine stays
 			// stuck on the dead socket forever. sessionReaderAlive stays
 			// true (goroutine isn't dead, just blocked), so EnsureSessionReader
-			// won't restart it. sockRead freezes. This deadline forces Read
-			// to return every 1s; on timeout we loop back, re-read
-			// c.outboundConn (picking up any replacement), and retry.
+			// won't restart it. This deadline forces Read to return every
+			// 1s; on timeout we loop back, re-read c.outboundConn (picking
+			// up any replacement), and retry.
 			type deadlineSetter interface {
 				SetReadDeadline(time.Time) error
 			}
@@ -524,22 +426,13 @@ drainDone:
 			}
 			n, err := oc.Read(b)
 			if err != nil {
-				// v26.12.44: Check for timeout before incrementing sockErr.
+				// v26.12.44: Check for timeout before treating as an error.
 				// A timeout is EXPECTED — it means no packets arrived in 1s.
-				// Don't log it as an error, don't increment sockErr, just retry.
+				// Just retry, picking up any replaced socket.
 				var ne stdnet.Error
 				if stderrors.As(err, &ne) && ne.Timeout() {
-					// Read deadline expired — no packets in 1s. Loop back,
-					// re-read c.outboundConn (in case it was replaced), retry.
-					// This is the critical fix: if the socket was replaced
-					// while we were blocked, we now pick up the new one.
 					continue
 				}
-				c.cntSockErr.Add(1)
-				errors.LogWarning(context.Background(),
-					"DIAG: reader EXIT sockErr=", c.cntSockErr.Load(),
-					" sockRead=", c.cntSockRead.Load(),
-					" err=", err)
 				select {
 				case <-dn:
 					return
@@ -555,19 +448,8 @@ drainDone:
 				}
 				return
 			}
-			if !loggedFirstRead {
-				loggedFirstRead = true
-				errors.LogWarning(context.Background(),
-					"DIAG: reader FIRST READ n=", n,
-					" local=", oc.LocalAddr(),
-					" sockRead=", c.cntSockRead.Load()+1)
-			}
-			c.cntSockRead.Add(1)
 			pkt := make([]byte, n)
 			copy(pkt, b[:n])
-			// v26.12.57: Content integrity — hash at read point.
-			c.cntReadBytes.Add(int64(n))
-			c.cntReadHash.Add(int64(crc32.ChecksumIEEE(pkt)))
 			// v26.12.41-link: Register server SCID from long-header replies.
 			// The server's Initial/Handshake reply carries its SCID, which
 			// Chrome uses as the DCID for 1-RTT packets. Without registering
@@ -584,34 +466,24 @@ drainDone:
 			// v26.12.46: THE DEADLOCK FIX. v26.12.43's blocking send
 			// traded a drop for a deadlock: if the consumer (responseDone →
 			// sessionReplyReader) exits, the channel fills to capacity and
-			// the reader blocks on the next send forever. sockRead freezes
-			// at a non-zero value, chDrop=0, sockErr=0, no reader EXIT —
-			// a clean-looking black hole. The kernel buffer then fills,
-			// Google sees loss, and the connection collapses silently.
+			// the reader blocks on the next send forever. The kernel buffer
+			// then fills, Google sees loss, and the connection collapses
+			// silently.
 			//
 			// Fix: bounded block. If the channel stays full for 5 seconds,
-			// the consumer is dead. Log it, exit the reader (which sets
+			// the consumer is dead. Exit the reader (which sets
 			// sessionReaderAlive=false via defer), and let EnsureSessionReader
 			// restart it when a new consumer appears. The 5s bound is
 			// generous — a live consumer draining at even 10 pkt/s would
 			// never trigger it. Only a dead consumer does.
 			// v26.12.67: Direct write to client, bypassing sessionReplyCh.
-			c.cntReplyOut.Add(1)
-			c.cntWriteBytes.Add(int64(len(pkt)))
-			c.cntWriteHash.Add(int64(crc32.ChecksumIEEE(pkt)))
 			_, werr := c.output(pkt)
 			if werr != nil {
-				c.cntWriteErr.Add(1)
 				select {
 				case c.sessionReplyCh <- pkt:
 				case <-dn:
 					return
 				case <-time.After(5 * time.Second):
-					errors.LogWarning(context.Background(),
-						"DIAG: reader BLOCKED on full channel 5s, exiting. depth=",
-						len(c.sessionReplyCh),
-						" sockRead=", c.cntSockRead.Load(),
-						" src=", c.src)
 					return
 				}
 			} else {
@@ -637,70 +509,6 @@ func (c *udpConn) ReadSessionReply() ([]byte, bool) {
 	case <-c.sessionReaderDn:
 		return nil, false
 	}
-}
-
-// v26.12.36-link: Counter methods for the QUIC reply path diagnostics.
-// Called from freedom.go's requestDone to count packets sent to Google.
-func (c *udpConn) IncReqSent()          { c.cntReqSent.Add(1) }
-func (c *udpConn) IncReqSentBy(n int64) { c.cntReqSent.Add(n) } // v26.12.42
-
-// GetCounters returns a snapshot of all reply-path counters for logging.
-func (c *udpConn) GetCounters() (sockRead, sockErr, chDrop, replyOut, reqSent, pipeDrop int64) {
-	pd := int64(0)
-	if c.cntPipeDrop != nil {
-		pd = c.cntPipeDrop.Load()
-	}
-	return c.cntSockRead.Load(), c.cntSockErr.Load(), c.cntChDrop.Load(),
-		c.cntReplyOut.Load(), c.cntReqSent.Load(), pd
-}
-
-// v26.12.36-link: StartCounterLogger starts a goroutine that logs the
-// reply-path counters every 5 seconds. This tells us exactly which
-// segment of the reply path dies after the QUIC handshake.
-func (c *udpConn) StartCounterLogger(src string) {
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-c.sessionReaderDn:
-				return
-			case <-t.C:
-				sr, se, cd, ro, rs, pd := c.GetCounters()
-				if sr == 0 && ro == 0 && rs == 0 && pd == 0 {
-					continue // no activity yet, skip
-				}
-				// v26.12.51: Include destination so the reqSent:sockRead ratio
-				// can be correlated with content (video vs thumbnail).
-				destStr := ""
-				c.outboundMu.Lock()
-				if c.outboundDest.IsValid() {
-					destStr = c.outboundDest.String()
-				}
-				c.outboundMu.Unlock()
-				errors.LogWarning(context.Background(),
-					"DIAG COUNTERS src=", src,
-					" dest=", destStr,
-					" sockRead=", sr,
-					" sockErr=", se,
-					" chDrop=", cd,
-					" replyOut=", ro,
-					" reqSent=", rs,
-					" pipeDrop=", pd,
-					" nilAddr=", c.cntNilAddr.Load(),
-					" ruleBlock=", c.cntRuleBlock.Load(),
-					" writeErr=", c.cntWriteErr.Load(),
-					" readB=", c.cntReadBytes.Load(),
-					" writeB=", c.cntWriteBytes.Load(),
-					" readH=", c.cntReadHash.Load(),
-					" writeH=", c.cntWriteHash.Load())
-				// v26.12.49: Also log worker-level inbound drops.
-				if c.worker != nil {
-					c.worker.LogWorkerDrops()
-				}
-			}
-		}
-	}()
 }
 
 // v26.12.53: mostRecentConnForIP finds the most recently active
@@ -743,12 +551,6 @@ func (w *udpWorker) mostRecentConnForIP(addr net.Address) *udpConn {
 	// With multiple conns, we can't know which one this packet belongs to,
 	// and guessing sends ACKs to the wrong server.
 	if count != 1 {
-		if count > 1 {
-			w.cntFallbackRefusedMulti.Add(1)
-			errors.LogWarning(context.Background(),
-				"DIAG: IP fallback REFUSED (multi-conn) count=", count,
-				" addr=", addr)
-		}
 		return nil
 	}
 	return best
@@ -766,52 +568,8 @@ func (c *udpConn) learnSrc(srcKey srcKey) {
 	// Don't overwrite if another conn already owns this srcKey
 	if _, exists := c.worker.srcIndex[srcKey]; !exists {
 		c.worker.srcIndex[srcKey] = c.connID
-		c.worker.cntPortLearned.Add(1)
 	}
 	c.worker.Unlock()
-}
-
-// v26.12.54: GetDropCounters returns pointers to the PacketWriter drop
-// counters. Called from freedom.go to wire them into PacketWriter.
-func (c *udpConn) GetDropCounters() (*atomic.Int64, *atomic.Int64, *atomic.Int64, *atomic.Int64) {
-	return &c.cntNilAddr, &c.cntRuleBlock, &c.cntResolveFail, &c.cntSystemResolveFail
-}
-
-// v26.12.49: GetWorkerDrops returns worker-level inbound drop counters.
-func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused, selfDialDropped, attributedFallback int64) {
-	return w.cntShortDrop.Load(), w.cntFallbackRefused.Load(), w.cntSelfDialDropped.Load(),
-		w.cntAttributedFallback.Load()
-}
-
-// v26.12.59: GetRoutingCounts returns per-routing-method counters.
-func (w *udpWorker) GetRoutingCounts() (srcHit, cidHit, cidHitAlt, ipFallback, fallbackRefusedMulti, shortDropNoConn, newConnFromShort, pktIn, longHdr, portLearned int64) {
-	return w.cntSrcHit.Load(), w.cntCidHit.Load(), w.cntCidHitAlt.Load(),
-		w.cntIpFallback.Load(), w.cntFallbackRefusedMulti.Load(),
-		w.cntShortDropNoConn.Load(), w.cntNewConnFromShort.Load(),
-		w.cntPktIn.Load(), w.cntLongHdr.Load(), w.cntPortLearned.Load()
-}
-
-// v26.12.49: LogWorkerDrops logs worker-level drop counters periodically.
-func (w *udpWorker) LogWorkerDrops() {
-	sd, fr, sdd, af := w.GetWorkerDrops()
-	sh, ch, cha, ipf, frm, sdn, ncs, pi, lh, pl := w.GetRoutingCounts()
-	identityCheck := sh + ch + cha + ipf + frm + sdn + ncs + lh
-	bal := pi - identityCheck
-	if sd > 0 || fr > 0 || sdd > 0 || af > 0 || pi > 0 {
-		errors.LogWarning(context.Background(),
-			"DIAG ROUTING pktIn=", pi,
-			" longHdr=", lh,
-			" srcHit=", sh,
-			" cidHit=", ch,
-			" cidHitAlt=", cha,
-			" ipFallback=", ipf,
-			" fbRefusedMulti=", frm,
-			" shortDropNoConn=", sdn,
-			" newConnFromShort=", ncs,
-			" portLearned=", pl,
-			" unbalanced=", bal,
-			" tag=", w.tag)
-	}
 }
 
 // v26.11.202: GetPooledConn returns the persistent pooledConn.
@@ -864,12 +622,6 @@ func (c *udpConn) Read(buf []byte) (int, error) {
 
 // Write implements io.Writer.
 func (c *udpConn) Write(buf []byte) (int, error) {
-	c.cntReplyOut.Add(1)
-	// v26.12.57: Content integrity — hash at write point.
-	// Computed BEFORE SplitCoalesced so it matches the read-side hash
-	// of the original datagram.
-	c.cntWriteBytes.Add(int64(len(buf)))
-	c.cntWriteHash.Add(int64(crc32.ChecksumIEEE(buf)))
 	// v26.11.144: Re-add SplitCoalesced (from v26.11.55).
 	// Packets > 1250 bytes are split into separate UDP datagrams.
 	// This allows coalesced QUIC packets (Initial+Handshake) to be
@@ -882,11 +634,7 @@ func (c *udpConn) Write(buf []byte) (int, error) {
 	if c.downlink != nil {
 		c.downlink.Add(int64(n))
 	}
-	if err != nil {
-		c.cntWriteErr.Add(1)
-		errors.LogWarning(context.Background(),
-			"DIAG: udpConn.Write ERROR err=", err, " src=", c.src)
-	} else {
+	if err == nil {
 		c.updateActivity()
 	}
 	return n, err
@@ -1064,30 +812,6 @@ type udpWorker struct {
 	sharedSockets   map[string]net.Conn
 	sharedSocketsMu sync.Mutex
 
-	// v26.12.49: Worker-level counters for inbound packet drops.
-	cntShortDrop       atomic.Int64
-	cntFallbackRefused atomic.Int64
-	// v26.12.50: Self-dial drops (127.0.0.1 on our own port).
-	cntSelfDialDropped atomic.Int64
-	// v26.12.53: Packets routed via client-IP fallback (empty DCID +
-	// unknown source port). These are 1-RTT packets from a migrated
-	// source port that the demux can't identify by CID or by port.
-	cntAttributedFallback atomic.Int64
-	// v26.12.59: Routing-method counters. Until now, shortDrop=0 could
-	// mean "everything routed correctly" OR "everything routed by IP
-	// fallback (which misroutes)". These distinguish:
-	cntSrcHit               atomic.Int64 // routed by srcIndex (known port)
-	cntCidHit               atomic.Int64 // routed by DCID lookup (default 8 bytes)
-	cntCidHitAlt            atomic.Int64 // routed by alt CID length (from dcidIndex keys)
-	cntIpFallback           atomic.Int64 // routed by IP fallback (single-conn)
-	cntFallbackRefusedMulti atomic.Int64 // IP fallback refused (multi-conn) — was never incremented before v26.12.59
-	cntShortDropNoConn      atomic.Int64 // dropped: no conn found for this IP
-	cntNewConnFromShort     atomic.Int64 // invisible path: short header created a NEW conn (orphaned 1-RTT re-homed)
-	// v26.12.60: Identity-check counters.
-	cntPktIn       atomic.Int64 // every UDP packet entering callback
-	cntLongHdr     atomic.Int64 // long-header packets (Initials etc)
-	cntPortLearned atomic.Int64 // learnSrc actually inserted a new key
-
 	ctx  context.Context
 	cone bool
 }
@@ -1177,10 +901,6 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
-	w.cntPktIn.Add(1)
-	if pb := b.Bytes(); len(pb) > 0 && pb[0]&0x80 != 0 {
-		w.cntLongHdr.Add(1)
-	}
 	// v26.12.50: Self-dial guard. A destination of 127.0.0.1 on this
 	// inbound's own listen port means the sniffer hasn't produced a
 	// destination yet and dokodemo's !FollowRedirect placeholder leaked
@@ -1190,7 +910,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 	// Port-based check: dest.Port == w.port. This can't touch DNS on :53.
 	if originalDest.IsValid() && originalDest.Port == w.port &&
 		originalDest.Address.Family().IsIP() && originalDest.Address.IP().IsLoopback() {
-		w.cntSelfDialDropped.Add(1)
 		b.Release()
 		return
 	}
@@ -1271,7 +990,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		if existingID, found := w.srcIndex[id.srcKey]; found {
 			if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
 				w.RUnlock()
-				w.cntSrcHit.Add(1)
 				// v26.12.67: Direct write — bypass pipe/Process for short
 				// headers when the outbound conn is available. This cuts the
 				// per-packet path from 6 hops (Hub→channel→callback→pipe→
@@ -1291,7 +1009,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 						// Direct write failed — fall back to pipe path
 						existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 					} else {
-						existingConn.IncReqSentBy(1)
 						existingConn.updateActivity()
 						b.Release()
 					}
@@ -1318,7 +1035,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			if existingID, found := w.dcidIndex[dk]; found {
 				if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
 					w.RUnlock()
-					w.cntCidHit.Add(1)
 					existingConn.learnSrc(id.srcKey)
 					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 					existingConn.updateActivity()
@@ -1340,7 +1056,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 		// through the proxy. Dropping is correct — Chrome will retransmit
 		// the Initial, which DOES have a SNI, and the connection will be
 		// established properly.
-		w.cntShortDropNoConn.Add(1)
 		b.Release()
 		return
 	}
@@ -1352,29 +1067,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 	}
 
 	conn, existing := w.getConnection(id)
-
-	// v26.12.59: Count the invisible path — a short header that created
-	// a NEW conn. This happens when a 1-RTT packet arrives from an unknown
-	// port AND the DCID lookup missed (or was skipped because id.dest was
-	// valid). The packet gets re-homed into a fresh conn with a fresh
-	// outbound socket → Google sees a new source port → path validation
-	// → "starts, then dies" shape. Until now this was invisible: it isn't
-	// a drop, so no counter counted it.
-	if !existing && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
-		w.cntNewConnFromShort.Add(1)
-		dcidLen := 0
-		if d, _, e := quic.ParseDCID(b.Bytes()); e == nil {
-			dcidLen = len(d)
-		}
-		errors.LogWarning(context.Background(),
-			"DIAG: NEW conn from SHORT header src=", source,
-			" dcidLen=", dcidLen,
-			" dest=", id.dest)
-	}
-
-	// v26.12.36-link: Removed per-packet DIAG: EXISTING conn logging.
-	// It fires on every steady-state packet at Warning level and floods the log.
-	// Keep NEW conn, CID rotation, and Process RETURNED for diagnostics.
 
 	// v26.11.118: REMOVED the C3 re-check block (v26.10.43/v26.10.78).
 	// The re-check ALWAYS found the conn that getConnection just created
@@ -1424,13 +1116,11 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 	//      keeps the pool socket's DCID registrations alive.
 	if !existing || (existing && !conn.processRunning.Load()) {
 		if !existing {
-			errors.LogWarning(context.Background(), "DIAG: NEW conn src=", source, " dest=", id.dest)
 			common.Must(w.checker.Start())
 		}
 		conn.processRunning.Store(true)
 
 		go func() {
-			startTime := time.Now()
 			ctx, cancel := context.WithCancel(w.ctx)
 			conn.cancel = cancel
 			sid := session.NewID()
@@ -1469,7 +1159,6 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			if err := w.proxy.Process(ctx, net.Network_UDP, conn, w.dispatcher); err != nil {
 				errors.LogInfoInner(ctx, err, "proxy.Process error for ", source)
 			}
-			errors.LogWarning(context.Background(), "DIAG: Process RETURNED src=", source, " after=", time.Since(startTime).Round(time.Millisecond))
 			// v26.11.196: DON'T close conn or removeConn here.
 			// The persistent outboundConn / pooledConnPtr survive
 			// Process restarts. clean() retires the conn after

@@ -72,17 +72,9 @@ func ListenUDP(ctx context.Context, address net.Address, port net.Port, streamSe
 	// v26.12.61: Enlarge kernel receive buffer (4MB) + cache channel (8192).
 	// Udp6RcvbufErrors=3545 proved the default buffer overflows at burst rate.
 	if hub.udpConn != nil {
-		if err := hub.udpConn.SetReadBuffer(4 * 1024 * 1024); err != nil {
-			errors.LogWarning(ctx, "Hub: SetReadBuffer(4MB) failed: ", err)
-		} else {
-			errors.LogInfo(ctx, "Hub: SetReadBuffer(4MB) ok")
-		}
+		_ = hub.udpConn.SetReadBuffer(4 * 1024 * 1024)
 		// v26.12.62: Also enlarge send buffer for reply packets.
-		if err := hub.udpConn.SetWriteBuffer(4 * 1024 * 1024); err != nil {
-			errors.LogWarning(ctx, "Hub: SetWriteBuffer(4MB) failed: ", err)
-		} else {
-			errors.LogInfo(ctx, "Hub: SetWriteBuffer(4MB) ok")
-		}
+		_ = hub.udpConn.SetWriteBuffer(4 * 1024 * 1024)
 	}
 	hub.cache = make(chan *udp.Packet, 8192)
 

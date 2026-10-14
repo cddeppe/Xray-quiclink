@@ -644,8 +644,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				GetOutboundConn() net.Conn
 				SetOutboundConn(net.Conn, net.Destination)
 				EnsureSessionReader()
-				IncReqSentBy(int64)
-				StartCounterLogger(string)
 				GetSharedOutboundConn(net.Destination) net.Conn
 			}); ok {
 				existingConn := udpConn.GetOutboundConn()
@@ -664,10 +662,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					}
 					udpConn.SetOutboundConn(conn, destination)
 					udpConn.EnsureSessionReader()
-					// v26.12.36: Start the counter logger for diagnostics
-					if inbound.Source.IsValid() {
-						udpConn.StartCounterLogger(inbound.Source.String())
-					}
 					errors.LogInfo(ctx, "freedom: persisted session socket + started reader for ", destination)
 				}
 			} else {
@@ -741,11 +735,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					// replies with DCID=∅ couldn't be demuxed → handshake
 					// never completed → stall.
 					scid, _, scidErr := quic.ParseSCID(mb[0].Bytes())
-					// v26.12.38: Log the decision for diagnostics
-					errors.LogWarning(context.Background(),
-						"DIAG: UDP path decision dest=", destination,
-						" scidLen=", len(scid), " scidErr=", scidErr,
-						" chosePool=", scidErr == nil && len(scid) > 0)
 					if scidErr == nil && len(scid) == 0 {
 						errors.LogInfo(ctx, "freedom: 0-length SCID QUIC — using per-session socket (h3 test site)")
 						// pconn stays nil — fall through to per-session path
@@ -759,7 +748,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 						}
 						if udpRemote != nil {
 							pconn, err = h.socketPool.Acquire(udpRemote)
-							errors.LogWarning(context.Background(), "DIAG: pool ACQUIRE dest=", destination, " pool=", pconn != nil, " err=", err)
 							if err != nil {
 								// v26.10.34-link (C3 fix): release peeked packets
 								// before returning. Without this, every Acquire
@@ -861,7 +849,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	requestDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)
-		errors.LogWarning(context.Background(), "DIAG: requestDone START dest=", destination, " pool=", pconn != nil)
 
 		var writer buf.Writer
 		if destination.Network == net.Network_TCP {
@@ -883,26 +870,6 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			writer = NewPooledPacketWriter(pconn, statWrite)
 		} else {
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
-			// v26.12.54: Wire drop counters from udpConn into PacketWriter
-			if pw, ok := writer.(*PacketWriter); ok {
-				if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-					if dc, ok2 := inbound.Conn.(interface {
-						GetDropCounters() (*atomic.Int64, *atomic.Int64, *atomic.Int64, *atomic.Int64)
-					}); ok2 {
-						nilA, ruleB, resF, sysF := dc.GetDropCounters()
-						pw.CntNilAddr = nilA
-						pw.CntRuleBlock = ruleB
-						pw.CntResolveFail = resF
-						pw.CntSystemResolveFail = sysF
-					}
-				}
-			}
-			// v26.12.36: Wrap writer to count packets sent to Google
-			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-				if cntr, ok := inbound.Conn.(interface{ IncReqSentBy(int64) }); ok {
-					writer = &countingPacketWriter{Writer: writer, counter: cntr}
-				}
-			}
 			if h.config.Noises != nil {
 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
 				writer = &NoisePacketWriter{
@@ -927,20 +894,16 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			// fired (responseDone returned, so YouTube closed the outbound).
 			select {
 			case <-inputCloser:
-				errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (inputCloser) dest=", destination)
 				return nil // graceful — let Dispatch Close(link.Writer)
 			default:
-				errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (error) dest=", destination, " err=", err)
 				return errors.New("failed to process request").Base(err)
 			}
 		}
-		errors.LogWarning(context.Background(), "DIAG: requestDone EXIT (copy done) dest=", destination)
 		return nil
 	}
 
 	responseDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.UplinkOnly)
-		errors.LogWarning(context.Background(), "DIAG: responseDone START dest=", destination, " pool=", pconn != nil)
 		// v26.10.37-link: signal the inputCloser goroutine to interrupt
 		// the inbound input pipe when responseDone returns — whether
 		// the outbound closed cleanly (EOF) or with an error. This
@@ -1013,10 +976,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 		}
 		if err := buf.Copy(reader, output, buf.UpdateActivity(timer)); err != nil {
-			errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (error) dest=", destination, " err=", err)
 			return errors.New("failed to process response").Base(err)
 		}
-		errors.LogWarning(context.Background(), "DIAG: responseDone EXIT (copy done — Google closed socket) dest=", destination)
 		// v26.12.30-link: For UDP session reader path, DON'T cancel/interrupt.
 		// The session reader goroutine is still running and will deliver
 		// future reply packets when Chrome sends 1-RTT data. Cancelling
@@ -1181,12 +1142,6 @@ type PacketWriter struct {
 	// So, cache and keep the resolve result
 	ResolvedUDPAddr *utils.TypedSyncMap[string, net.Address]
 	OutGateway      net.Address
-
-	// v26.12.54: Counters for silent drops in WriteMultiBuffer.
-	CntNilAddr           *atomic.Int64
-	CntRuleBlock         *atomic.Int64
-	CntResolveFail       *atomic.Int64
-	CntSystemResolveFail *atomic.Int64
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -1226,9 +1181,6 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					if shouldUseSystemResolver {
 						udpAddr, err := net.ResolveUDPAddr("udp", b.UDP.NetAddr())
 						if err != nil {
-							if w.CntSystemResolveFail != nil {
-								w.CntSystemResolveFail.Add(1)
-							}
 							b.Release()
 							continue
 						} else {
@@ -1484,20 +1436,4 @@ func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b := buf.FromBytes(pkt)
 	b.UDP = r.udpDest
 	return buf.MultiBuffer{b}, nil
-}
-
-// v26.12.36: countingPacketWriter wraps a buf.Writer and increments a
-// counter on each WriteMultiBuffer call. Used to count packets sent
-// from Chrome to Google through the requestDone path.
-type countingPacketWriter struct {
-	buf.Writer
-	counter interface{ IncReqSentBy(int64) }
-}
-
-func (w *countingPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	// v26.12.42: count per-datagram, not per-WriteMultiBuffer call.
-	// Each call may contain multiple buffers (pipe batching), so counting
-	// per-call undercounts the actual datagrams sent to Google.
-	w.counter.IncReqSentBy(int64(len(mb)))
-	return w.Writer.WriteMultiBuffer(mb)
 }
