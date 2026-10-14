@@ -1436,8 +1436,13 @@ func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	if !ok || len(pkt) == 0 {
 		return nil, io.EOF
 	}
-	b := buf.New()
-	b.Write(pkt)
+	// v26.12.40-link: use FromBytes to avoid silent truncation.
+	// buf.New() gives an 8192-byte buffer — packets larger than that
+	// would be silently truncated by b.Write(pkt). FromBytes wraps the
+	// existing []byte directly (unmanaged, no copy). The caller
+	// (buf.Copy) will Release the MultiBuffer, which is a no-op for
+	// unmanaged buffers.
+	b := buf.FromBytes(pkt)
 	b.UDP = r.udpDest
 	return buf.MultiBuffer{b}, nil
 }
