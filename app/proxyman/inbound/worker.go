@@ -183,7 +183,8 @@ type udpConn struct {
 	writer           buf.Writer
 	output           func([]byte) (int, error)
 	remote           net.Addr
-	connID           connID // v26.12.53: stored for learnSrc (IP fallback)
+	replyDestPtr     *atomic.Pointer[net.Destination] // v26.12.68
+	connID           connID                           // v26.12.53: stored for learnSrc (IP fallback)
 	local            net.Addr
 	done             *done.Instance
 	uplink           stats.Counter
@@ -1150,23 +1151,23 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 		connID:   id, // v26.12.53: stored for learnSrc (IP fallback)
 		worker:   w,  // v26.12.39: back-reference for shared socket
 	}
+	// v26.12.68: Store the current reply destination in an atomic
+	// pointer instead of taking w.RLock per packet. The old code took
+	// w.RLock + w.RUnlock on EVERY reply packet — at 1000+ pkt/s that's
+	// 2000+ lock ops/s on the same RWMutex, causing contention that
+	// throttles throughput. Atomic load is ~10ns; RLock is ~100-500ns
+	// under contention.
+	var replyDest atomic.Pointer[net.Destination]
+	replyDest.Store(&srcCopy)
 	conn.output = func(b []byte) (int, error) {
-		// Snapshot src under w.Lock() so we race-free against
-		// tryQUICMigration()'s `*conn.src = id.src` reassignment. The
-		// outbound hub.WriteTo call is performed outside the lock so
-		// a slow network write does not block the inbound worker's
-		// packet-processing loop.
-		//
-		// v26.10.34-link (M10 fix): use RLock instead of Lock. The
-		// closure only READS *conn.src; the writer (*oldConn.src =
-		// id.src in tryQUICMigration) already uses w.Lock(). RLock
-		// allows multiple outbound packets to snapshot concurrently
-		// instead of serializing against every inbound packet.
-		w.RLock()
-		srcCopy := *conn.src
-		w.RUnlock()
-		return w.hub.WriteTo(b, srcCopy)
+		d := replyDest.Load()
+		if d == nil {
+			return 0, stderrors.New("no reply destination")
+		}
+		return w.hub.WriteTo(b, *d)
 	}
+	// Expose replyDest for tryQUICMigration to update atomically
+	conn.replyDestPtr = &replyDest
 	w.activeConn[id] = conn
 
 	conn.updateActivity()
