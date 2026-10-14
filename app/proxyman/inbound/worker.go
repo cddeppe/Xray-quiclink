@@ -731,6 +731,7 @@ func (w *udpWorker) mostRecentConnForIP(addr net.Address) *udpConn {
 	// and guessing sends ACKs to the wrong server.
 	if count != 1 {
 		if count > 1 {
+			w.cntFallbackRefusedMulti.Add(1)
 			errors.LogWarning(context.Background(),
 				"DIAG: IP fallback REFUSED (multi-conn) count=", count,
 				" addr=", addr)
@@ -768,15 +769,26 @@ func (w *udpWorker) GetWorkerDrops() (shortDrop, fallbackRefused, selfDialDroppe
 		w.cntAttributedFallback.Load()
 }
 
+// v26.12.59: GetRoutingCounts returns per-routing-method counters.
+func (w *udpWorker) GetRoutingCounts() (srcHit, cidHit, cidHitAlt, ipFallback, fallbackRefusedMulti, shortDropNoConn, newConnFromShort int64) {
+	return w.cntSrcHit.Load(), w.cntCidHit.Load(), w.cntCidHitAlt.Load(),
+		w.cntIpFallback.Load(), w.cntFallbackRefusedMulti.Load(),
+		w.cntShortDropNoConn.Load(), w.cntNewConnFromShort.Load()
+}
+
 // v26.12.49: LogWorkerDrops logs worker-level drop counters periodically.
 func (w *udpWorker) LogWorkerDrops() {
 	sd, fr, sdd, af := w.GetWorkerDrops()
-	if sd > 0 || fr > 0 || sdd > 0 || af > 0 {
+	sh, ch, cha, ipf, frm, sdn, ncs := w.GetRoutingCounts()
+	if sd > 0 || fr > 0 || sdd > 0 || af > 0 || sh > 0 || ch > 0 || cha > 0 || ipf > 0 || frm > 0 || sdn > 0 || ncs > 0 {
 		errors.LogWarning(context.Background(),
-			"DIAG WORKER DROPS shortDrop=", sd,
-			" fallbackRefused=", fr,
-			" selfDialDropped=", sdd,
-			" ipFallback=", af,
+			"DIAG ROUTING srcHit=", sh,
+			" cidHit=", ch,
+			" cidHitAlt=", cha,
+			" ipFallback=", ipf,
+			" fbRefusedMulti=", frm,
+			" shortDropNoConn=", sdn,
+			" newConnFromShort=", ncs,
 			" tag=", w.tag)
 	}
 }
@@ -1063,6 +1075,16 @@ type udpWorker struct {
 	// unknown source port). These are 1-RTT packets from a migrated
 	// source port that the demux can't identify by CID or by port.
 	cntAttributedFallback atomic.Int64
+	// v26.12.59: Routing-method counters. Until now, shortDrop=0 could
+	// mean "everything routed correctly" OR "everything routed by IP
+	// fallback (which misroutes)". These distinguish:
+	cntSrcHit               atomic.Int64 // routed by srcIndex (known port)
+	cntCidHit               atomic.Int64 // routed by DCID lookup (default 8 bytes)
+	cntCidHitAlt            atomic.Int64 // routed by alt CID length (from dcidIndex keys)
+	cntIpFallback           atomic.Int64 // routed by IP fallback (single-conn)
+	cntFallbackRefusedMulti atomic.Int64 // IP fallback refused (multi-conn) — was never incremented before v26.12.59
+	cntShortDropNoConn      atomic.Int64 // dropped: no conn found for this IP
+	cntNewConnFromShort     atomic.Int64 // invisible path: short header created a NEW conn (orphaned 1-RTT re-homed)
 
 	ctx  context.Context
 	cone bool
@@ -1232,6 +1254,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			if existingID, found := w.dcidIndex[dk]; found {
 				if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
 					w.RUnlock()
+					w.cntCidHit.Add(1)
 					// v26.12.58: Bind the source port so future packets
 					// from this port go through the fast path (srcIndex),
 					// which handles CID rotation. Without this, every
@@ -1247,31 +1270,32 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				}
 			}
 			w.RUnlock()
-			// v26.12.58: Also try other known CID lengths. The default
-			// is 8 (Chrome/Firefox/Safari), but some servers use
-			// different lengths. If the default lookup missed, try
-			// each known length before giving up.
-			for _, cidLen := range []int{4, 8, 8, 8, 8} {
-				if cidLen == 8 {
-					continue // already tried above
-				}
-				if 1+cidLen > len(b.Bytes()) {
-					continue
-				}
-				altDcid := b.Bytes()[1 : 1+cidLen]
-				altDk := makeDCIDKey(altDcid)
-				w.RLock()
-				if existingID, found := w.dcidIndex[altDk]; found {
-					if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
-						w.RUnlock()
-						existingConn.learnSrc(id.srcKey)
-						existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
-						existingConn.updateActivity()
-						return
+			// v26.12.59: Try alt CID lengths derived from dcidIndex keys.
+			// dcidKey is length-tagged (cid [20]byte; len int), so a 4-byte
+			// parse can only match a registered 4-byte CID — no cross-length
+			// false positives. The default 8 was already tried above.
+			triedLens := map[int]bool{8: true}
+			w.RLock()
+			for dk := range w.dcidIndex {
+				if !triedLens[dk.len] {
+					triedLens[dk.len] = true
+					if 1+dk.len <= len(b.Bytes()) {
+						altDcid := b.Bytes()[1 : 1+dk.len]
+						altDk := makeDCIDKey(altDcid)
+						if existingID, found := w.dcidIndex[altDk]; found {
+							if existingConn, connFound := w.activeConn[existingID]; connFound && !existingConn.done.Done() {
+								w.RUnlock()
+								w.cntCidHitAlt.Add(1)
+								existingConn.learnSrc(id.srcKey)
+								existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
+								existingConn.updateActivity()
+								return
+							}
+						}
 					}
 				}
-				w.RUnlock()
 			}
+			w.RUnlock()
 		}
 
 		// v26.12.41-link: DCID miss — fall back to srcIndex ONLY when
@@ -1291,6 +1315,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 				}
 				if activeCount <= 1 {
 					w.RUnlock()
+					w.cntSrcHit.Add(1)
 					existingConn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 					existingConn.updateActivity()
 					return
@@ -1329,6 +1354,7 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			conn.learnSrc(id.srcKey)
 			conn.writer.WriteMultiBuffer(buf.MultiBuffer{b})
 			conn.updateActivity()
+			w.cntIpFallback.Add(1)
 			w.cntAttributedFallback.Add(1)
 			errors.LogWarning(context.Background(),
 				"DIAG: short header ATTRIBUTED via IP fallback src=", source,
@@ -1337,9 +1363,9 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 			return
 		}
 		// No conn found for this IP — genuine unknown packet. Drop it.
-		w.cntShortDrop.Add(1)
+		w.cntShortDropNoConn.Add(1)
 		errors.LogWarning(context.Background(),
-			"DIAG: short header DROPPED src=", source,
+			"DIAG: short header DROPPED (no conn for IP) src=", source,
 			" dcidLen=", dcidLen,
 			" firstByte=", b.Bytes()[0])
 		b.Release()
@@ -1353,6 +1379,25 @@ func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest
 	}
 
 	conn, existing := w.getConnection(id)
+
+	// v26.12.59: Count the invisible path — a short header that created
+	// a NEW conn. This happens when a 1-RTT packet arrives from an unknown
+	// port AND the DCID lookup missed (or was skipped because id.dest was
+	// valid). The packet gets re-homed into a fresh conn with a fresh
+	// outbound socket → Google sees a new source port → path validation
+	// → "starts, then dies" shape. Until now this was invisible: it isn't
+	// a drop, so no counter counted it.
+	if !existing && len(b.Bytes()) > 0 && b.Bytes()[0]&0x80 == 0 {
+		w.cntNewConnFromShort.Add(1)
+		dcidLen := 0
+		if d, _, e := quic.ParseDCID(b.Bytes()); e == nil {
+			dcidLen = len(d)
+		}
+		errors.LogWarning(context.Background(),
+			"DIAG: NEW conn from SHORT header src=", source,
+			" dcidLen=", dcidLen,
+			" dest=", id.dest)
+	}
 
 	// v26.12.36-link: Removed per-packet DIAG: EXISTING conn logging.
 	// It fires on every steady-state packet at Warning level and floods the log.
