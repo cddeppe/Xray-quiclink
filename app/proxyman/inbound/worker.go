@@ -628,8 +628,17 @@ func (c *udpConn) StartCounterLogger(src string) {
 				if sr == 0 && ro == 0 && rs == 0 {
 					continue // no activity yet, skip
 				}
+				// v26.12.51: Include destination so the reqSent:sockRead ratio
+				// can be correlated with content (video vs thumbnail).
+				destStr := ""
+				c.outboundMu.Lock()
+				if c.outboundDest.IsValid() {
+					destStr = c.outboundDest.String()
+				}
+				c.outboundMu.Unlock()
 				errors.LogWarning(context.Background(),
 					"DIAG COUNTERS src=", src,
+					" dest=", destStr,
 					" sockRead=", sr,
 					" sockErr=", se,
 					" chDrop=", cd,
