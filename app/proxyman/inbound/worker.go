@@ -245,6 +245,11 @@ type udpConn struct {
 	cntReqSent  atomic.Int64 // packets Chrome->Google (via PacketWriter)
 	// v26.12.52: Inbound pipe overflow drops.
 	cntPipeDrop *atomic.Int64 // pointer to local pipeDropCounter
+	// v26.12.54: Silent drops inside PacketWriter.WriteMultiBuffer.
+	cntNilAddr           atomic.Int64
+	cntRuleBlock         atomic.Int64
+	cntResolveFail       atomic.Int64
+	cntSystemResolveFail atomic.Int64
 }
 
 func (c *udpConn) setInactive() {
@@ -651,7 +656,9 @@ func (c *udpConn) StartCounterLogger(src string) {
 					" chDrop=", cd,
 					" replyOut=", ro,
 					" reqSent=", rs,
-					" pipeDrop=", pd)
+					" pipeDrop=", pd,
+					" nilAddr=", c.cntNilAddr.Load(),
+					" ruleBlock=", c.cntRuleBlock.Load())
 				// v26.12.49: Also log worker-level inbound drops.
 				if c.worker != nil {
 					c.worker.LogWorkerDrops()
@@ -701,6 +708,12 @@ func (c *udpConn) learnSrc(srcKey srcKey) {
 		c.worker.srcIndex[srcKey] = c.connID
 	}
 	c.worker.Unlock()
+}
+
+// v26.12.54: GetDropCounters returns pointers to the PacketWriter drop
+// counters. Called from freedom.go to wire them into PacketWriter.
+func (c *udpConn) GetDropCounters() (*atomic.Int64, *atomic.Int64, *atomic.Int64, *atomic.Int64) {
+	return &c.cntNilAddr, &c.cntRuleBlock, &c.cntResolveFail, &c.cntSystemResolveFail
 }
 
 // v26.12.49: GetWorkerDrops returns worker-level inbound drop counters.

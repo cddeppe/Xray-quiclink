@@ -883,6 +883,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			writer = NewPooledPacketWriter(pconn, statWrite)
 		} else {
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
+			// v26.12.54: Wire drop counters from udpConn into PacketWriter
+			if pw, ok := writer.(*PacketWriter); ok {
+				if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+					if dc, ok2 := inbound.Conn.(interface {
+						GetDropCounters() (*atomic.Int64, *atomic.Int64, *atomic.Int64, *atomic.Int64)
+					}); ok2 {
+						nilA, ruleB, resF, sysF := dc.GetDropCounters()
+						pw.CntNilAddr = nilA
+						pw.CntRuleBlock = ruleB
+						pw.CntResolveFail = resF
+						pw.CntSystemResolveFail = sysF
+					}
+				}
+			}
 			// v26.12.36: Wrap writer to count packets sent to Google
 			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
 				if cntr, ok := inbound.Conn.(interface{ IncReqSentBy(int64) }); ok {
@@ -1167,6 +1181,12 @@ type PacketWriter struct {
 	// So, cache and keep the resolve result
 	ResolvedUDPAddr *utils.TypedSyncMap[string, net.Address]
 	OutGateway      net.Address
+
+	// v26.12.54: Counters for silent drops in WriteMultiBuffer.
+	CntNilAddr           *atomic.Int64
+	CntRuleBlock         *atomic.Int64
+	CntResolveFail       *atomic.Int64
+	CntSystemResolveFail *atomic.Int64
 }
 
 func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -1206,6 +1226,9 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					if shouldUseSystemResolver {
 						udpAddr, err := net.ResolveUDPAddr("udp", b.UDP.NetAddr())
 						if err != nil {
+							if w.CntSystemResolveFail != nil {
+								w.CntSystemResolveFail.Add(1)
+							}
 							b.Release()
 							continue
 						} else {
