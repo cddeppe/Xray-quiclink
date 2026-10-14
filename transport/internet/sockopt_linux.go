@@ -61,6 +61,37 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			}
 		}
 
+		// v26.12.71: TCP_NODELAY — disable Nagle's algorithm. Without
+		// this, small packets are delayed up to 40ms waiting for
+		// coalescing. YouTube HTTP/2 sends many small frames — each
+		// one gets delayed. This is the single biggest TCP latency
+		// reduction available.
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
+			return errors.New("failed to set TCP_NODELAY").Base(err)
+		}
+
+		// v26.12.71: TCP_QUICKACK — disable delayed ACK. Linux's
+		// default delayed ACK adds up to 40ms per ACK. For HTTP/2
+		// request/response, every request takes 40ms longer.
+		// Note: Linux resets QUICKACK periodically; this sets it for
+		// the initial state, and Go's subsequent reads/writes will
+		// re-trigger it on activity.
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_QUICKACK, 1); err != nil {
+			// Non-fatal: some kernels don't support TCP_QUICKACK
+			errors.LogDebug(context.Background(), "TCP_QUICKACK not supported: ", err)
+		}
+
+	}
+
+	// v26.12.71: Enlarge socket buffers to 4MB for burst absorption.
+	// Default Linux buffers are ~208KB — only 0.3s of buffer at 5 Mbit/s.
+	// 4MB gives ~6s of burst absorption, preventing packet drops that
+	// cause TCP congestion control to back off.
+	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024); err != nil {
+		errors.LogDebug(context.Background(), "SO_SNDBUF(4MB) failed: ", err)
+	}
+	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024); err != nil {
+		errors.LogDebug(context.Background(), "SO_RCVBUF(4MB) failed: ", err)
 	}
 
 	if len(config.CustomSockopt) > 0 {
@@ -69,14 +100,10 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 				errors.LogDebug(context.Background(), "CustomSockopt system not match: ", "want ", custom.System, " got ", runtime.GOOS)
 				continue
 			}
-			// Skip unwanted network type
-			// network might be tcp4 or tcp6
-			// use HasPrefix so that "tcp" can match tcp4/6 with "tcp" if user want to control all tcp (udp is also the same)
-			// if it is empty, strings.HasPrefix will always return true to make it apply for all networks
 			if !strings.HasPrefix(network, custom.Network) {
 				continue
 			}
-			level := 0x6 // default TCP
+			level := 0x6
 			var opt int
 			if len(custom.Opt) == 0 {
 				return errors.New("No opt!")
@@ -169,6 +196,22 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 				return errors.New("failed to set TCP_MAXSEG", err)
 			}
 		}
+
+		// v26.12.71: TCP_NODELAY + TCP_QUICKACK on inbound too.
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
+			return errors.New("failed to set TCP_NODELAY").Base(err)
+		}
+		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_QUICKACK, 1); err != nil {
+			errors.LogDebug(context.Background(), "TCP_QUICKACK not supported: ", err)
+		}
+	}
+
+	// v26.12.71: Enlarge socket buffers on inbound too.
+	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024); err != nil {
+		errors.LogDebug(context.Background(), "SO_SNDBUF(4MB) failed: ", err)
+	}
+	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024); err != nil {
+		errors.LogDebug(context.Background(), "SO_RCVBUF(4MB) failed: ", err)
 	}
 
 	if len(config.CustomSockopt) > 0 {
