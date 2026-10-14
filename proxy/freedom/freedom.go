@@ -628,7 +628,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				GetOutboundConn() net.Conn
 				SetOutboundConn(net.Conn, net.Destination)
 				EnsureSessionReader()
-				IncReqSent()
+				IncReqSentBy(int64)
 				StartCounterLogger(string)
 				GetSharedOutboundConn(net.Destination) net.Conn
 			}); ok {
@@ -869,7 +869,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
 			// v26.12.36: Wrap writer to count packets sent to Google
 			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
-				if cntr, ok := inbound.Conn.(interface{ IncReqSent() }); ok {
+				if cntr, ok := inbound.Conn.(interface{ IncReqSentBy(int64) }); ok {
 					writer = &countingPacketWriter{Writer: writer, counter: cntr}
 				}
 			}
@@ -1452,10 +1452,13 @@ func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 // from Chrome to Google through the requestDone path.
 type countingPacketWriter struct {
 	buf.Writer
-	counter interface{ IncReqSent() }
+	counter interface{ IncReqSentBy(int64) }
 }
 
 func (w *countingPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	w.counter.IncReqSent()
+	// v26.12.42: count per-datagram, not per-WriteMultiBuffer call.
+	// Each call may contain multiple buffers (pipe batching), so counting
+	// per-call undercounts the actual datagrams sent to Google.
+	w.counter.IncReqSentBy(int64(len(mb)))
 	return w.Writer.WriteMultiBuffer(mb)
 }

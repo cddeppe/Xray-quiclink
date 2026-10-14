@@ -450,7 +450,8 @@ func (c *udpConn) ReadSessionReply() ([]byte, bool) {
 
 // v26.12.36-link: Counter methods for the QUIC reply path diagnostics.
 // Called from freedom.go's requestDone to count packets sent to Google.
-func (c *udpConn) IncReqSent() { c.cntReqSent.Add(1) }
+func (c *udpConn) IncReqSent()          { c.cntReqSent.Add(1) }
+func (c *udpConn) IncReqSentBy(n int64) { c.cntReqSent.Add(n) } // v26.12.42
 
 // GetCounters returns a snapshot of all reply-path counters for logging.
 func (c *udpConn) GetCounters() (sockRead, sockErr, chDrop, replyOut, reqSent int64) {
