@@ -992,6 +992,29 @@ func (w *udpWorker) getConnection(id connID) (*udpConn, bool) {
 }
 
 func (w *udpWorker) callback(b *buf.Buffer, source net.Destination, originalDest net.Destination) {
+	// v26.12.47: Loopback guard — matches the TCP worker's guard at line 89.
+	// If the packet's destination is the proxy's own listen address, or
+	// loopback, drop it. Without this, a UDP packet that gets sniffed and
+	// re-routed to 127.0.0.1:443 creates an infinite recursion: each
+	// recursion manufactures a dead connection (sockRead=0, reqSent=5).
+	if originalDest.IsValid() {
+		destIP := originalDest.Address.IP()
+		if destIP.IsLoopback() || destIP.IsUnspecified() {
+			errors.LogWarning(context.Background(),
+				"DIAG: udpWorker DROPPING loopback dest=", originalDest,
+				" src=", source)
+			b.Release()
+			return
+		}
+		// Also check if dest matches our own hub address
+		if w.hub != nil && w.hub.Addr().String() == originalDest.NetAddr() {
+			errors.LogWarning(context.Background(),
+				"DIAG: udpWorker DROPPING self-loop dest=", originalDest,
+				" src=", source)
+			b.Release()
+			return
+		}
+	}
 	id := connID{
 		src:    source,
 		srcKey: makeSrcKey(source), // v26.10.16-link: precompute once, reuse everywhere
