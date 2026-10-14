@@ -83,16 +83,10 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 
 	}
 
-	// v26.12.71: Enlarge socket buffers to 4MB for burst absorption.
-	// Default Linux buffers are ~208KB — only 0.3s of buffer at 5 Mbit/s.
-	// 4MB gives ~6s of burst absorption, preventing packet drops that
-	// cause TCP congestion control to back off.
-	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024); err != nil {
-		errors.LogDebug(context.Background(), "SO_SNDBUF(4MB) failed: ", err)
-	}
-	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024); err != nil {
-		errors.LogDebug(context.Background(), "SO_RCVBUF(4MB) failed: ", err)
-	}
+	// v26.12.72: Removed SO_SNDBUF/SO_RCVBUF — they disable TCP
+	// buffer auto-tuning (tcp_rmem/tcp_wmem), capping throughput.
+	// The kernel auto-tunes up to 931KB dynamically, which is better
+	// than a fixed 208KB that manual setting clamps to.
 
 	if len(config.CustomSockopt) > 0 {
 		for _, custom := range config.CustomSockopt {
@@ -206,13 +200,7 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 		}
 	}
 
-	// v26.12.71: Enlarge socket buffers on inbound too.
-	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4*1024*1024); err != nil {
-		errors.LogDebug(context.Background(), "SO_SNDBUF(4MB) failed: ", err)
-	}
-	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4*1024*1024); err != nil {
-		errors.LogDebug(context.Background(), "SO_RCVBUF(4MB) failed: ", err)
-	}
+	// v26.12.72: Removed — see outbound comment above.
 
 	if len(config.CustomSockopt) > 0 {
 		for _, custom := range config.CustomSockopt {
