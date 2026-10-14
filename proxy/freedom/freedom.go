@@ -628,18 +628,21 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				GetOutboundConn() net.Conn
 				SetOutboundConn(net.Conn, net.Destination)
 				EnsureSessionReader()
+				IncReqSent()
+				StartCounterLogger(string)
 			}); ok {
 				existingConn := udpConn.GetOutboundConn()
 				if existingConn != nil {
 					conn = existingConn
-					// v26.12.35: Also call EnsureSessionReader on restart.
-					// If the reader died (socket replacement), this restarts it.
 					udpConn.EnsureSessionReader()
 					errors.LogInfo(ctx, "freedom: reused persistent outbound conn to ", destination)
 				} else {
-					// v26.12.27: Persist conn + start permanent reader goroutine.
 					udpConn.SetOutboundConn(conn, destination)
 					udpConn.EnsureSessionReader()
+					// v26.12.36: Start the counter logger for diagnostics
+					if inbound.Source.IsValid() {
+						udpConn.StartCounterLogger(inbound.Source.String())
+					}
 					errors.LogInfo(ctx, "freedom: persisted session socket + started reader for ", destination)
 				}
 			} else {
@@ -841,6 +844,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			writer = NewPooledPacketWriter(pconn, statWrite)
 		} else {
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination, outGateway)
+			// v26.12.36: Wrap writer to count packets sent to Google
+			if inbound := session.InboundFromContext(ctx); inbound != nil && inbound.Conn != nil {
+				if cntr, ok := inbound.Conn.(interface{ IncReqSent() }); ok {
+					writer = &countingPacketWriter{Writer: writer, counter: cntr}
+				}
+			}
 			if h.config.Noises != nil {
 				errors.LogDebug(ctx, "NOISE", h.config.Noises)
 				writer = &NoisePacketWriter{
@@ -1408,4 +1417,17 @@ func (r *sessionReplyReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 	b.Write(pkt)
 	b.UDP = r.udpDest
 	return buf.MultiBuffer{b}, nil
+}
+
+// v26.12.36: countingPacketWriter wraps a buf.Writer and increments a
+// counter on each WriteMultiBuffer call. Used to count packets sent
+// from Chrome to Google through the requestDone path.
+type countingPacketWriter struct {
+	buf.Writer
+	counter interface{ IncReqSent() }
+}
+
+func (w *countingPacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	w.counter.IncReqSent()
+	return w.Writer.WriteMultiBuffer(mb)
 }
