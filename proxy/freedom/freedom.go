@@ -470,11 +470,13 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	// v26.12.50: Self-dial guard. A destination of 127.0.0.1 on this
 	// inbound's own listen port means the sniffer hasn't produced a
 	// destination yet and dokodemo's !FollowRedirect placeholder leaked
-	// through. Dialling it connects to ourselves. Drop and let the
-	// client retransmit the Initial.
-	// Port-based: dest.Port == inbound.Local.Port && IsLoopback.
-	// This can't touch DNS on :53.
-	if inbound != nil && inbound.Local.IsValid() &&
+	// through. Dialling it connects to ourselves.
+	// v26.12.73: UDP ONLY. For TCP, the sniffer will get the SNI on
+	// the next packet — dropping prevents the TLS handshake from
+	// completing and causes video stream stalls. TCP connections
+	// that genuinely loop back will fail naturally.
+	if destination.Network == net.Network_UDP &&
+		inbound != nil && inbound.Local.IsValid() &&
 		destination.Port == inbound.Local.Port &&
 		destination.Address.Family().IsIP() && destination.Address.IP().IsLoopback() {
 		errors.LogWarning(ctx, "freedom: DROPPING self-dial destination ",
