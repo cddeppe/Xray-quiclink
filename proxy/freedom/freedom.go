@@ -510,7 +510,12 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 	var blockedDest *net.Destination
 	var blockedRule *FinalRule
-	err := retry.ExponentialBackoff(5, 100).On(func() error {
+	// v26.12.74: Reduced from 5 to 2 retries. 5 retries on NXDOMAIN
+	// wastes ~3 seconds (100+200+400+800+1600ms) per dead domain.
+	// Chrome also retries, creating 20+ DNS queries for one dead domain.
+	// 2 retries (100+200ms = 300ms total) is enough for transient
+	// failures; genuine NXDOMAIN fails fast instead of stalling.
+	err := retry.ExponentialBackoff(2, 100).On(func() error {
 		if destination.Address.Family().IsDomain() {
 			if defaultRule != nil || len(h.finalRules) > 0 {
 				if strategy := h.resolveStrategy; strategy.HasStrategy() {
