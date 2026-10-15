@@ -70,14 +70,13 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 			return errors.New("failed to set TCP_NODELAY").Base(err)
 		}
 
-		// v26.12.71: TCP_QUICKACK — disable delayed ACK. Linux's
-		// default delayed ACK adds up to 40ms per ACK. For HTTP/2
-		// request/response, every request takes 40ms longer.
-		// Note: Linux resets QUICKACK periodically; this sets it for
-		// the initial state, and Go's subsequent reads/writes will
-		// re-trigger it on activity.
+		// v26.12.71: TCP_QUICKACK — disable delayed ACK for the initial
+		// ACK. Linux re-enables delayed ACK after each ACK (it's one-shot),
+		// so this only helps the first packet exchange. TCP_NODELAY (above)
+		// is the permanent latency fix; QUICKACK is a minor first-packet
+		// optimization. Cannot be made permanent from Go without patching
+		// the runtime to call setsockopt after each read.
 		if err := syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, unix.TCP_QUICKACK, 1); err != nil {
-			// Non-fatal: some kernels don't support TCP_QUICKACK
 			errors.LogDebug(context.Background(), "TCP_QUICKACK not supported: ", err)
 		}
 

@@ -271,7 +271,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
 			// if w.isUplink && inbound.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	inbound.CanSpliceCopy = 1
+			//      inbound.CanSpliceCopy = 1
 			// }
 			if !w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // ob need to be passed in due to context can have more than one ob
 				w.ob.CanSpliceCopy = 1
@@ -338,7 +338,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				spliceReadyInbound = inbound
 			}
 			// if w.isUplink && w.ob != nil && w.ob.CanSpliceCopy == 2 { // TODO: enable uplink splice
-			// 	w.ob.CanSpliceCopy = 1
+			//      w.ob.CanSpliceCopy = 1
 			// }
 		}
 		SuppressOuterCloseNotify(w.conn)
@@ -768,9 +768,14 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			errors.LogDebug(ctx, "CopyRawConn splice")
 			statWriter, _ := writer.(*dispatcher.SizeStatWriter)
 			//runtime.Gosched() // necessary
-			timer.SetTimeout(24 * time.Hour) // prevent leak, just in case
+			// v26.12.75: Reduced from 24h to 10min. A stalled
+			// splice (peer stops sending, no FIN) should not hang
+			// for 24 hours. TCP keepalive (45s idle/45s interval)
+			// detects dead peers in ~90-135s; 10min is a generous
+			// backstop that allows for HTTP/2 PING gaps.
+			timer.SetTimeout(10 * time.Minute)
 			if inTimer != nil {
-				inTimer.SetTimeout(24 * time.Hour)
+				inTimer.SetTimeout(10 * time.Minute)
 			}
 			w, err := tc.ReadFrom(readerConn)
 			if readCounter != nil {

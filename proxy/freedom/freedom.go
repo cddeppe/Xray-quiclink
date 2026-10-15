@@ -427,6 +427,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		<-inputCloser
 		common.Interrupt(input)
 	}()
+	// v26.12.75: Ensure inputCloser is closed on ALL exit paths,
+	// including early returns before task.Run (dial failure, DNS
+	// failure). Without this, the goroutine above leaks on every
+	// failed connection attempt — one goroutine + pipe per failure.
+	defer close(inputCloser)
 
 	// Sticky UDP DNS: if enabled and destination is a domain, pre-resolve to
 	// a consistent IP for this hostname. This prevents IPv4/IPv6 flipping
