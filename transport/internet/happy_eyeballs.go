@@ -16,7 +16,10 @@ type result struct {
 
 func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Port, sockopt *SocketConfig, domain string) (net.Conn, error) {
 	if len(ips) < 2 {
-		panic("at least 2 ips is required to race dial")
+		return nil, errors.New("TcpRaceDial: at least 2 ips are required to race dial, got ", len(ips))
+	}
+	if sockopt == nil || sockopt.HappyEyeballs == nil {
+		return nil, errors.New("TcpRaceDial: sockopt.HappyEyeballs is nil")
 	}
 
 	prioritizeIPv6 := sockopt.HappyEyeballs.PrioritizeIpv6
@@ -82,7 +85,19 @@ func TcpRaceDial(ctx context.Context, src net.Address, ips []net.IP, port net.Po
 
 		case <-timer.C:
 			if nextTryIndex == len(ips) || activeNum == maxConcurrentTry {
-				panic("impossible situation")
+				// v26.12.79: was panic("impossible situation").
+				// Can happen on goroutine scheduling edge cases.
+				if nextTryIndex == len(ips) && activeNum == 0 {
+					if winConn != nil {
+						return winConn, nil
+					}
+					return nil, errors.New("TcpRaceDial: all attempts failed for ", domain)
+				}
+				if activeNum > 0 {
+					timer.Reset(tryDelayMs)
+					continue
+				}
+				return nil, errors.New("TcpRaceDial: invalid maxConcurrentTry=0 for ", domain)
 			}
 			go tcpTryDial(newCtx, src, sockopt, ips[nextTryIndex], port, nextTryIndex, resultCh)
 			activeNum++

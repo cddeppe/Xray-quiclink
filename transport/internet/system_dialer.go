@@ -33,6 +33,7 @@ type DefaultSystemDialer struct {
 //   - src is nil or a wildcard (AnyIP/AnyIPv6);
 //   - dest is a loopback IP and src is a non-loopback IP (EADDRNOTAVAIL);
 //   - src and dest are IPs of different families (EADDRNOTAVAIL).
+//
 // This guard is what makes sendThrough:"origin" safe for multi-IP servers:
 // the listen IP is used whenever possible, and the kernel is allowed to
 // pick a valid source for loopback or cross-family destinations.
@@ -56,7 +57,7 @@ func resolveSrcAddr(network net.Network, src net.Address, dest net.Destination) 
 	}
 	return &net.UDPAddr{
 		IP:   src.IP(),
-			Port: 0,
+		Port: 0,
 	}
 }
 
@@ -241,7 +242,17 @@ type FakePacketConn struct {
 
 func (c *FakePacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	n, err = c.Read(p)
-	return n, &net.UDPAddr{IP: c.Conn.RemoteAddr().(*net.TCPAddr).IP, Port: c.Conn.RemoteAddr().(*net.TCPAddr).Port}, err
+	// v26.12.79: safe type assertion — don't panic on non-TCP conns.
+	remote := c.Conn.RemoteAddr()
+	if ta, ok := remote.(*net.TCPAddr); ok && ta != nil {
+		return n, &net.UDPAddr{IP: ta.IP, Port: ta.Port}, err
+	}
+	if remote != nil {
+		if uaddr, perr := net.ResolveUDPAddr("udp", remote.String()); perr == nil {
+			return n, uaddr, err
+		}
+	}
+	return n, nil, err
 }
 
 func (c *FakePacketConn) WriteTo(p []byte, _ net.Addr) (n int, err error) {
