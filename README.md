@@ -1,126 +1,98 @@
 # Xray-quiclink
 
-A fork of [Xray-core](https://github.com/XTLS/Xray-core) focused on **transparent QUIC/HTTP3 proxying** and **deterministic source-IP handling** for multi-hop proxy chains.
+A fork of [Xray-core](https://github.com/XTLS/Xray-core) focused on **transparent proxying of YouTube/Google traffic** via a VPS using DNS hijacking.
 
-## What This Fork Does
-
-Standard xray-core is a Layer-4 proxy. QUIC (HTTP/3) is a Layer-7 protocol with encrypted short headers that carry no SNI. This creates a fundamental mismatch: xray can sniff the SNI from a QUIC Initial (long header), but cannot determine the destination for 1-RTT short headers.
-
-This fork bridges that gap with a UDP socket pool that demuxes QUIC replies by Connection ID (CID), allowing transparent QUIC proxying without TPROXY, iptables, or WireGuard.
+## Current Status (v26.12.79)
 
 ### What Works
 
-| Feature | Status |
-|---------|--------|
-| h3 test sites (quic.nginx.org, cloudflare-quic.com) over QUIC | ✅ Working |
-| YouTube over TCP (fallback) | ✅ Working |
-| DNS hijacking mode (no WireGuard needed) | ✅ Working |
-| Multi-IP inbound listen | ✅ Working |
-| Deterministic source-IP binding (sendThrough: origin) | ✅ Working |
-| TCP warm pool (faster video-to-video transitions) | ✅ Working |
-| Sticky DNS resolver with wildcard cache | ✅ Working |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| YouTube over TCP (splice) | ✅ Working | Kernel-level zero-copy splice. TCP_NODELAY + TCP_QUICKACK enabled. |
+| h3 test sites (quic.nginx.org, cloudflare-quic.com) | ✅ Working | Per-session UDP socket with persistent reader. |
+| DNS hijacking mode (no WireGuard/TPROXY needed) | ✅ Working | Uses ctrld or any local DNS resolver. |
+| Multi-IP inbound listen (IPv4 + IPv6) | ✅ Working | Dual-stack with sendThrough: origin. |
+| Deterministic source-IP binding | ✅ Working | sendThrough: origin ensures outbound uses the same IP as inbound. |
+| QUIC handshake relay | ✅ Working | SNI sniffing from QUIC Initial, persistent session socket, server SCID registration. |
+| QUIC 1-RTT routing | ✅ Working | 5-tuple (srcIndex) primary, DCID as exception for NAT rebind. RFC 9312 §4.2 compliant. |
+| Happy Eyeballs (IPv6/IPv4 racing) | ✅ Working | Configurable via sockopt.happyEyeballs. |
 
-### What Does Not Work
+### What Does Not Work (Yet)
 
 | Feature | Status | Reason |
 |---------|--------|--------|
-| YouTube over QUIC | ❌ Not working | QUIC 1-RTT short headers are encrypted (no SNI). YouTube opens multiple parallel QUIC connections with CID rotation, breaking DCID-based reply demuxing. Without TPROXY + WireGuard, xray cannot route 1-RTT packets to the correct destination. |
+| YouTube video playback over QUIC | ⚠️ Partial | QUIC handshake completes and data flows, but throughput is throttled (~80-200 kbit/s vs 1-8 Mbit/s needed). QUIC's congestion control sees the userspace relay's added RTT and keeps the congestion window small. TCP doesn't have this problem because splice is kernel-level zero-copy. RFC 9312 §4.3 warns that transparent relays suppress congestion-control resets, which is the likely mechanism. |
+
+### Removed Features (were in earlier versions, now deleted)
+
+| Feature | Why Removed |
+|---------|-------------|
+| TCP warm pool | Caused FD leaks (dial before warmAcquired check), goroutine leaks (Release without close), stale-connection reuse, and periodic throughput drops (preWarmLoop dialed 10 connections every 60s). YouTube uses unique `rr*.googlevideo.com` subdomains per video — pre-warmed connections to old IPs were never reused. |
+| UDP socket pool | Added complexity and bugs (buffer leaks, stale socket reuse, goroutine leaks on reload). The per-session socket path with persistent reader handles QUIC demux correctly without it. |
+| Sticky DNS resolver | Served stale IPs for CDN-rotated googlevideo subdomains. ctrld's own cache with proper TTLs is better. The sticky resolver's 60s hardcoded TTL was worse than Google's actual 300s TTL. |
+| SplitCoalesced | Split coalesced QUIC packets into separate UDP datagrams, violating RFC 9000 §12.2. Coalesced packets must be delivered as a single datagram. |
+| DIAG counter system | Extensive diagnostic counters (sockRead, chDrop, shortDrop, pipeDrop, nilAddr, writeErr, etc.) added during debugging. Stripped in v26.12.70 for clean production builds. Can be re-added from v26.12.69 tag if needed. |
 
 ---
 
-## Changes From Upstream
+## Architecture
 
-### New Files Created
-
-| File | Purpose |
-|------|---------|
-| `common/protocol/quic/dcid.go` | QUIC DCID (Destination Connection ID) parser for long and short headers |
-| `common/protocol/quic/dcid_test.go` | Tests for DCID parser |
-| `common/protocol/quic/split.go` | Coalesced QUIC packet splitter (RFC 9000 Section 12.2) |
-| `common/protocol/quic/sniff_bench_test.go` | Benchmarks for QUIC sniffer |
-| `common/protocol/quic/workerhook.go` | Server SCID notification hook for the inbound worker |
-| `proxy/freedom/udp_pool.go` | UDP socket pool with DCID-based reply demuxing |
-| `proxy/freedom/udp_sticky.go` | Sticky DNS resolver with wildcard cache + stale-while-revalidate |
-| `proxy/freedom/tcp_pool.go` | TCP warm pool for faster video-to-video transitions |
-| `proxy/freedom/udptimeout/udptimeout.go` | Configurable UDP timeout (replaces hardcoded 2-minute) |
-| `example-configs/vps-consolidated.json` | Example configuration with all features |
-
-### Files Modified
-
-| File | What Changed |
-|------|--------------|
-| `app/proxyman/inbound/worker.go` | Added QUIC CID migration, synthetic dest (DCID-based connID), Solution A (srcIndex routing for short headers) |
-| `app/dispatcher/default.go` | UDP sniffer integration for DispatchLink |
-| `app/dispatcher/sniffer.go` | QUIC sniffer registration |
-| `app/dns/cache_controller.go` | Wildcard fallback for SERVFAIL, prefetch refresh, cache optimizations |
-| `app/dns/nameserver_cached.go` | SERVFAIL fallback integration, stale-while-revalidate |
-| `app/dns/nameserver.go` | IPv4/IPv6 preference support |
-| `app/dns/config.proto` | DNS config fields for new features |
-| `common/protocol/quic/sniff.go` | Full QUIC SNI sniffer with ECH support, DCID cache, CRYPTO frame accumulation |
-| `common/protocol/tls/sniff.go` | Truncated ClientHello SNI extraction (ECH split across QUIC packets) |
-| `proxy/freedom/freedom.go` | Pool + sticky resolver integration, sendThrough: origin, UDP/TCP separation |
-| `proxy/freedom/config.proto` | UDPConfig fields for socket pool, sticky resolver, TCP warm pool |
-| `infra/conf/freedom.go` | Config parsing for udpConfig |
-| `transport/internet/system_dialer.go` | resolveSrcAddr with family-mismatch guard, loopback guard |
-| `transport/internet/dialer.go` | LookupForIP queries both A and AAAA regardless of source IP family |
-| `transport/internet/udp/hub.go` | UDP hub integration for QUIC sniffing |
-| `core/core.go` | Version tracking |
-
----
-
-## How It Works
-
-### The Problem
-
-When you use DNS hijacking (e.g., Control D) to point youtube.com at your VPS:
-
-1. Chrome resolves youtube.com to your VPS IP (e.g., 85.155.228.208)
-2. Chrome sends QUIC Initial (long header) to VPS:443
-3. xray sniffs SNI from the ClientHello and identifies the destination
-4. xray forwards to Google
-5. Google replies and xray forwards back to Chrome
-
-This works for the Initial (step 2) because long headers carry the ClientHello with SNI. But 1-RTT short headers (step 5+) are encrypted — they carry no SNI. xray has no way to know where to send them.
-
-### The Solution: UDP Socket Pool with DCID Demuxing
-
-The UDP socket pool shares one outbound UDP socket per destination IP. When a QUIC session sends its first packet, the pool registers the client's SCID and DCID in a demux map. When the server replies, the pool parses the reply's DCID and routes it to the correct session.
+### TCP Path (Working, Optimized)
 
 ```
-Chrome sends QUIC Initial (DCID=A, SCID=B)
-  -> xray sniffs SNI -> freedom dials Google IP
-  -> pool.Acquire(googleIP) -> pooledSocket
-  -> WriteTo registers DCID=A and SCID=B in demux map
-  -> Packet sent to Google
-
-Google replies (DCID=B, matches Chrome's SCID)
-  -> pool readLoop parses DCID=B
-  -> demux[B] -> session inbox -> Chrome
+Chrome → DNS hijack → VPS:443 (dokodemo-door)
+  → SNI sniff (TLS ClientHello)
+  → freedom outbound dials Google IP
+  → splice (kernel zero-copy, no userspace copy)
+  → data flows bidirectionally
 ```
 
-**Why this works for h3 test sites:** One QUIC connection per destination IP. The SCID is non-zero, so server replies have a matching DCID. Demuxing works cleanly.
+TCP uses Go's `ReadFrom` → kernel `splice(2)` syscall. Zero userspace copies, zero per-packet allocations. TCP_NODELAY eliminates 40ms Nagle delay. TCP_QUICKACK eliminates 40ms delayed ACK on the first packet exchange. Splice timeout is 10 minutes (backstop for stalled connections; TCP keepalive detects dead peers in ~90-135s).
 
-**Why this does not work for YouTube:** YouTube opens multiple parallel QUIC connections to the same Google IP. Chrome uses 0-length SCID (server replies have DCID=empty). CID rotation (NEW_CONNECTION_ID frames) changes the DCID mid-connection. These factors break DCID-based demuxing.
+### UDP/QUIC Path (Functional, Throughput-Limited)
 
-### The Sticky DNS Resolver
+```
+Chrome → DNS hijack → VPS:443 (dokodemo-door, network: tcp,udp)
+  → QUIC Initial (long header) → SNI sniff
+  → freedom dials Google IP on per-session UDP socket
+  → SetOutboundConn stores socket for reuse
+  → EnsureSessionReader starts persistent reader goroutine
+  → Reader goroutine reads Google's replies, registers server SCID
+  → Replies delivered to Chrome via direct write (c.output → hub.WriteTo)
+  → Subsequent 1-RTT short headers routed by srcIndex (5-tuple)
+  → CID rotation handled by tryQUICMigration
+  → NAT rebind handled by DCID lookup (exception path)
+```
 
-YouTube rotates CDN edge hostnames every 60-90 seconds. Public DNS cannot keep up — new hostnames return NXDOMAIN before DNS caches them.
+The per-session socket path gives each QUIC connection its own outbound UDP socket with a permanent reader goroutine. The reader uses a 1-second `SetReadDeadline` to prevent blocking on stale sockets. Replies are written directly to the client via `c.output` (bypassing the channel/pipe/Process path). Request packets use direct write to the outbound socket when available (bypassing the pipe/Process/PacketWriter path).
 
-The sticky resolver:
-1. Caches the first successful DNS resolution per hostname (TTL: 300s recommended)
-2. Supports wildcard caching (*.googlevideo.com) for sibling hostnames
-3. Returns stale entries immediately while refreshing in the background (stale-while-revalidate)
-4. Falls back to sibling IPs on SERVFAIL (same CDN edge family serves same content)
+### Why QUIC Throughput Is Limited
 
-### The TCP Warm Pool
+QUIC implements its own congestion control in userspace (Chrome's QUIC stack). The congestion window (cwnd) determines how much data can be in flight. The cwnd is calibrated based on measured RTT. A userspace relay adds latency to every packet's round-trip:
 
-Pre-warms TCP connections to commonly-accessed destinations. When Chrome requests the next video segment, the connection is already established (saves ~100-200ms of TCP+TLS handshake per request).
+- TCP splice: kernel-to-kernel, ~0µs added per packet
+- QUIC relay: Hub → channel → callback → pipe/Process → PacketWriter → socket → reader → c.output → hub, ~100-300µs added per direction
+
+This inflated RTT keeps QUIC's cwnd small, limiting throughput to ~80-200 kbit/s. TCP doesn't have this problem because splice adds near-zero latency.
+
+RFC 9312 §4.3 explicitly warns: "Applying address translation at a middlebox to maintain a stable address-port mapping for flows based on connection ID conceals important and security-relevant information from QUIC endpoints... suppresses the reset of congestion-control state on path change."
+
+### RFC 9312 Compliance
+
+This fork follows RFC 9312 (Manageability of the QUIC Transport Protocol) guidance:
+
+- **§4.2**: 5-tuple (srcIndex) is the primary routing key, not CID. CID is used only as an exception for NAT rebind association.
+- **§2.1**: Uses only the invariant Header Form bit (bit 7) for long/short header discrimination. Does not rely on the fixed bit (0x40), which is not invariant per RFC 9287.
+- **§2.2/§2.4**: Coalesced packets are delivered intact (SplitCoalesced removed).
+- **§4.5**: No mid-connection packet drops to force TCP fallback.
+- **§4.10**: No application-level MTU guessing (let DPLPMTUD handle it).
+- **§1**: Transparent relay is out of scope for the RFC; the supported approach is to terminate QUIC (be an endpoint), which this fork does not do.
 
 ---
 
 ## Configuration
 
-### Recommended Config (DNS Hijacking Mode)
+### Minimal Config (TCP-only, recommended for YouTube)
 
 ```json
 {
@@ -129,8 +101,8 @@ Pre-warms TCP connections to commonly-accessed destinations. When Chrome request
     "error": "/var/log/xray/error.log"
   },
   "dns": {
-    "cacheSize": 1000,
-    "serveStale": true,
+    "cacheSize": 5000,
+    "serveStale": false,
     "servers": ["127.0.0.1", "[::1]"]
   },
   "inbounds": [
@@ -140,13 +112,29 @@ Pre-warms TCP connections to commonly-accessed destinations. When Chrome request
       "protocol": "dokodemo-door",
       "tag": "in-443",
       "settings": { "network": "tcp,udp" },
-      "sniffing": { "enabled": true, "destOverride": ["tls", "quic"] },
+      "sniffing": { "enabled": true, "destOverride": ["tls"] },
       "streamSettings": {
         "sockopt": {
           "tcpFastOpen": true,
           "tcpNoDelay": true,
-          "tcpUserTimeout": 30000,
-          "tcpKeepAlive": 15
+          "tcpKeepAlive": 15,
+          "tcpMptcp": true
+        }
+      }
+    },
+    {
+      "listen": ["YOUR_VPS_IPV4", "YOUR_VPS_IPV6"],
+      "port": 80,
+      "protocol": "dokodemo-door",
+      "tag": "in-80",
+      "settings": { "network": "tcp" },
+      "sniffing": { "enabled": true, "destOverride": ["http"] },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpNoDelay": true,
+          "tcpKeepAlive": 15,
+          "tcpMptcp": true
         }
       }
     }
@@ -158,36 +146,35 @@ Pre-warms TCP connections to commonly-accessed destinations. When Chrome request
       "sendThrough": "origin",
       "streamSettings": {
         "sockopt": {
-          "domainStrategy": "UseIp",
+          "domainStrategy": "UseIPv6v4",
+          "happyEyeballs": {
+            "prioritizeIpv6": true,
+            "interleave": 0,
+            "tryDelayMs": 50,
+            "maxConcurrentTry": 3
+          },
           "tcpFastOpen": true,
           "tcpNoDelay": true,
-          "tcpUserTimeout": 30000,
-          "tcpKeepAlive": 15
+          "tcpKeepAlive": 15,
+          "tcpMptcp": true
         }
       },
       "settings": {
         "udpConfig": {
-          "enableSocketPool": true,
-          "enableStickyResolver": true,
-          "preferIpv4": true,
-          "sessionIdleTimeout": 1800,
-          "stickyResolverTtl": 300,
-          "poolStalenessTimeout": 300,
-          "poolIdleTimeout": 600,
-          "poolUnusedTimeout": 300,
-          "enableTcpWarmPool": true,
-          "tcpWarmPoolTimeout": 30,
-          "preWarmFirstN": 10,
-          "preWarmLearnVisits": 3,
-          "enableTcpWarmPoolHealthCheck": true,
-          "tcpWarmPoolMaxIdle": 120,
-          "tcpConnectTimeout": 10,
-          "edgeHealthCooldown": 30
+          "preferIpv6": true,
+          "sessionIdleTimeout": 1800
         }
       }
     },
-    { "protocol": "blackhole", "tag": "block" }
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
   ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  },
   "policy": {
     "levels": {
       "0": {
@@ -201,205 +188,100 @@ Pre-warms TCP connections to commonly-accessed destinations. When Chrome request
 }
 ```
 
-### UDP Config Options
+### Key Config Notes
 
-| Option | Default | Recommended | Description |
-|--------|---------|-------------|-------------|
-| enableSocketPool | false | true | UDP socket pool with DCID demuxing (required for h3 test sites) |
-| enableStickyResolver | false | true | Cache DNS with stale-while-revalidate |
-| preferIpv4 | false | true | Prefer IPv4 from DNS results |
-| sessionIdleTimeout | 300 | 1800 | UDP session idle timeout (seconds) |
-| stickyResolverTtl | 60 | 300 | DNS cache TTL (seconds) — YouTube reuses CDN hostnames |
-| poolStalenessTimeout | 300 | 300 | Socket staleness check (seconds) |
-| poolIdleTimeout | 600 | 600 | Socket idle timeout (seconds) |
-| poolUnusedTimeout | 300 | 300 | Unused socket timeout (seconds) |
-| enableTcpWarmPool | false | true | Pre-warm TCP connections |
-| tcpWarmPoolTimeout | 10 | 30 | Warm connection timeout (seconds) |
-| preWarmFirstN | 5 | 10 | Number of connections to pre-warm |
-| preWarmLearnVisits | 3 | 3 | Visits before pre-warming |
-| enableTcpWarmPoolHealthCheck | false | true | Health check warm connections |
-| tcpWarmPoolMaxIdle | 60 | 120 | Max idle warm connections |
-| tcpConnectTimeout | 10 | 10 | TCP connect timeout (seconds) |
-| edgeHealthCooldown | 30 | 30 | Edge health cooldown (seconds) |
-
-### Tuning for YouTube TCP Performance
-
-For faster video-to-video transitions (reduces stall when swiping):
-
-- **stickyResolverTtl: 300** — YouTube reuses CDN hostnames within a session, so caching DNS for 5 minutes means most video-to-video transitions skip DNS entirely (saves 50-130ms per lookup)
-- **tcpWarmPoolTimeout: 30** — Keep TCP warm for 30s (was 10s) — Chrome often needs the connection 15-20s later
-- **preWarmFirstN: 10** — Pre-warm 10 connections (was 5) — YouTube fetches video, audio, and thumbnails simultaneously
-- **tcpWarmPoolMaxIdle: 120** — Allow 120 idle connections (was 60) — YouTube opens many parallel connections
+- **`serveStale: false`** — Do NOT enable. Serving stale DNS entries for 5 minutes causes connections to dead CDN IPs. ctrld's own cache with proper TTLs is better.
+- **`prefetchInterval: 0`** (omit or set to 0) — Do NOT enable prefetch. YouTube's googlevideo subdomains are unique per video session; prefetching wastes DNS queries on one-time-use domains.
+- **`enableTcpWarmPool: false`** (omit) — Warm pool removed from code. Setting is ignored.
+- **`enableStickyResolver: false`** (omit) — Sticky resolver is harmful for CDN-rotated domains. ctrld handles caching.
+- **`enableSocketPool: false`** (omit) — Socket pool not needed. Per-session path handles QUIC demux.
+- **`tryDelayMs: 50`** — 50ms instead of 150ms default. Reduces latency on IPv6-fail connections.
+- **`network: "tcp,udp"`** — Enable UDP on :443 inbound for QUIC. Leave :80 as TCP-only.
 
 ---
-
-## Version History
-
-### v26.11.116 (Current — Final Polished Version)
-
-Base: v26.11.56 (last version where h3 test sites work AND YouTube falls back to TCP properly)
-
-Kept improvements:
-1. ECH ClientHello SNI extraction from truncated QUIC packets (v26.11.75)
-2. Packet slicing in udp_pool readLoop (v26.11.81)
-
-Removed (experimental code that caused stalling):
-- SNI cache (v26.11.109) — created duplicate connections
-- connBySrc (v26.11.110) — fragile conn lifecycle
-- directWrite (v26.11.111) — bypassed pipe but did not fix root cause
-- Silent drop (v26.11.114) — lost packets instead of routing them
-- TPROXY (v26.11.116) — does not work with DNS hijacking
-
-### v26.11.56 (Last stable base)
-
-- Synthetic dest + Solution A (srcIndex-based routing for short headers)
-- SplitCoalesced in udpConn.Write (no truncate to 1250)
-- Original v26.11.0 worker (silent drop for demux misses)
-- h3 test sites work, YouTube falls back to TCP
-
-### v26.11.54 (Proven QUIC support for h3 test sites)
-
-- UDP socket pool with DCID-based reply demuxing
-- Sticky resolver with wildcard cache + stale-while-revalidate
-- QUIC CID migration handling
-- h3 test sites (quic.nginx.org, cloudflare-quic.com) work over QUIC
-
-### v26.11.0 (First fully functional fork)
-
-- All four architectural fixes working together
-- Extended UDP timeout (30 minutes)
-- Sticky DNS resolver
-- UDP socket pool
-- QUIC CID migration
-
-### v26.10.0-v26.10.43 (Multi-IP + source-IP binding)
-
-- Multi-IP inbound listen (array of IPs)
-- sendThrough: "origin" for deterministic source-IP binding
-- Family-mismatch guard in resolveSrcAddr
-- Loopback guard to prevent EADDRNOTAVAIL
-
-### v26.9.9 (Initial fork)
-
-- Extended UDP timeout from 2 minutes to 30 minutes
-- Sticky DNS resolver with IPv4/IPv6 preference
-- NXDOMAIN edge rotation handling (wildcard cache for *.googlevideo.com)
-- UDP socket pool with dead-socket detection
-
----
-
-## What We Tried and Why It Did Not Work (v26.11.101-v26.11.115)
-
-Over 15 versions, we attempted to make YouTube work over QUIC. Every attempt failed because of the fundamental limitation: xray cannot know the destination for QUIC 1-RTT short headers without TPROXY + WireGuard.
-
-| Version | Approach | Why it failed |
-|---------|----------|---------------|
-| v26.11.101 | lastActiveCh for 0-SCID | Only worked for long headers with empty DCID |
-| v26.11.103 | Source-port pool keying | Eliminated sharing but did not fix CID rotation |
-| v26.11.105 | Extend lastActiveCh to all demux misses | Replies delivered but Chrome still stalled |
-| v26.11.107 | Synthetic dest + Solution A | Short headers still created new conns to 127.0.0.1 loop |
-| v26.11.109 | SNI cache by source address | Created duplicate connections, overwrote connBySrc |
-| v26.11.110 | connBySrc direct conn cache | Fragile conn lifecycle, misses when conn dies |
-| v26.11.111 | directWrite bypass | ACKs reached Google but data still stalled after ~50KB |
-| v26.11.114 | Silent drop for unmatched short headers | Prevented 127.0.0.1 loop but lost packets |
-| v26.11.115 | Route ALL packets through existing conn | Long headers still created new conns |
-| v26.11.116 | TPROXY | Does not work with DNS hijacking (only works with WireGuard) |
-
-Root cause: Without TPROXY + WireGuard, xray cannot know the destination IP for QUIC 1-RTT short headers. This is a protocol-level limitation, not a code bug.
-
----
-
-## Bugs We Hit and Fixed
-
-1. **Tab vs newline in struct definition** — Tab character between fields caused Go to interpret the second field as part of the first's comment. x86 build succeeded (cached), ARM64 failed. Fix: replaced tab with newline. Lesson: always go clean -cache before building.
-
-2. **Calling IP() on a DomainAddress** — destination.Address.IP() panicked when destination was a domain (SNI-sniffed traffic). Fix: use conn.RemoteAddr() (always an IP after dial). Lesson: xray's net.Address is a discriminated union.
-
-3. **Pool init after early return** — Pool init placed after usesDialerProxy early return. Fix: moved to top of Init.
-
-4. **65535-byte buffer sent instead of packet[:n]** — readLoop sent the full pool buffer instead of the actual packet length. SplitCoalesced saw garbage, failed, and caused EMSGSIZE. Fix: getPacket() returns b[:cap(b)], readLoop sends packet[:n].
-
-5. **Truncate to 1250 corrupted QUIC packets** — v26.11.58 added truncate as EMSGSIZE fallback. Chrome saw malformed data and stalled. Fix: removed truncate entirely. QUIC retransmits dropped packets (correct behavior).
-
-6. **SNI cache created duplicate connections** — v26.11.109's SNI cache created NEW freedom.Process for cached packets, overwriting connBySrc. Fix: removed SNI cache.
-
-7. **Broad chmod +x on all files** — A chmod +x during development made all 1100+ files executable (mode 755). GitHub showed our commit as the last modifier for files we never touched. Fix: git filter-branch to rewrite history, reverting all non-script files to mode 644.
-
----
-
-## Building
-
-```bash
-# AMD64
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o xray-linux-amd64 ./main
-
-# ARM64
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o xray-linux-arm64 ./main
-```
 
 ## Installation
 
+### From Release
+
 ```bash
-wget https://github.com/cddeppe/Xray-quiclink/releases/download/v26.11.116/xray-linux-amd64
-chmod +x xray-linux-amd64
-mv xray-linux-amd64 /usr/local/bin/xray
+# AMD64
+cd /tmp && wget -q https://github.com/cddeppe/Xray-quiclink/releases/download/v26.12.79/xray-linux-amd64 && chmod +x xray-linux-amd64 && mv xray-linux-amd64 /usr/local/bin/xray && systemctl restart xray
 
-mkdir -p /etc/xray
-cp example-configs/vps-consolidated.json /etc/xray/config.json
-# Edit config to match your IPs
-
-systemctl enable xray
-systemctl start xray
+# ARM64
+cd /tmp && wget -q https://github.com/cddeppe/Xray-quiclink/releases/download/v26.12.79/xray-linux-arm64 && chmod +x xray-linux-arm64 && mv xray-linux-arm64 /usr/local/bin/xray && systemctl restart xray
 ```
 
-## Known Limitations
+### From Source
 
-1. **YouTube over QUIC does not work.** QUIC 1-RTT short headers are encrypted (no SNI). Without TPROXY + WireGuard, xray cannot determine the destination. YouTube falls back to TCP cleanly.
-
-2. **Only QUIC, not non-QUIC UDP.** The pool's reply demuxing relies on parsing QUIC DCID. Non-QUIC UDP (DNS, games, WireGuard) falls back to the existing per-session dial path.
-
-3. **Pool keys on destination IP, not hostname.** CDNs that rotate IPs aggressively create separate pooled sockets per IP. Could be improved by pooling on hostname, but adds complexity.
-
-4. **CID length defaults to 8 for short headers.** If a QUIC variant uses a different default CID length and the first packet is a short header, the parser will get the wrong CID. In practice, handshakes always start with a long header.
-
-5. **TPROXY does not work with DNS hijacking.** TPROXY only works with routed tunnels (WireGuard). The tproxy/ directory contains setup scripts, but they are only useful with a WireGuard architecture.
+```bash
+git clone -b v191-prefetch https://github.com/cddeppe/Xray-quiclink.git
+cd Xray-quiclink
+CGO_ENABLED=0 go build -o xray -trimpath -ldflags="-s -w" ./main
+```
 
 ---
 
-## Maintenance
+## Changes From Upstream Xray-core
 
-### Rebasing Against Upstream
+### Key Modified Files
 
-```bash
-git remote add upstream https://github.com/XTLS/Xray-core.git
-git fetch upstream
-git rebase upstream/main
-# Resolve conflicts in:
-# - app/proxyman/inbound/worker.go
-# - proxy/freedom/freedom.go
-# - proxy/freedom/udp_pool.go
-# - common/protocol/tls/sniff.go
-# - common/protocol/quic/sniff.go
-```
+| File | What Changed |
+|------|--------------|
+| `proxy/freedom/freedom.go` | UDP per-session socket path, direct write bypass, self-dial guard (UDP only), nil conn guard, defer-based pipe cleanup, context leak fix, DNS retry 5→2 |
+| `app/proxyman/inbound/worker.go` | 5-tuple primary routing (RFC 9312 §4.2), DCID exception path for NAT rebind, persistent session reader, server SCID registration, shared socket map, Hub buffer enlargement (4MB), cache channel enlargement (8192), self-dial guard, atomic reply destination (no per-packet mutex) |
+| `proxy/proxy.go` | Splice timeout 24h→10min |
+| `transport/internet/sockopt_linux.go` | TCP_NODELAY + TCP_QUICKACK on all sockets |
+| `transport/internet/udp/hub.go` | SetReadBuffer(4MB) + SetWriteBuffer(4MB), cache channel 256→8192, removed silent `default:` drop |
+| `transport/internet/system_dialer.go` | FakePacketConn safe type assertion |
+| `transport/internet/happy_eyeballs.go` | Panics replaced with error returns |
+| `transport/pipe/impl.go` | (Cleaned — overflow counter removed) |
+| `common/protocol/quic/dcid.go` | QUIC DCID/SCID parser |
+| `common/protocol/quic/sniff.go` | QUIC SNI sniffer with ECH support |
+| `core/core.go` | Version tracking (v26.12.79) |
 
-### Considered But Not Built
+### Bug Fixes Applied (v26.12.73–v26.12.79)
 
-1. **HTTP/2 stream-aware routing** — requires custom CA (security risk, breaks transparent setup)
-2. **Pool on hostname instead of IP** — adds DNS re-resolution complexity, marginal benefit
-3. **NEW_CONNECTION_ID frame tracking** — current srcIndex fallback handles common case
-4. **GSO/GRO for outbound** — batch syscalls for throughput, not needed for single user
-5. **WireGuard + TPROXY** — the only way to make YouTube over QUIC work. Would require switching from DNS hijacking to a routed tunnel architecture.
+1. **Self-dial guard restricted to UDP only** — was dropping TCP connections where sniffer hadn't extracted SNI yet
+2. **DNS retry 5→2** — 5 retries on NXDOMAIN wasted ~3 seconds per dead domain
+3. **Goroutine leak fix** — `inputCloser` goroutine leaked on every failed dial
+4. **Splice timeout 24h→10min** — stalled splice shouldn't hang for 24 hours
+5. **TCP_NODELAY + TCP_QUICKACK** — eliminates 40ms Nagle delay and 40ms delayed ACK
+6. **Nil conn guard** — blocked finalRule left conn=nil, causing panic on Close()
+7. **Context leak fix** — missing `defer cancel()` leaked contexts on long-lived connections
+8. **FakePacketConn safe assertion** — unchecked `*net.TCPAddr` type assertion could panic
+9. **happy_eyeballs panics→errors** — two `panic()` calls replaced with error returns
+10. **Defer-based pipe cleanup** — `defer common.Interrupt(input)` + `defer common.Close(output)` prevents pipe/buffer leak on error paths
+11. **Warm pool removed** — FD leaks, goroutine leaks, stale-connection reuse, preWarmLoop sawtooth
+12. **SplitCoalesced removed** — violated RFC 9000 §12.2, broke QUIC coalesced packets
+13. **Hub buffer enlargement** — 4MB receive + send buffers, 8192-slot cache channel, no silent drops
+14. **SO_SNDBUF/SO_RCVBUF removed** — manual buffer sizing disabled TCP auto-tuning, capping throughput
+15. **Per-packet mutex removed** — atomic.Pointer for reply destination, atomic.Value for outbound conn
 
 ---
+
+## Kernel Tuning
+
+```bash
+# /etc/sysctl.d/99-quic.conf
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=3276800
+net.core.wmem_default=3276800
+```
+
+Verify:
+```bash
+sysctl net.core.rmem_max net.core.wmem_max
+```
+
+---
+
+## Branches
+
+- `v191-prefetch` — active development branch (latest: v26.12.79)
+- `main` — stable base (v26.11.132)
 
 ## License
 
-[Mozilla Public License Version 2.0](LICENSE)
-
-This fork is based on [Xray-core](https://github.com/XTLS/Xray-core) by the Project X community. All upstream license terms apply to the original code. Fork-specific additions are licensed under the same MPL-2.0.
-
-## Credits
-
-- [Xray-core](https://github.com/XTLS/Xray-core) — the upstream project this fork is based on
-- [Project X](https://github.com/XTLS) — the community behind xray-core
-- All contributors to the upstream project whose work this fork builds upon
+Same as [Xray-core](https://github.com/XTLS/Xray-core) (MIT/Apache-2.0).
